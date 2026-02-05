@@ -126,7 +126,7 @@ pub fn gen_interaction_trace(
 
     let mut logup_gen = LogupTraceGenerator::new(log_size);
 
-    for [l0, l1] in lookup_data.round_lookups.array_chunks::<2>() {
+    for [l0, l1] in lookup_data.round_lookups.as_chunks::<2>().0 {
         let mut col_gen = logup_gen.new_col();
 
         #[allow(clippy::needless_range_loop)]

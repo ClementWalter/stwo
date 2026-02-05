@@ -131,14 +131,13 @@ impl FromIterator<BaseField> for BaseColumn {
         let mut data = (&mut chunks).map(PackedBaseField::from_array).collect_vec();
         let mut length = data.len() * N_LANES;
 
-        if let Some(remainder) = chunks.into_remainder() {
-            let rem = remainder.len();
-            if rem > 0 {
-                length += rem;
-                let mut last = [BaseField::zero(); N_LANES];
-                last[..rem].copy_from_slice(remainder.as_slice());
-                data.push(PackedBaseField::from_array(last));
-            }
+        let remainder = chunks.into_remainder();
+        let rem = remainder.len();
+        if rem > 0 {
+            length += rem;
+            let mut last = [BaseField::zero(); N_LANES];
+            last[..rem].copy_from_slice(remainder.as_slice());
+            data.push(PackedBaseField::from_array(last));
         }
 
         Self { data, length }
@@ -212,14 +211,13 @@ impl FromIterator<CM31> for CM31Column {
         let mut data = (&mut chunks).map(PackedCM31::from_array).collect_vec();
         let mut length = data.len() * N_LANES;
 
-        if let Some(remainder) = chunks.into_remainder() {
-            let rem = remainder.len();
-            if rem > 0 {
-                length += rem;
-                let mut last = [CM31::zero(); N_LANES];
-                last[..rem].copy_from_slice(remainder.as_slice());
-                data.push(PackedCM31::from_array(last));
-            }
+        let remainder = chunks.into_remainder();
+        let rem = remainder.len();
+        if rem > 0 {
+            length += rem;
+            let mut last = [CM31::zero(); N_LANES];
+            last[..rem].copy_from_slice(remainder.as_slice());
+            data.push(PackedCM31::from_array(last));
         }
 
         Self { data, length }
@@ -346,14 +344,13 @@ impl FromIterator<SecureField> for SecureColumn {
             .collect_vec();
         let mut length = data.len() * N_LANES;
 
-        if let Some(remainder) = chunks.into_remainder() {
-            let rem = remainder.len();
-            if rem > 0 {
-                length += rem;
-                let mut last = [SecureField::zero(); N_LANES];
-                last[..rem].copy_from_slice(remainder.as_slice());
-                data.push(PackedSecureField::from_array(last));
-            }
+        let remainder = chunks.into_remainder();
+        let rem = remainder.len();
+        if rem > 0 {
+            length += rem;
+            let mut last = [SecureField::zero(); N_LANES];
+            last[..rem].copy_from_slice(remainder.as_slice());
+            data.push(PackedSecureField::from_array(last));
         }
 
         Self { data, length }
