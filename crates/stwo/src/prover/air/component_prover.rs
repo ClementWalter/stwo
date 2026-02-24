@@ -74,7 +74,10 @@ impl<B: Backend> Poly<B> {
         if let Some(coeffs) = &self.coeffs {
             coeffs.evaluate_with_twiddles(domain, twiddles)
         } else {
-            panic!("The polynomial's coefficients are not stored");
+            self.evals
+                .clone()
+                .interpolate_with_twiddles(twiddles)
+                .evaluate_with_twiddles(domain, twiddles)
         }
     }
 }
