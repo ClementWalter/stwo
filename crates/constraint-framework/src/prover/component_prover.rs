@@ -191,9 +191,10 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
         let broadcast_powers = &broadcast_powers;
 
         iter.for_each(|(chunk_start_row, mut chunk)| {
-            // Logup fraction buffer, recycled across the chunk's rows: finalize_logup_batched
-            // hands the vector back cleared, so only the first row of the chunk allocates.
-            let mut fracs_buf = Vec::new();
+            // Logup fraction buffers, recycled across the chunk's rows: finalize_logup_batched
+            // hands the vectors back cleared, so only the first row of the chunk allocates.
+            let mut denoms_buf = Vec::new();
+            let mut numerators_buf = Vec::new();
             // Clamp to both the chunk length and the valid row count (see n_vec_rows above).
             let chunk_rows = chunk.0[0].0.len().min(n_vec_rows - chunk_start_row);
             for idx_in_chunk in 0..chunk_rows {
@@ -208,10 +209,12 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
                     self_eval.log_size(),
                     self_claimed_sum,
                 );
-                eval.logup.fracs = std::mem::take(&mut fracs_buf);
+                eval.logup_denoms = std::mem::take(&mut denoms_buf);
+                eval.logup_nonunit_numerators = std::mem::take(&mut numerators_buf);
                 let mut evaluated = self_eval.evaluate(eval);
                 let row_res = evaluated.row_res;
-                fracs_buf = std::mem::take(&mut evaluated.logup.fracs);
+                denoms_buf = std::mem::take(&mut evaluated.logup_denoms);
+                numerators_buf = std::mem::take(&mut evaluated.logup_nonunit_numerators);
 
                 // Finalize row.
                 unsafe {
