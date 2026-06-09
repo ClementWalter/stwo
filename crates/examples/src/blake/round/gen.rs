@@ -258,10 +258,10 @@ pub fn generate_trace(
     let mut generator = TraceGenerator::new(log_size);
     let n_vec_rows: usize = 1 << (log_size - LOG_N_LANES);
 
-    // Two chunks per thread bounds the load-imbalance tail at half a chunk, while
-    // keeping the number of per-chunk multiplicity accumulators (~70MB each) small.
+    // One chunk per thread: each extra chunk costs a ~70MB zero-initialized
+    // multiplicity accumulator, which outweighs the load-balance gain.
     #[cfg(feature = "parallel")]
-    let n_chunks = (2 * rayon::current_num_threads()).clamp(1, n_vec_rows);
+    let n_chunks = rayon::current_num_threads().clamp(1, n_vec_rows);
     #[cfg(not(feature = "parallel"))]
     let n_chunks = 1;
     let chunk_size = n_vec_rows.div_ceil(n_chunks);
