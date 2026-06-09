@@ -1,6 +1,6 @@
 use std::ops::Mul;
 
-use num_traits::Zero;
+use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
 use stwo::core::pcs::TreeVec;
@@ -34,6 +34,14 @@ pub struct SimdDomainEvaluator<'a> {
     pub domain_log_size: u32,
     pub eval_domain_log_size: u32,
     pub logup: LogupAtRow<Self>,
+    /// Logup fraction denominators, in entry order. Numerators are stored sparsely in
+    /// [`Self::logup_nonunit_numerators`]; an entry without one has a numerator of one
+    /// (the common case for lookup multiplicities), avoiding a 128-byte copy per entry
+    /// and the multiplications by one when batches are summed.
+    pub logup_denoms: Vec<VeryPackedSecureField>,
+    /// Sparse `(entry index, numerator)` pairs for entries whose numerator is not
+    /// (bitwise) the canonical one, in increasing entry order.
+    pub logup_nonunit_numerators: Vec<(usize, VeryPackedSecureField)>,
 }
 impl<'a> SimdDomainEvaluator<'a> {
     /// Broadcasts each random coefficient power to all SIMD lanes, for reuse across all
@@ -69,7 +77,69 @@ impl<'a> SimdDomainEvaluator<'a> {
             domain_log_size,
             eval_domain_log_size: eval_log_size,
             logup: LogupAtRow::new(INTERACTION_TRACE_IDX, claimed_sum, log_size),
+            logup_denoms: Vec::new(),
+            logup_nonunit_numerators: Vec::new(),
         }
+    }
+
+    fn push_logup_frac(
+        &mut self,
+        numerator: Option<VeryPackedSecureField>,
+        denominator: VeryPackedSecureField,
+    ) {
+        if self.logup_denoms.is_empty() {
+            self.logup.is_finalized = false;
+        }
+        if let Some(numerator) = numerator {
+            self.logup_nonunit_numerators
+                .push((self.logup_denoms.len(), numerator));
+        }
+        self.logup_denoms.push(denominator);
+    }
+
+    /// Sums the logup fraction batch with entry indices `[start, end)`, skipping the
+    /// numerator multiplications for entries whose numerator is one. `numerators` is the
+    /// sparse non-unit numerator suffix that starts at `start` (or later). Returns the batch
+    /// fraction's numerator (`None` encodes one) and denominator, plus the remaining sparse
+    /// suffix. The result is identical to the generic `Fraction` sum.
+    fn sum_logup_batch<'b>(
+        denoms: &[VeryPackedSecureField],
+        mut numerators: &'b [(usize, VeryPackedSecureField)],
+        start: usize,
+        end: usize,
+    ) -> (
+        Option<VeryPackedSecureField>,
+        VeryPackedSecureField,
+        &'b [(usize, VeryPackedSecureField)],
+    ) {
+        let mut numerator_at = |i: usize| -> Option<VeryPackedSecureField> {
+            match numerators.first() {
+                Some(&(idx, n)) if idx == i => {
+                    numerators = &numerators[1..];
+                    Some(n)
+                }
+                _ => None,
+            }
+        };
+
+        let mut acc_num = numerator_at(start);
+        let mut acc_den = denoms[start];
+        for i in start + 1..end {
+            let den = denoms[i];
+            let num = numerator_at(i);
+            // a/b + c/d = (ad + cb) / (bd), with multiplications by one elided.
+            let lhs = match acc_num {
+                None => den,
+                Some(a) => den * a,
+            };
+            let rhs = match num {
+                None => acc_den,
+                Some(c) => acc_den * c,
+            };
+            acc_num = Some(lhs + rhs);
+            acc_den = acc_den * den;
+        }
+        (acc_num, acc_den, numerators)
     }
 }
 impl EvalAtRow for SimdDomainEvaluator<'_> {
@@ -123,28 +193,53 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
         VeryPackedSecureField::from_very_packed_m31s(values)
     }
 
-    fn write_logup_frac(&mut self, fraction: Fraction<Self::EF, Self::EF>) {
-        if self.logup.fracs.is_empty() {
-            self.logup.is_finalized = false;
-        }
-        self.logup.fracs.push(fraction);
+    /// Stores the relation entry in compact form: the denominator is pushed densely and the
+    /// numerator only when it is not (bitwise) the canonical one. This avoids materializing
+    /// and copying a full `Fraction` per entry in the hot row loop.
+    fn add_to_relation<R: crate::Relation<Self::F, Self::EF>>(
+        &mut self,
+        entry: crate::RelationEntry<'_, Self::F, Self::EF, R>,
+    ) {
+        let denominator = entry.relation.combine(entry.values);
+        let numerator = if is_canonical_one(&entry.multiplicity) {
+            None
+        } else {
+            Some(entry.multiplicity)
+        };
+        self.push_logup_frac(numerator, denominator);
     }
 
-    /// Specialized version of [`crate::logup_proxy!`]'s `finalize_logup_batched` that skips
-    /// secure-field multiplications by numerators equal to one when summing each batch —
-    /// the common case for lookup multiplicities. Emits exactly the same constraints.
+    fn write_logup_frac(&mut self, fraction: Fraction<Self::EF, Self::EF>) {
+        let numerator = if is_canonical_one(&fraction.numerator) {
+            None
+        } else {
+            Some(fraction.numerator)
+        };
+        self.push_logup_frac(numerator, fraction.denominator);
+    }
+
+    /// Specialized version of [`crate::logup_proxy!`]'s `finalize_logup_batched` that reads
+    /// the compact fraction storage and skips secure-field multiplications by numerators
+    /// equal to one — the common case for lookup multiplicities. Emits exactly the same
+    /// constraints as the generic implementation.
     fn finalize_logup_batched(&mut self, batch_size: usize) {
         assert!(!self.logup.is_finalized, "LogupAtRow was already finalized");
         assert!(batch_size > 0, "Batch size must be positive");
 
-        let mut fracs = std::mem::take(&mut self.logup.fracs);
-        let n_batches = fracs.len().div_ceil(batch_size);
+        let mut denoms = std::mem::take(&mut self.logup_denoms);
+        let mut nonunit_numerators = std::mem::take(&mut self.logup_nonunit_numerators);
+        let n_batches = denoms.len().div_ceil(batch_size);
         assert!(n_batches > 0, "No fractions to finalize");
 
         let mut prev_col_cumsum = VeryPackedSecureField::zero();
+        let mut numerators = nonunit_numerators.as_slice();
 
-        for (batch_idx, chunk) in fracs.chunks(batch_size).enumerate() {
-            let cur_frac = sum_fractions_skipping_one_numerators(chunk);
+        for batch_idx in 0..n_batches {
+            let start = batch_idx * batch_size;
+            let end = (start + batch_size).min(denoms.len());
+            let (cur_num, cur_den, rest) =
+                Self::sum_logup_batch(&denoms, numerators, start, end);
+            numerators = rest;
             if batch_idx + 1 < n_batches {
                 // All batches except the last are cumulatively summed in new
                 // interaction columns.
@@ -152,7 +247,11 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
                     self.next_extension_interaction_mask(self.logup.interaction, [0]);
                 let diff = cur_cumsum - prev_col_cumsum;
                 prev_col_cumsum = cur_cumsum;
-                self.add_constraint(diff * cur_frac.denominator - cur_frac.numerator);
+                let lhs = diff * cur_den;
+                self.add_constraint(match cur_num {
+                    None => lhs - VeryPackedSecureField::one(),
+                    Some(num) => lhs - num,
+                });
             } else {
                 let [prev_row_cumsum, cur_cumsum] =
                     self.next_extension_interaction_mask(self.logup.interaction, [-1, 0]);
@@ -164,12 +263,18 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
                 // uniform - apply on all rows.
                 let shifted_diff = diff + self.logup.cumsum_shift;
 
-                self.add_constraint(shifted_diff * cur_frac.denominator - cur_frac.numerator);
+                let lhs = shifted_diff * cur_den;
+                self.add_constraint(match cur_num {
+                    None => lhs - VeryPackedSecureField::one(),
+                    Some(num) => lhs - num,
+                });
             }
         }
 
-        fracs.clear();
-        self.logup.fracs = fracs;
+        denoms.clear();
+        nonunit_numerators.clear();
+        self.logup_denoms = denoms;
+        self.logup_nonunit_numerators = nonunit_numerators;
         self.logup.is_finalized = true;
     }
 
@@ -184,7 +289,7 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
 
 /// Returns whether all lanes hold the canonical representation of one (coordinate 0 is the
 /// integer 1, all other coordinates 0). Numerators built from `EF::one()` always match;
-/// semantically-one values in another representation merely fall back to the generic path.
+/// semantically-one values in another representation merely take the generic path.
 fn is_canonical_one(x: &VeryPackedSecureField) -> bool {
     use std::simd::u32x16;
     let one = u32x16::splat(1);
@@ -197,28 +302,5 @@ fn is_canonical_one(x: &VeryPackedSecureField) -> bool {
             && b.into_simd() == zero
             && c.into_simd() == zero
             && d.into_simd() == zero
-    })
-}
-
-/// Sums a batch of logup fractions, using a/b + c/d = (ad + cb) / (bd) but skipping the
-/// numerator multiplications when a numerator is (bitwise) one. The result is identical to
-/// the generic `Fraction` sum.
-fn sum_fractions_skipping_one_numerators(
-    chunk: &[Fraction<VeryPackedSecureField, VeryPackedSecureField>],
-) -> Fraction<VeryPackedSecureField, VeryPackedSecureField> {
-    let mut iter = chunk.iter();
-    let first = *iter.next().expect("empty logup batch");
-    iter.fold(first, |a, b| {
-        let lhs = if is_canonical_one(&a.numerator) {
-            b.denominator
-        } else {
-            b.denominator * a.numerator
-        };
-        let rhs = if is_canonical_one(&b.numerator) {
-            a.denominator
-        } else {
-            a.denominator * b.numerator
-        };
-        Fraction::new(lhs + rhs, a.denominator * b.denominator)
     })
 }
