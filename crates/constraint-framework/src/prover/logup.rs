@@ -134,10 +134,24 @@ impl LogupTraceGenerator {
         let packed_cumsum_shift = PackedSecureField::broadcast(cumsum_shift);
 
         last_col_coords.iter_mut().enumerate().for_each(|(i, c)| {
-            c.data
-                .iter_mut()
-                .for_each(|x| *x -= packed_cumsum_shift.into_packed_m31s()[i])
+            let shift = packed_cumsum_shift.into_packed_m31s()[i];
+            #[cfg(feature = "parallel")]
+            c.data.par_iter_mut().for_each(|x| *x -= shift);
+            #[cfg(not(feature = "parallel"))]
+            c.data.iter_mut().for_each(|x| *x -= shift);
         });
+
+        // The four coordinate prefix sums are independent; run them concurrently.
+        #[cfg(feature = "parallel")]
+        let coord_prefix_sum = {
+            let [c0, c1, c2, c3] = last_col_coords;
+            let ((p0, p1), (p2, p3)) = rayon::join(
+                || rayon::join(|| inclusive_prefix_sum(c0), || inclusive_prefix_sum(c1)),
+                || rayon::join(|| inclusive_prefix_sum(c2), || inclusive_prefix_sum(c3)),
+            );
+            [p0, p1, p2, p3]
+        };
+        #[cfg(not(feature = "parallel"))]
         let coord_prefix_sum = last_col_coords.map(inclusive_prefix_sum);
         let secure_prefix_sum = SecureColumnByCoords {
             columns: coord_prefix_sum,
