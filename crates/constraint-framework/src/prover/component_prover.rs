@@ -24,7 +24,9 @@ use tracing::{span, Level};
 use super::{CpuDomainEvaluator, SimdDomainEvaluator};
 use crate::{FrameworkComponent, FrameworkEval, PREPROCESSED_TRACE_IDX};
 
-const CHUNK_SIZE: usize = 1;
+/// Number of very-packed rows evaluated per rayon task. Large enough to amortize
+/// work-stealing overhead, small enough to balance load across threads.
+const CHUNK_SIZE: usize = 32;
 
 /// Common inputs for constraint quotient evaluation, shared between the SIMD and CPU backends.
 struct ConstraintQuotientInputs<'a, B: Backend> {
@@ -159,7 +161,11 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
 
         let col = unsafe { VeryPackedSecureColumnByCoords::transform_under_mut(accum.col) };
 
-        let range = 0..(1 << (eval_domain.log_size() - LOG_N_LANES - LOG_N_VERY_PACKED_ELEMS));
+        // Number of valid very-packed rows. The transformed column's inner vectors still
+        // report their pre-transform (PackedBaseField) length, so chunks taken from them
+        // can extend past this count and must be clamped.
+        let n_vec_rows = 1 << (eval_domain.log_size() - LOG_N_LANES - LOG_N_VERY_PACKED_ELEMS);
+        let range = 0..n_vec_rows;
 
         #[cfg(not(feature = "parallel"))]
         let iter = range.step_by(CHUNK_SIZE).zip(col.chunks_mut(CHUNK_SIZE));
@@ -179,15 +185,21 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
         // row task to avoid per-row allocations inside the hot loop.
         let trace_cols = trace.as_cols_ref().map_cols(|c| c.as_ref());
         let trace_cols = &trace_cols;
+        // Broadcast the random coefficient powers to SIMD lanes once for all rows.
+        let broadcast_powers =
+            SimdDomainEvaluator::broadcast_random_coeff_powers(&accum.random_coeff_powers);
+        let broadcast_powers = &broadcast_powers;
 
-        iter.for_each(|(chunk_idx, mut chunk)| {
-            for idx_in_chunk in 0..CHUNK_SIZE {
-                let vec_row = chunk_idx * CHUNK_SIZE + idx_in_chunk;
+        iter.for_each(|(chunk_start_row, mut chunk)| {
+            // Clamp to both the chunk length and the valid row count (see n_vec_rows above).
+            let chunk_rows = chunk.0[0].0.len().min(n_vec_rows - chunk_start_row);
+            for idx_in_chunk in 0..chunk_rows {
+                let vec_row = chunk_start_row + idx_in_chunk;
                 // Evaluate constrains at row.
                 let eval = SimdDomainEvaluator::new(
-                    &trace_cols,
+                    trace_cols,
                     vec_row,
-                    &accum.random_coeff_powers,
+                    broadcast_powers,
                     trace_domain.log_size(),
                     eval_domain.log_size(),
                     self_eval.log_size(),

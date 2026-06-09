@@ -26,7 +26,9 @@ pub struct SimdDomainEvaluator<'a> {
     pub column_index_per_interaction: [usize; MAX_N_INTERACTIONS],
     /// The row index of the simd-vector row to evaluate the constraints at.
     pub vec_row: usize,
-    pub random_coeff_powers: &'a [SecureField],
+    /// Random coefficient powers, pre-broadcast to SIMD lanes. Broadcasting once per
+    /// component (instead of per row per constraint) keeps it out of the hot loop.
+    pub random_coeff_powers: &'a [VeryPackedSecureField],
     pub row_res: VeryPackedSecureField,
     pub constraint_index: usize,
     pub domain_log_size: u32,
@@ -34,10 +36,21 @@ pub struct SimdDomainEvaluator<'a> {
     pub logup: LogupAtRow<Self>,
 }
 impl<'a> SimdDomainEvaluator<'a> {
+    /// Broadcasts each random coefficient power to all SIMD lanes, for reuse across all
+    /// rows of the evaluation domain.
+    pub fn broadcast_random_coeff_powers(
+        random_coeff_powers: &[SecureField],
+    ) -> Vec<VeryPackedSecureField> {
+        random_coeff_powers
+            .iter()
+            .map(|&p| VeryPackedSecureField::broadcast(p))
+            .collect()
+    }
+
     pub fn new(
         trace_eval: &'a TreeVec<Vec<&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>>,
         vec_row: usize,
-        random_coeff_powers: &'a [SecureField],
+        random_coeff_powers: &'a [VeryPackedSecureField],
         domain_log_size: u32,
         eval_log_size: u32,
         log_size: u32,
@@ -102,9 +115,7 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
     where
         Self::EF: Mul<G, Output = Self::EF> + From<G>,
     {
-        self.row_res +=
-            VeryPackedSecureField::broadcast(self.random_coeff_powers[self.constraint_index])
-                * constraint;
+        self.row_res += self.random_coeff_powers[self.constraint_index] * constraint;
         self.constraint_index += 1;
     }
 
