@@ -654,15 +654,6 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
@@ -1235,7 +1226,7 @@ dependencies = [
  "hashbrown 0.15.4",
  "hex",
  "indexmap",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "num-traits",
  "rand",
  "rayon",
@@ -1255,7 +1246,7 @@ name = "stwo-air-utils"
 version = "2.2.0"
 dependencies = [
  "bytemuck",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "rayon",
  "stwo",
  "stwo-air-utils-derive",
@@ -1276,7 +1267,7 @@ name = "stwo-constraint-framework"
 version = "2.2.0"
 dependencies = [
  "hashbrown 0.15.4",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "num-traits",
  "rand",
  "rayon",
@@ -1291,7 +1282,7 @@ version = "2.2.0"
 dependencies = [
  "criterion",
  "educe",
- "itertools 0.12.1",
+ "itertools 0.13.0",
  "ndarray",
  "num-traits",
  "rand",

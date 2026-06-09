@@ -16,7 +16,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-itertools = { version = "0.12", default-features = false, features = [
+itertools = { version = "0.13", default-features = false, features = [
     "use_alloc",
 ] }
 blake2 = { version = "0.10.6", default-features = false }
