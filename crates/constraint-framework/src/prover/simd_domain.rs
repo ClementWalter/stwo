@@ -251,8 +251,7 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
         for batch_idx in 0..n_batches {
             let start = batch_idx * batch_size;
             let end = (start + batch_size).min(denoms.len());
-            let (cur_num, cur_den, rest) =
-                Self::sum_logup_batch(&denoms, numerators, start, end);
+            let (cur_num, cur_den, rest) = Self::sum_logup_batch(&denoms, numerators, start, end);
             numerators = rest;
             if batch_idx + 1 < n_batches {
                 // All batches except the last are cumulatively summed in new
