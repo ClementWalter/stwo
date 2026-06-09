@@ -97,6 +97,20 @@ macro_rules! xor_table_component {
                     self.mults[*column_idx as usize].as_mut_slice()[*offset as usize].0 += 1;
                 }
             }
+
+            /// Adds the multiplicities accumulated in `other` into `self`. Counts are raw
+            /// (non-reduced) u32 increments, so this is a plain element-wise integer add;
+            /// the total multiplicity of an entry is assumed to stay below the modulus,
+            /// as in `add_input`.
+            pub fn merge(&mut self, other: Self) {
+                for (dst, src) in self.mults.iter_mut().zip(other.mults) {
+                    for (d, s) in dst.data.iter_mut().zip(src.data) {
+                        *d = unsafe {
+                            PackedBaseField::from_simd_unchecked(d.into_simd() + s.into_simd())
+                        };
+                    }
+                }
+            }
         }
         /// Component that evaluates the xor table.
         pub type XorTableComponent<const ELEM_BITS: u32, const EXPAND_BITS: u32> =
