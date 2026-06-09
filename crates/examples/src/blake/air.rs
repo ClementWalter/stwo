@@ -306,6 +306,10 @@ where
     // Setup protocol.
     let channel = &mut MC::C::default();
     let mut commitment_scheme = CommitmentSchemeProver::new(config, &twiddles);
+    // Keep the interpolated coefficients alongside the evaluations: out-of-domain
+    // sampling then evaluates each polynomial from its 2^k coefficients instead of a
+    // barycentric dot product over the 2^(k+blowup) committed evaluations.
+    commitment_scheme.set_store_polynomials_coefficients();
     // Preprocessed trace.
     // TODO(ShaharS): share is_first column between components when constant columns support this.
     let span = span!(Level::INFO, "Preprocessed Trace").entered();
