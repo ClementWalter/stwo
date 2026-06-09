@@ -49,6 +49,17 @@ impl XorAccums {
             _ => panic!("Invalid w"),
         }
     }
+
+    /// Adds the multiplicities accumulated in `other` into `self`, allowing independent
+    /// (e.g. per-chunk) accumulators to be combined.
+    #[cfg(feature = "parallel")]
+    fn merge(&mut self, other: Self) {
+        self.xor12.merge(other.xor12);
+        self.xor9.merge(other.xor9);
+        self.xor8.merge(other.xor8);
+        self.xor7.merge(other.xor7);
+        self.xor4.merge(other.xor4);
+    }
 }
 
 relation!(XorElements12, 3);
