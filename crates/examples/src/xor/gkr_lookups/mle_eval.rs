@@ -247,12 +247,14 @@ impl<O: MleCoeffColumnOracle> ComponentProver<SimdBackend> for MleEvalProverComp
         let _span = span!(Level::INFO, "Constraint pointwise eval").entered();
         let n_very_packed_rows =
             1 << (eval_domain.log_size() - LOG_N_LANES - LOG_N_VERY_PACKED_ELEMS);
+        let broadcast_powers =
+            SimdDomainEvaluator::broadcast_random_coeff_powers(&acc.random_coeff_powers);
         for vec_row in 0..n_very_packed_rows {
             // Evaluate constrains at row.
             let mut eval = SimdDomainEvaluator::new(
                 &component_trace,
                 vec_row,
-                &acc.random_coeff_powers,
+                &broadcast_powers,
                 trace_domain.log_size(),
                 eval_domain.log_size(),
                 self.log_size(),
