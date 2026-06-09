@@ -123,5 +123,101 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
         VeryPackedSecureField::from_very_packed_m31s(values)
     }
 
-    crate::logup_proxy!();
+    fn write_logup_frac(&mut self, fraction: Fraction<Self::EF, Self::EF>) {
+        if self.logup.fracs.is_empty() {
+            self.logup.is_finalized = false;
+        }
+        self.logup.fracs.push(fraction);
+    }
+
+    /// Specialized version of [`crate::logup_proxy!`]'s `finalize_logup_batched` that skips
+    /// secure-field multiplications by numerators equal to one when summing each batch —
+    /// the common case for lookup multiplicities. Emits exactly the same constraints.
+    fn finalize_logup_batched(&mut self, batch_size: usize) {
+        assert!(!self.logup.is_finalized, "LogupAtRow was already finalized");
+        assert!(batch_size > 0, "Batch size must be positive");
+
+        let mut fracs = std::mem::take(&mut self.logup.fracs);
+        let n_batches = fracs.len().div_ceil(batch_size);
+        assert!(n_batches > 0, "No fractions to finalize");
+
+        let mut prev_col_cumsum = VeryPackedSecureField::zero();
+
+        for (batch_idx, chunk) in fracs.chunks(batch_size).enumerate() {
+            let cur_frac = sum_fractions_skipping_one_numerators(chunk);
+            if batch_idx + 1 < n_batches {
+                // All batches except the last are cumulatively summed in new
+                // interaction columns.
+                let [cur_cumsum] = self.next_extension_interaction_mask(self.logup.interaction, [0]);
+                let diff = cur_cumsum - prev_col_cumsum;
+                prev_col_cumsum = cur_cumsum;
+                self.add_constraint(diff * cur_frac.denominator - cur_frac.numerator);
+            } else {
+                let [prev_row_cumsum, cur_cumsum] =
+                    self.next_extension_interaction_mask(self.logup.interaction, [-1, 0]);
+
+                let diff = cur_cumsum - prev_row_cumsum - prev_col_cumsum;
+                // Instead of checking diff = num / denom, check
+                // diff = num / denom - cumsum_shift. This makes
+                // (num / denom - cumsum_shift) have sum zero, which makes the constraint
+                // uniform - apply on all rows.
+                let shifted_diff = diff + self.logup.cumsum_shift;
+
+                self.add_constraint(shifted_diff * cur_frac.denominator - cur_frac.numerator);
+            }
+        }
+
+        fracs.clear();
+        self.logup.fracs = fracs;
+        self.logup.is_finalized = true;
+    }
+
+    fn finalize_logup(&mut self) {
+        self.finalize_logup_batched(1)
+    }
+
+    fn finalize_logup_in_pairs(&mut self) {
+        self.finalize_logup_batched(2)
+    }
+}
+
+/// Returns whether all lanes hold the canonical representation of one (coordinate 0 is the
+/// integer 1, all other coordinates 0). Numerators built from `EF::one()` always match;
+/// semantically-one values in another representation merely fall back to the generic path.
+fn is_canonical_one(x: &VeryPackedSecureField) -> bool {
+    use std::simd::u32x16;
+    let one = u32x16::splat(1);
+    let zero = u32x16::splat(0);
+    x.0.iter().all(|q| {
+        let [c0, c1] = q.0;
+        let [a, b] = c0.0;
+        let [c, d] = c1.0;
+        a.into_simd() == one
+            && b.into_simd() == zero
+            && c.into_simd() == zero
+            && d.into_simd() == zero
+    })
+}
+
+/// Sums a batch of logup fractions, using a/b + c/d = (ad + cb) / (bd) but skipping the
+/// numerator multiplications when a numerator is (bitwise) one. The result is identical to
+/// the generic `Fraction` sum.
+fn sum_fractions_skipping_one_numerators(
+    chunk: &[Fraction<VeryPackedSecureField, VeryPackedSecureField>],
+) -> Fraction<VeryPackedSecureField, VeryPackedSecureField> {
+    let mut iter = chunk.iter();
+    let first = *iter.next().expect("empty logup batch");
+    iter.fold(first, |a, b| {
+        let lhs = if is_canonical_one(&a.numerator) {
+            b.denominator
+        } else {
+            b.denominator * a.numerator
+        };
+        let rhs = if is_canonical_one(&b.numerator) {
+            a.denominator
+        } else {
+            a.denominator * b.numerator
+        };
+        Fraction::new(lhs + rhs, a.denominator * b.denominator)
+    })
 }
