@@ -129,8 +129,7 @@ impl<'a> SimdDomainEvaluator<'a> {
 
         let mut acc_num = numerator_at(start);
         let mut acc_den = denoms[start];
-        for i in start + 1..end {
-            let den = denoms[i];
+        for (i, &den) in denoms.iter().enumerate().take(end).skip(start + 1) {
             let num = numerator_at(i);
             // a/b + c/d = (ad + cb) / (bd), with multiplications by one elided.
             let lhs = match acc_num {
@@ -142,7 +141,7 @@ impl<'a> SimdDomainEvaluator<'a> {
                 Some(c) => acc_den * c,
             };
             acc_num = Some(lhs + rhs);
-            acc_den = acc_den * den;
+            acc_den *= den;
         }
         (acc_num, acc_den, numerators)
     }
