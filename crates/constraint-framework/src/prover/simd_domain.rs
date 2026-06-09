@@ -42,6 +42,10 @@ pub struct SimdDomainEvaluator<'a> {
     /// Sparse `(entry index, numerator)` pairs for entries whose numerator is not
     /// (bitwise) the canonical one, in increasing entry order.
     pub logup_nonunit_numerators: Vec<(usize, VeryPackedSecureField)>,
+    /// Precomputed `(offset, index map)` pairs for non-zero mask offsets: the map gives,
+    /// for every flat evaluation index, the bit-reversed circle-domain index of its offset
+    /// neighbor. Offsets without a map fall back to computing the index per lane.
+    pub offset_index_maps: &'a [(isize, Vec<u32>)],
 }
 impl<'a> SimdDomainEvaluator<'a> {
     /// Broadcasts each random coefficient power to all SIMD lanes, for reuse across all
@@ -79,6 +83,7 @@ impl<'a> SimdDomainEvaluator<'a> {
             logup: LogupAtRow::new(INTERACTION_TRACE_IDX, claimed_sum, log_size),
             logup_denoms: Vec::new(),
             logup_nonunit_numerators: Vec::new(),
+            offset_index_maps: &[],
         }
     }
 
@@ -170,13 +175,22 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
             // Otherwise, we need to look up the value at the offset.
             // Since the domain is bit-reversed circle domain ordered, we need to look up the value
             // at the bit-reversed natural order index at an offset.
+            let base = self.vec_row << (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS);
+            let index_map = self
+                .offset_index_maps
+                .iter()
+                .find(|(map_off, _)| *map_off == off)
+                .map(|(_, map)| map);
             VeryPackedBaseField::from_array(std::array::from_fn(|i| {
-                let row_index = offset_bit_reversed_circle_domain_index(
-                    (self.vec_row << (LOG_N_LANES + LOG_N_VERY_PACKED_ELEMS)) + i,
-                    self.domain_log_size,
-                    self.eval_domain_log_size,
-                    off,
-                );
+                let row_index = match index_map {
+                    Some(map) => map[base + i] as usize,
+                    None => offset_bit_reversed_circle_domain_index(
+                        base + i,
+                        self.domain_log_size,
+                        self.eval_domain_log_size,
+                        off,
+                    ),
+                };
                 self.trace_eval[interaction][col_index].at(row_index)
             }))
         })

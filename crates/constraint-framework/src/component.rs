@@ -171,6 +171,22 @@ impl<E: FrameworkEval> FrameworkComponent<E> {
         self.claimed_sum
     }
 
+    /// Distinct non-zero mask offsets used by this component, across all interactions.
+    pub(crate) fn nonzero_mask_offsets(&self) -> Vec<isize> {
+        let mut offsets: Vec<isize> = self
+            .info
+            .mask_offsets
+            .iter()
+            .flatten()
+            .flatten()
+            .copied()
+            .filter(|&off| off != 0)
+            .collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        offsets
+    }
+
     pub fn logup_counts(&self) -> RelationCounts {
         let size = 1 << self.eval.log_size();
         RelationCounts(

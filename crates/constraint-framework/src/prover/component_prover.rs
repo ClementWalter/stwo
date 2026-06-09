@@ -9,7 +9,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::TreeVec;
 use stwo::core::poly::circle::{CanonicCoset, CircleDomain};
-use stwo::core::utils::bit_reverse;
+use stwo::core::utils::{bit_reverse, offset_bit_reversed_circle_domain_index};
 use stwo::prover::backend::simd::column::VeryPackedSecureColumnByCoords;
 use stwo::prover::backend::simd::m31::LOG_N_LANES;
 use stwo::prover::backend::simd::very_packed_m31::{VeryPackedBaseField, LOG_N_VERY_PACKED_ELEMS};
@@ -189,6 +189,34 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
         let broadcast_powers =
             SimdDomainEvaluator::broadcast_random_coeff_powers(&accum.random_coeff_powers);
         let broadcast_powers = &broadcast_powers;
+        // Precompute, for every non-zero mask offset, the bit-reversed circle-domain index
+        // of each evaluation point's offset neighbor. The maps are shared by all rows and
+        // all columns using that offset, replacing per-row per-lane index computations.
+        let offset_index_maps: Vec<(isize, Vec<u32>)> = self
+            .nonzero_mask_offsets()
+            .into_iter()
+            .map(|off| {
+                let n = 1usize << eval_domain.log_size();
+                let mut map = vec![0u32; n];
+                #[cfg(feature = "parallel")]
+                let chunks = map.par_chunks_mut(1 << 12);
+                #[cfg(not(feature = "parallel"))]
+                let chunks = map.chunks_mut(1 << 12);
+                chunks.enumerate().for_each(|(chunk_idx, chunk)| {
+                    let base = chunk_idx << 12;
+                    for (j, slot) in chunk.iter_mut().enumerate() {
+                        *slot = offset_bit_reversed_circle_domain_index(
+                            base + j,
+                            trace_domain.log_size(),
+                            eval_domain.log_size(),
+                            off,
+                        ) as u32;
+                    }
+                });
+                (off, map)
+            })
+            .collect();
+        let offset_index_maps = &offset_index_maps;
 
         iter.for_each(|(chunk_start_row, mut chunk)| {
             // Logup fraction buffers, recycled across the chunk's rows: finalize_logup_batched
@@ -209,6 +237,7 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
                     self_eval.log_size(),
                     self_claimed_sum,
                 );
+                eval.offset_index_maps = offset_index_maps;
                 eval.logup_denoms = std::mem::take(&mut denoms_buf);
                 eval.logup_nonunit_numerators = std::mem::take(&mut numerators_buf);
                 let mut evaluated = self_eval.evaluate(eval);
