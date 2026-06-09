@@ -175,9 +175,12 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
         let self_eval = &self.eval;
         let self_claimed_sum = self.claimed_sum;
 
-        iter.for_each(|(chunk_idx, mut chunk)| {
-            let trace_cols = trace.as_cols_ref().map_cols(|c| c.as_ref());
+        // Shared read-only view of the trace columns, built once and borrowed by every
+        // row task to avoid per-row allocations inside the hot loop.
+        let trace_cols = trace.as_cols_ref().map_cols(|c| c.as_ref());
+        let trace_cols = &trace_cols;
 
+        iter.for_each(|(chunk_idx, mut chunk)| {
             for idx_in_chunk in 0..CHUNK_SIZE {
                 let vec_row = chunk_idx * CHUNK_SIZE + idx_in_chunk;
                 // Evaluate constrains at row.
