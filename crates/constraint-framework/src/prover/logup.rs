@@ -86,8 +86,7 @@ impl LogupTraceGenerator {
 
         // Write fractions straight into a preallocated column instead of unzipping into
         // four freshly collected vectors.
-        let mut numerator =
-            unsafe { SecureColumnByCoords::<SimdBackend>::uninitialized(length) };
+        let mut numerator = unsafe { SecureColumnByCoords::<SimdBackend>::uninitialized(length) };
         let [n0, n1, n2, n3] = &mut numerator.columns;
         (self.denom.data.par_iter_mut())
             .zip(n0.data.par_iter_mut())
