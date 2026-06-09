@@ -81,21 +81,28 @@ impl LogupTraceGenerator {
         &mut self,
         iter: impl IndexedParallelIterator<Item = (PackedSecureField, PackedSecureField)>,
     ) {
-        use stwo::prover::backend::simd::column::BaseColumn;
-
         let length = 1 << self.log_size;
         assert_eq!(iter.len() * N_LANES, length);
 
-        let (((c0, c1), c2), c3) = (self.denom.data.par_iter_mut())
+        // Write fractions straight into a preallocated column instead of unzipping into
+        // four freshly collected vectors.
+        let mut numerator =
+            unsafe { SecureColumnByCoords::<SimdBackend>::uninitialized(length) };
+        let [n0, n1, n2, n3] = &mut numerator.columns;
+        (self.denom.data.par_iter_mut())
+            .zip(n0.data.par_iter_mut())
+            .zip(n1.data.par_iter_mut())
+            .zip(n2.data.par_iter_mut())
+            .zip(n3.data.par_iter_mut())
             .zip(iter)
-            .map(|(dst_denom, (numerator, denom))| {
+            .for_each(|(((((dst_denom, d0), d1), d2), d3), (numerator, denom))| {
                 *dst_denom = denom;
                 let [c0, c1, c2, c3] = numerator.into_packed_m31s();
-                (((c0, c1), c2), c3)
-            })
-            .unzip();
-        let columns = [c0, c1, c2, c3].map(BaseColumn::from_simd);
-        let numerator = SecureColumnByCoords::<SimdBackend> { columns };
+                *d0 = c0;
+                *d1 = c1;
+                *d2 = c2;
+                *d3 = c3;
+            });
 
         LogupColGenerator {
             gen: self,
@@ -176,8 +183,9 @@ impl LogupColGenerator<'_> {
 
     /// Finalizes generating the column.
     pub fn finalize_col(mut self) {
-        // Column size is a power of 2.
-        let chunk_size = std::cmp::min(4, self.gen.denom.data.len());
+        // Column size is a power of 2. The chunk is the rayon task granularity: large
+        // enough to amortize scheduling overhead, small enough to balance across threads.
+        let chunk_size = std::cmp::min(1 << 10, self.gen.denom.data.len());
         batch_inverse_packed_qm31(&self.gen.denom.data, &mut self.gen.batch_inverse_buffer);
 
         #[cfg(feature = "parallel")]
