@@ -217,9 +217,7 @@ macro_rules! logup_proxy {
                     // uniform - apply on all rows.
                     let shifted_diff = diff + self.logup.cumsum_shift.clone();
 
-                    self.add_constraint(
-                        shifted_diff * cur_frac.denominator - cur_frac.numerator,
-                    );
+                    self.add_constraint(shifted_diff * cur_frac.denominator - cur_frac.numerator);
                 }
             }
 

@@ -300,7 +300,9 @@ pub fn generate_trace(
 
     #[cfg(feature = "parallel")]
     {
-        let accums: Vec<XorAccums> = views
+        // Tree-reduce the per-chunk accumulators so the (large) multiplicity-table
+        // merges also run in parallel instead of sequentially on one thread.
+        let merged = views
             .into_par_iter()
             .enumerate()
             .map(|(chunk_idx, view)| {
@@ -308,9 +310,12 @@ pub fn generate_trace(
                 generate_chunk(view, chunk_idx * chunk_size, inputs, &mut acc);
                 acc
             })
-            .collect();
-        for acc in accums {
-            xor_accum.merge(acc);
+            .reduce_with(|mut a, b| {
+                a.merge(b);
+                a
+            });
+        if let Some(merged) = merged {
+            xor_accum.merge(merged);
         }
     }
     #[cfg(not(feature = "parallel"))]

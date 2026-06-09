@@ -75,10 +75,8 @@ macro_rules! xor_table_gen {
                     let a0 = u32x16::splat((ah0 << limb_bits) | al);
                     let a1 = u32x16::splat((ah1 << limb_bits) | al);
                     // bll is just the consecutive numbers 0 .. N_LANES-1.
-                    let b0 =
-                        u32x16::splat((bh0 << limb_bits) | (blh << LOG_N_LANES)) | offsets_vec;
-                    let b1 =
-                        u32x16::splat((bh1 << limb_bits) | (blh << LOG_N_LANES)) | offsets_vec;
+                    let b0 = u32x16::splat((bh0 << limb_bits) | (blh << LOG_N_LANES)) | offsets_vec;
+                    let b1 = u32x16::splat((bh1 << limb_bits) | (blh << LOG_N_LANES)) | offsets_vec;
 
                     let c0 = a0 ^ b0;
                     let c1 = a1 ^ b1;
@@ -97,11 +95,7 @@ macro_rules! xor_table_gen {
                 };
 
                 #[cfg(feature = "parallel")]
-                logup_gen.col_from_par_iter(
-                    (0..n_vec_rows)
-                        .into_par_iter()
-                        .map(frac_at_row),
-                );
+                logup_gen.col_from_par_iter((0..n_vec_rows).into_par_iter().map(frac_at_row));
                 #[cfg(not(feature = "parallel"))]
                 logup_gen.col_from_iter((0..n_vec_rows).map(frac_at_row));
             }
@@ -131,11 +125,7 @@ macro_rules! xor_table_gen {
                 };
 
                 #[cfg(feature = "parallel")]
-                logup_gen.col_from_par_iter(
-                    (0..n_vec_rows)
-                        .into_par_iter()
-                        .map(frac_at_row),
-                );
+                logup_gen.col_from_par_iter((0..n_vec_rows).into_par_iter().map(frac_at_row));
                 #[cfg(not(feature = "parallel"))]
                 logup_gen.col_from_iter((0..n_vec_rows).map(frac_at_row));
             }

@@ -148,7 +148,8 @@ impl EvalAtRow for SimdDomainEvaluator<'_> {
             if batch_idx + 1 < n_batches {
                 // All batches except the last are cumulatively summed in new
                 // interaction columns.
-                let [cur_cumsum] = self.next_extension_interaction_mask(self.logup.interaction, [0]);
+                let [cur_cumsum] =
+                    self.next_extension_interaction_mask(self.logup.interaction, [0]);
                 let diff = cur_cumsum - prev_col_cumsum;
                 prev_col_cumsum = cur_cumsum;
                 self.add_constraint(diff * cur_frac.denominator - cur_frac.numerator);
