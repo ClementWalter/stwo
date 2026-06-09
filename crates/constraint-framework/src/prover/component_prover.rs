@@ -191,12 +191,15 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
         let broadcast_powers = &broadcast_powers;
 
         iter.for_each(|(chunk_start_row, mut chunk)| {
+            // Logup fraction buffer, recycled across the chunk's rows: finalize_logup_batched
+            // hands the vector back cleared, so only the first row of the chunk allocates.
+            let mut fracs_buf = Vec::new();
             // Clamp to both the chunk length and the valid row count (see n_vec_rows above).
             let chunk_rows = chunk.0[0].0.len().min(n_vec_rows - chunk_start_row);
             for idx_in_chunk in 0..chunk_rows {
                 let vec_row = chunk_start_row + idx_in_chunk;
                 // Evaluate constrains at row.
-                let eval = SimdDomainEvaluator::new(
+                let mut eval = SimdDomainEvaluator::new(
                     trace_cols,
                     vec_row,
                     broadcast_powers,
@@ -205,7 +208,10 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
                     self_eval.log_size(),
                     self_claimed_sum,
                 );
-                let row_res = self_eval.evaluate(eval).row_res;
+                eval.logup.fracs = std::mem::take(&mut fracs_buf);
+                let mut evaluated = self_eval.evaluate(eval);
+                let row_res = evaluated.row_res;
+                fracs_buf = std::mem::take(&mut evaluated.logup.fracs);
 
                 // Finalize row.
                 unsafe {

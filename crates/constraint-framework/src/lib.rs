@@ -182,41 +182,49 @@ macro_rules! logup_proxy {
         /// Finalize the logup by adding the constraints for the fractions, batched into
         /// consecutive groups of `batch_size`. If the number of fractions is not a multiple
         /// of `batch_size`, the last group is smaller.
+        ///
+        /// Runs once per evaluated row, so it avoids heap allocation: the fractions vector
+        /// is taken out for the duration of the call and handed back cleared, letting
+        /// callers recycle its buffer across rows.
         fn finalize_logup_batched(&mut self, batch_size: usize) {
             assert!(!self.logup.is_finalized, "LogupAtRow was already finalized");
             assert!(batch_size > 0, "Batch size must be positive");
 
-            let mut batched: std_shims::Vec<Fraction<Self::EF, Self::EF>> = self
-                .logup
-                .fracs
-                .chunks(batch_size)
-                .map(|chunk| chunk.iter().cloned().sum())
-                .collect();
-
-            let last_frac = batched.pop().expect("No fractions to finalize");
+            let mut fracs = ::core::mem::take(&mut self.logup.fracs);
+            let n_batches = fracs.len().div_ceil(batch_size);
+            assert!(n_batches > 0, "No fractions to finalize");
 
             let mut prev_col_cumsum = <Self::EF as num_traits::Zero>::zero();
 
-            // All batches except the last are cumulatively summed in new interaction columns.
-            for cur_frac in batched {
-                let [cur_cumsum] =
-                    self.next_extension_interaction_mask(self.logup.interaction, [0]);
-                let diff = cur_cumsum.clone() - prev_col_cumsum.clone();
-                prev_col_cumsum = cur_cumsum;
-                self.add_constraint(diff * cur_frac.denominator - cur_frac.numerator);
+            for (batch_idx, chunk) in fracs.chunks(batch_size).enumerate() {
+                let cur_frac: Fraction<Self::EF, Self::EF> = chunk.iter().cloned().sum();
+                if batch_idx + 1 < n_batches {
+                    // All batches except the last are cumulatively summed in new
+                    // interaction columns.
+                    let [cur_cumsum] =
+                        self.next_extension_interaction_mask(self.logup.interaction, [0]);
+                    let diff = cur_cumsum.clone() - prev_col_cumsum.clone();
+                    prev_col_cumsum = cur_cumsum;
+                    self.add_constraint(diff * cur_frac.denominator - cur_frac.numerator);
+                } else {
+                    let [prev_row_cumsum, cur_cumsum] =
+                        self.next_extension_interaction_mask(self.logup.interaction, [-1, 0]);
+
+                    let diff = cur_cumsum - prev_row_cumsum - prev_col_cumsum.clone();
+                    // Instead of checking diff = num / denom, check
+                    // diff = num / denom - cumsum_shift. This makes
+                    // (num / denom - cumsum_shift) have sum zero, which makes the constraint
+                    // uniform - apply on all rows.
+                    let shifted_diff = diff + self.logup.cumsum_shift.clone();
+
+                    self.add_constraint(
+                        shifted_diff * cur_frac.denominator - cur_frac.numerator,
+                    );
+                }
             }
 
-            let [prev_row_cumsum, cur_cumsum] =
-                self.next_extension_interaction_mask(self.logup.interaction, [-1, 0]);
-
-            let diff = cur_cumsum - prev_row_cumsum - prev_col_cumsum.clone();
-            // Instead of checking diff = num / denom, check diff = num / denom - cumsum_shift.
-            // This makes (num / denom - cumsum_shift) have sum zero, which makes the constraint
-            // uniform - apply on all rows.
-            let shifted_diff = diff + self.logup.cumsum_shift.clone();
-
-            self.add_constraint(shifted_diff * last_frac.denominator - last_frac.numerator);
-
+            fracs.clear();
+            self.logup.fracs = fracs;
             self.logup.is_finalized = true;
         }
 
