@@ -28,6 +28,7 @@ impl<A: Copy, const N: usize> Vectorized<A, N> {
 }
 
 impl<A: Copy, const N: usize> From<[A; N]> for Vectorized<A, N> {
+    #[inline(always)]
     fn from(array: [A; N]) -> Self {
         Vectorized(array)
     }
@@ -92,12 +93,14 @@ impl VeryPackedQM31 {
     }
 }
 impl From<M31> for VeryPackedM31 {
+    #[inline(always)]
     fn from(v: M31) -> Self {
         Self::broadcast(v)
     }
 }
 
 impl From<VeryPackedM31> for VeryPackedQM31 {
+    #[inline(always)]
     fn from(value: VeryPackedM31) -> Self {
         VeryPackedQM31::from_very_packed_m31s([
             value,
@@ -109,6 +112,7 @@ impl From<VeryPackedM31> for VeryPackedQM31 {
 }
 
 impl From<QM31> for VeryPackedQM31 {
+    #[inline(always)]
     fn from(value: QM31) -> Self {
         VeryPackedQM31::broadcast(value)
     }
@@ -128,6 +132,7 @@ where
 {
     type Output = Vectorized<A::Output, N>;
 
+    #[inline(always)]
     fn add(self, other: Vectorized<B, N>) -> Self::Output {
         Vectorized::from_fn(|i| self.0[i] + other.0[i])
     }
@@ -139,6 +144,7 @@ where
 {
     type Output = Vectorized<A::Output, N>;
 
+    #[inline(always)]
     fn add(self, other: B) -> Self::Output {
         Vectorized::from_fn(|i| self.0[i] + other)
     }
@@ -150,6 +156,7 @@ where
 {
     type Output = Vectorized<A::Output, N>;
 
+    #[inline(always)]
     fn sub(self, other: Vectorized<B, N>) -> Self::Output {
         Vectorized::from_fn(|i| self.0[i] - other.0[i])
     }
@@ -161,6 +168,7 @@ where
 {
     type Output = Vectorized<A::Output, N>;
 
+    #[inline(always)]
     fn sub(self, other: B) -> Self::Output {
         Vectorized::from_fn(|i| self.0[i] - other)
     }
@@ -172,6 +180,7 @@ where
 {
     type Output = Vectorized<A::Output, N>;
 
+    #[inline(always)]
     fn mul(self, other: Vectorized<B, N>) -> Self::Output {
         Vectorized::from_fn(|i| self.0[i] * other.0[i])
     }
@@ -183,6 +192,7 @@ where
 {
     type Output = Vectorized<A::Output, N>;
 
+    #[inline(always)]
     fn mul(self, other: B) -> Self::Output {
         Vectorized::from_fn(|i| self.0[i] * other)
     }
@@ -191,6 +201,7 @@ where
 impl<A: AddAssign<B> + Copy, B: Copy, const N: usize> AddAssign<Vectorized<B, N>>
     for Vectorized<A, N>
 {
+    #[inline(always)]
     fn add_assign(&mut self, other: Vectorized<B, N>) {
         for i in 0..N {
             self.0[i] += other.0[i];
@@ -199,6 +210,7 @@ impl<A: AddAssign<B> + Copy, B: Copy, const N: usize> AddAssign<Vectorized<B, N>
 }
 
 impl<A: AddAssign<B> + Copy, B: Scalar + Copy, const N: usize> AddAssign<B> for Vectorized<A, N> {
+    #[inline(always)]
     fn add_assign(&mut self, other: B) {
         for i in 0..N {
             self.0[i] += other;
@@ -209,6 +221,7 @@ impl<A: AddAssign<B> + Copy, B: Scalar + Copy, const N: usize> AddAssign<B> for 
 impl<A: MulAssign<B> + Copy, B: Copy, const N: usize> MulAssign<Vectorized<B, N>>
     for Vectorized<A, N>
 {
+    #[inline(always)]
     fn mul_assign(&mut self, other: Vectorized<B, N>) {
         for i in 0..N {
             self.0[i] *= other.0[i];
@@ -229,16 +242,19 @@ where
 }
 
 impl<A: Zero + Copy, const N: usize> Zero for Vectorized<A, N> {
+    #[inline(always)]
     fn zero() -> Self {
         Vectorized::from_fn(|_| A::zero())
     }
 
+    #[inline(always)]
     fn is_zero(&self) -> bool {
         self.0.iter().all(A::is_zero)
     }
 }
 
 impl<A: One + Copy, const N: usize> One for Vectorized<A, N> {
+    #[inline(always)]
     fn one() -> Self {
         Vectorized::from_fn(|_| A::one())
     }
