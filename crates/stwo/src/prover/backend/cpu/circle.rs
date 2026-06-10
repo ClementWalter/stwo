@@ -1,5 +1,7 @@
 use itertools::Itertools;
 use num_traits::Zero;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use super::CpuBackend;
 use crate::core::circle::{CirclePoint, CirclePointIndex, Coset};
@@ -58,19 +60,18 @@ impl PolyOps for CpuBackend {
         }
 
         let line_twiddles = domain_line_twiddles_from_tree(eval.domain, &twiddles.itwiddles);
-        let circle_twiddles = circle_twiddles_from_line_twiddles(line_twiddles[0]);
+        let circle_twiddles = circle_twiddles_from_line_twiddles(line_twiddles[0]).collect_vec();
 
-        for (h, t) in circle_twiddles.enumerate() {
-            fft_layer_loop(&mut values, 0, h, t, ibutterfly);
-        }
+        fft_full_layer(&mut values, 0, |h| circle_twiddles[h], ibutterfly);
         for (layer, layer_twiddles) in line_twiddles.into_iter().enumerate() {
-            for (h, &t) in layer_twiddles.iter().enumerate() {
-                fft_layer_loop(&mut values, layer + 1, h, t, ibutterfly);
-            }
+            fft_full_layer(&mut values, layer + 1, |h| layer_twiddles[h], ibutterfly);
         }
 
         // Divide all values by 2^log_size.
         let inv = BaseField::from_u32_unchecked(eval.domain.size() as u32).inverse();
+        #[cfg(feature = "parallel")]
+        values.par_iter_mut().for_each(|val| *val *= inv);
+        #[cfg(not(feature = "parallel"))]
         for val in &mut values {
             *val *= inv;
         }
@@ -227,16 +228,12 @@ impl PolyOps for CpuBackend {
         }
 
         let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
-        let circle_twiddles = circle_twiddles_from_line_twiddles(line_twiddles[0]);
+        let circle_twiddles = circle_twiddles_from_line_twiddles(line_twiddles[0]).collect_vec();
 
         for (layer, layer_twiddles) in line_twiddles.iter().enumerate().rev() {
-            for (h, &t) in layer_twiddles.iter().enumerate() {
-                fft_layer_loop(&mut buffer, layer + 1, h, t, butterfly);
-            }
+            fft_full_layer(&mut buffer, layer + 1, |h| layer_twiddles[h], butterfly);
         }
-        for (h, t) in circle_twiddles.enumerate() {
-            fft_layer_loop(&mut buffer, 0, h, t, butterfly);
-        }
+        fft_full_layer(&mut buffer, 0, |h| circle_twiddles[h], butterfly);
 
         CircleEvaluation::new(domain, buffer)
     }
@@ -304,19 +301,53 @@ pub fn slow_precompute_twiddles(mut coset: Coset) -> Vec<BaseField> {
     twiddles
 }
 
-fn fft_layer_loop(
+/// Applies one FFT layer over the whole value buffer: for each `h`, the butterflies of
+/// block `h` (a contiguous range of `2^(i+1)` values, pairing index `l` with
+/// `l + 2^i`) use twiddle `twiddle_at(h)`. Blocks are disjoint and butterflies within a
+/// block are independent, so the layer is processed in parallel: across blocks when
+/// there are many, and across the butterfly pairs of the (few, large) blocks otherwise.
+fn fft_full_layer(
     values: &mut [BaseField],
     i: usize,
-    h: usize,
-    t: BaseField,
-    butterfly_fn: impl Fn(&mut BaseField, &mut BaseField, BaseField),
+    twiddle_at: impl Fn(usize) -> BaseField + Sync,
+    butterfly_fn: impl Fn(&mut BaseField, &mut BaseField, BaseField) + Sync,
 ) {
-    for l in 0..(1 << i) {
-        let idx0 = (h << (i + 1)) + l;
-        let idx1 = idx0 + (1 << i);
-        let (mut val0, mut val1) = (values[idx0], values[idx1]);
-        butterfly_fn(&mut val0, &mut val1, t);
-        (values[idx0], values[idx1]) = (val0, val1);
+    let block = 1 << (i + 1);
+    let half = 1 << i;
+
+    #[cfg(feature = "parallel")]
+    {
+        const MIN_PAR_SIZE: usize = 1 << 13;
+        // Only go parallel from a top-level call: when the FFT is already running inside
+        // a rayon task (e.g. one column among many in a per-column parallel pass), inner
+        // splitting just adds scheduling overhead.
+        if rayon::current_thread_index().is_none() && values.len() >= MIN_PAR_SIZE {
+            values
+                .par_chunks_mut(block)
+                .enumerate()
+                .for_each(|(h, chunk)| {
+                    let t = twiddle_at(h);
+                    let (lo, hi) = chunk.split_at_mut(half);
+                    // Within a large block, split the butterfly pairs across threads too.
+                    const SUB: usize = 1 << 12;
+                    lo.par_chunks_mut(SUB).zip(hi.par_chunks_mut(SUB)).for_each(
+                        |(lo_chunk, hi_chunk)| {
+                            for (v0, v1) in lo_chunk.iter_mut().zip(hi_chunk.iter_mut()) {
+                                butterfly_fn(v0, v1, t);
+                            }
+                        },
+                    );
+                });
+            return;
+        }
+    }
+
+    for (h, chunk) in values.chunks_mut(block).enumerate() {
+        let t = twiddle_at(h);
+        let (lo, hi) = chunk.split_at_mut(half);
+        for (v0, v1) in lo.iter_mut().zip(hi.iter_mut()) {
+            butterfly_fn(v0, v1, t);
+        }
     }
 }
 
