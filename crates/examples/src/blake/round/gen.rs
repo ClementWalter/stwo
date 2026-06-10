@@ -350,32 +350,25 @@ pub fn generate_interaction_trace(
 ) {
     let _span = span!(Level::INFO, "Generate round interaction trace").entered();
     let mut logup_gen = LogupTraceGenerator::new(log_size);
-    let n_vec_rows: usize = 1 << (log_size - LOG_N_LANES);
 
-    for [(w0, l0), (w1, l1)] in lookup_data.xor_lookups.as_chunks::<2>().0 {
-        let frac_at_row = |vec_row: usize| {
+    // One logup column per pair of xor lookups, plus the round lookup column.
+    assert!(lookup_data.xor_lookups.len().is_multiple_of(2));
+    let n_pairs = lookup_data.xor_lookups.len() / 2;
+    logup_gen.cols_from_fn(n_pairs + 1, |col, vec_row| {
+        if col < n_pairs {
+            let (w0, l0) = &lookup_data.xor_lookups[2 * col];
+            let (w1, l1) = &lookup_data.xor_lookups[2 * col + 1];
             let p0: PackedSecureField =
                 xor_lookup_elements.combine(*w0, &l0.each_ref().map(|l| l.data[vec_row]));
             let p1: PackedSecureField =
                 xor_lookup_elements.combine(*w1, &l1.each_ref().map(|l| l.data[vec_row]));
             (p0 + p1, p0 * p1)
-        };
-
-        #[cfg(feature = "parallel")]
-        logup_gen.col_from_par_iter((0..n_vec_rows).into_par_iter().map(frac_at_row));
-        #[cfg(not(feature = "parallel"))]
-        logup_gen.col_from_iter((0..n_vec_rows).map(frac_at_row));
-    }
-
-    let round_frac_at_row = |vec_row: usize| {
-        let p = round_lookup_elements
-            .combine(&lookup_data.round_lookup.each_ref().map(|l| l.data[vec_row]));
-        (-PackedSecureField::one(), p)
-    };
-    #[cfg(feature = "parallel")]
-    logup_gen.col_from_par_iter((0..n_vec_rows).into_par_iter().map(round_frac_at_row));
-    #[cfg(not(feature = "parallel"))]
-    logup_gen.col_from_iter((0..n_vec_rows).map(round_frac_at_row));
+        } else {
+            let p = round_lookup_elements
+                .combine(&lookup_data.round_lookup.each_ref().map(|l| l.data[vec_row]));
+            (-PackedSecureField::one(), p)
+        }
+    });
 
     logup_gen.finalize_last()
 }

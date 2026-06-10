@@ -206,49 +206,41 @@ pub fn gen_interaction_trace(
     let _span = span!(Level::INFO, "Generate scheduler interaction trace").entered();
 
     let mut logup_gen = LogupTraceGenerator::new(log_size);
-    let n_vec_rows: usize = 1 << (log_size - LOG_N_LANES);
 
-    for [l0, l1] in lookup_data.round_lookups.as_chunks::<2>().0 {
-        let frac_at_row = |vec_row: usize| {
+    // One logup column per pair of round lookups, plus a final column for the blake
+    // lookup (combined with the last round lookup when the number of rounds is odd,
+    // as in blake3).
+    let n_pairs = N_ROUNDS / 2;
+    logup_gen.cols_from_fn(n_pairs + 1, |col, vec_row| {
+        if col < n_pairs {
+            let l0 = &lookup_data.round_lookups[2 * col];
+            let l1 = &lookup_data.round_lookups[2 * col + 1];
             let p0: PackedSecureField =
                 round_lookup_elements.combine(&l0.each_ref().map(|l| l.data[vec_row]));
             let p1: PackedSecureField =
                 round_lookup_elements.combine(&l1.each_ref().map(|l| l.data[vec_row]));
             (p0 + p1, p0 * p1)
-        };
-
-        #[cfg(feature = "parallel")]
-        logup_gen.col_from_par_iter((0..n_vec_rows).into_par_iter().map(frac_at_row));
-        #[cfg(not(feature = "parallel"))]
-        logup_gen.col_from_iter((0..n_vec_rows).map(frac_at_row));
-    }
-
-    // Last pair. If the number of round is odd (as in blake3), we combine that last round lookup
-    // with the entire blake lookup.
-    let last_frac_at_row = |vec_row: usize| {
-        let p_blake: PackedSecureField = blake_lookup_elements.combine(
-            &lookup_data
-                .blake_lookups
-                .each_ref()
-                .map(|l| l.data[vec_row]),
-        );
-        if N_ROUNDS % 2 == 1 {
-            let p_round: PackedSecureField = round_lookup_elements.combine(
-                &lookup_data.round_lookups[N_ROUNDS - 1]
+        } else {
+            let p_blake: PackedSecureField = blake_lookup_elements.combine(
+                &lookup_data
+                    .blake_lookups
                     .each_ref()
                     .map(|l| l.data[vec_row]),
             );
-            // TODO(alont): Remove.
-            (p_blake, p_round * p_blake)
-        } else {
-            // TODO(alont): Remove.
-            (PackedSecureField::zero(), p_blake)
+            if N_ROUNDS % 2 == 1 {
+                let p_round: PackedSecureField = round_lookup_elements.combine(
+                    &lookup_data.round_lookups[N_ROUNDS - 1]
+                        .each_ref()
+                        .map(|l| l.data[vec_row]),
+                );
+                // TODO(alont): Remove.
+                (p_blake, p_round * p_blake)
+            } else {
+                // TODO(alont): Remove.
+                (PackedSecureField::zero(), p_blake)
+            }
         }
-    };
-    #[cfg(feature = "parallel")]
-    logup_gen.col_from_par_iter((0..n_vec_rows).into_par_iter().map(last_frac_at_row));
-    #[cfg(not(feature = "parallel"))]
-    logup_gen.col_from_iter((0..n_vec_rows).map(last_frac_at_row));
+    });
 
     logup_gen.finalize_last()
 }
