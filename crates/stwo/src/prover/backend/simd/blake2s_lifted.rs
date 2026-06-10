@@ -135,9 +135,8 @@ pub(crate) fn build_leaves_from_flat_columns<const IS_M31_OUTPUT: bool>(
             #[cfg(feature = "parallel")]
             let iter_states = next_layer_state_slice.par_iter_mut();
 
+            // First chunk: lift the previous states and `columns[start..start + 16]`.
             iter_states.enumerate().for_each(|(i, state)| {
-                let mut local_byte_count = byte_count + N_BYTES_IN_BLAKE_MESSAGE;
-                // Lift `prev_layer_states` and the first chunk `columns[start..start + 16]`.
                 let prev_state = std::array::from_fn(|j| {
                     let prev_state_limb = prev_layer_states[i >> log_ratio][j];
                     to_lifted_simd(prev_state_limb, log_ratio, i)
@@ -153,22 +152,37 @@ pub(crate) fn build_leaves_from_flat_columns<const IS_M31_OUTPUT: bool>(
                         i,
                     )
                 });
+                *state =
+                    compress_unfinalized(prev_state, msgs, byte_count + N_BYTES_IN_BLAKE_MESSAGE);
+            });
 
-                *state = compress_unfinalized(prev_state, msgs, local_byte_count);
-                // Deal with the subsequent chunks in columns[start + 16..end]`. Note that since
-                // `start < end` and both are multiples of 16, we have `start + 16 <= end`,
-                // therefore the indexing range below doesn't panic. All columns in
-                // `columns[start + 16..end]` are guaranteed to be of the same size (hence no
-                // lifting is required).
-                for chunk_columns in &mut columns[start + 16..end].chunks(N_FELTS_IN_BLAKE_MESSAGE)
-                {
+            // Deal with the subsequent chunks in `columns[start + 16..end]`. Note that since
+            // `start < end` and both are multiples of 16, we have `start + 16 <= end`,
+            // therefore the indexing range below doesn't panic. All columns in
+            // `columns[start + 16..end]` are guaranteed to be of the same size (hence no
+            // lifting is required). Chunks are absorbed one full state pass at a time, so
+            // each pass touches only 16 column streams (prefetcher friendly); the per-state
+            // compression chain order is unchanged.
+            let mut local_byte_count = byte_count + N_BYTES_IN_BLAKE_MESSAGE;
+            for chunk_columns in &mut columns[start + 16..end].chunks(N_FELTS_IN_BLAKE_MESSAGE) {
+                local_byte_count += N_BYTES_IN_BLAKE_MESSAGE;
+                let absorb = |(i, state): (usize, &mut [u32x16; N_FELTS_IN_BLAKE_STATE])| {
                     let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = std::array::from_fn(|j| {
                         u32x16::from_slice(&chunk_columns[j][i * N_LANES..(i + 1) * N_LANES])
                     });
-                    local_byte_count += N_BYTES_IN_BLAKE_MESSAGE;
                     *state = compress_unfinalized(*state, msgs, local_byte_count);
-                }
-            });
+                };
+                #[cfg(not(feature = "parallel"))]
+                next_layer_states[0..1 << chunk_max_log_size]
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(absorb);
+                #[cfg(feature = "parallel")]
+                next_layer_states[0..1 << chunk_max_log_size]
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(absorb);
+            }
             // We hashed `((end - start) / N_FELTS_IN_BLAKE_MESSAGE) * N_BYTES_IN_BLAKE_MESSAGE = 4
             // * (end - start)` bytes.
             byte_count += 4 * (end - start) as u64;
