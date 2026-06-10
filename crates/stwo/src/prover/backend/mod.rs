@@ -13,6 +13,8 @@ use crate::prover::vcs_lifted::ops::MerkleOpsLifted;
 use crate::prover::{AccumulationOps, QuotientOps};
 
 pub mod cpu;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod metal;
 pub mod simd;
 
 pub trait Backend:

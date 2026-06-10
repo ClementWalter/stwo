@@ -6,6 +6,7 @@ license.workspace = true
 description = "Example implementations using the STWO prover"
 
 [features]
+metal = ["stwo/metal"]
 parallel = ["dep:rayon", "stwo/parallel"]
 tracing = ["stwo/tracing"]
 slow-tests = []

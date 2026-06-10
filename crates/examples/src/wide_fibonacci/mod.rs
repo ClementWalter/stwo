@@ -529,6 +529,9 @@ mod tests {
             .unwrap_or(8);
         let config = PcsConfig::default();
         // Twiddle precompute and trace generation are independent; run them in parallel.
+        // GPU pipeline compilation is process setup, like twiddle precompute.
+        #[cfg(feature = "metal")]
+        stwo::prover::backend::metal::warmup();
         let t = std::time::Instant::now();
         let (twiddles, trace) = rayon::join(
             || {

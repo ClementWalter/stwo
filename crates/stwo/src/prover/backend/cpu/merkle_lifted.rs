@@ -115,11 +115,23 @@ impl<H: MerkleHasherLifted + Send + Sync + 'static> MerkleOpsLifted<H> for CpuBa
         // Blake2s fast path; see `build_leaves`.
         if TypeId::of::<H>() == TypeId::of::<Blake2sMerkleHasherGeneric<true>>() {
             let prev: &Vec<Blake2sHash> = unsafe { std::mem::transmute(prev_layer) };
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            if let Some(next) =
+                crate::prover::backend::metal::blake2s::build_next_layer_metal(prev, true)
+            {
+                return unsafe { std::mem::transmute::<Vec<Blake2sHash>, Vec<H::Hash>>(next) };
+            }
             let next = build_next_layer_simd::<true>(prev);
             return unsafe { std::mem::transmute::<Vec<Blake2sHash>, Vec<H::Hash>>(next) };
         }
         if TypeId::of::<H>() == TypeId::of::<Blake2sMerkleHasherGeneric<false>>() {
             let prev: &Vec<Blake2sHash> = unsafe { std::mem::transmute(prev_layer) };
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            if let Some(next) =
+                crate::prover::backend::metal::blake2s::build_next_layer_metal(prev, false)
+            {
+                return unsafe { std::mem::transmute::<Vec<Blake2sHash>, Vec<H::Hash>>(next) };
+            }
             let next = build_next_layer_simd::<false>(prev);
             return unsafe { std::mem::transmute::<Vec<Blake2sHash>, Vec<H::Hash>>(next) };
         }
@@ -150,6 +162,23 @@ fn blake2s_fast_path<H: MerkleHasherLifted + 'static>(
             std::slice::from_raw_parts(column.as_ptr() as *const u32, column.len())
         })
         .collect();
+    // Apple-GPU path for large uniform-size commitments; bit-identical output, with
+    // the SIMD builder as fallback (no device / unsupported shape).
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    {
+        use crate::prover::backend::metal::blake2s::{build_leaves_metal, MIN_METAL_LOG_SIZE};
+        let n_rows = flat_columns[0].len();
+        if n_rows >= 1 << MIN_METAL_LOG_SIZE
+            && flat_columns.iter().all(|c| c.len() == n_rows)
+            && n_rows == 1 << lifting_log_size
+        {
+            if let Some(leaves) = build_leaves_metal(&flat_columns, is_m31) {
+                return Some(unsafe {
+                    std::mem::transmute::<Vec<Blake2sHash>, Vec<H::Hash>>(leaves)
+                });
+            }
+        }
+    }
     let leaves = if is_m31 {
         build_leaves_from_flat_columns::<true>(&flat_columns, lifting_log_size)
     } else {
