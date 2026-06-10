@@ -111,19 +111,30 @@ impl PackLeavesOps for CpuBackend {
         let packed_len = len_m31 / PACKED_LEAF_SIZE;
         let cpu_columns: [Vec<BaseField>; SECURE_EXTENSION_DEGREE] =
             core::array::from_fn(|coord| values[coord].to_cpu());
+        // Each output slot is a pure function of (packed_row, offset, coord); fill the
+        // packed columns in parallel.
         let mut packed_cpu: [Vec<BaseField>; SECURE_EXTENSION_DEGREE * PACKED_LEAF_SIZE] =
-            core::array::from_fn(|_| Vec::with_capacity(packed_len));
+            core::array::from_fn(|_| vec![BaseField::default(); packed_len]);
 
-        for packed_row in 0..packed_len {
-            let row_start = packed_row * PACKED_LEAF_SIZE;
-            for offset in 0..PACKED_LEAF_SIZE {
-                for coord in 0..SECURE_EXTENSION_DEGREE {
-                    packed_cpu[coord + offset * SECURE_EXTENSION_DEGREE]
-                        .push(cpu_columns[coord][row_start + offset]);
-                }
+        let fill = |column_idx: usize, column: &mut Vec<BaseField>| {
+            let coord = column_idx % SECURE_EXTENSION_DEGREE;
+            let offset = column_idx / SECURE_EXTENSION_DEGREE;
+            let src = &cpu_columns[coord];
+            for (packed_row, slot) in column.iter_mut().enumerate() {
+                *slot = src[packed_row * PACKED_LEAF_SIZE + offset];
             }
-        }
+        };
+        #[cfg(feature = "parallel")]
+        packed_cpu
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, col)| fill(i, col));
+        #[cfg(not(feature = "parallel"))]
+        packed_cpu
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, col)| fill(i, col));
 
-        packed_cpu.map(|column| column.into_iter().collect())
+        packed_cpu
     }
 }
