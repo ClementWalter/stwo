@@ -389,6 +389,7 @@ pub fn prove_poseidon(
     );
     info!("Poseidon component info:\n{}", component);
     let proof = prove(&[&component], channel, commitment_scheme).unwrap();
+    crate::maybe_dump_proof_hash("simd_poseidon", &proof);
 
     (component, proof)
 }

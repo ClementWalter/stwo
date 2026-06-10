@@ -306,6 +306,20 @@ impl PolyOps for SimdBackend {
             mappings.push(x);
             x = CirclePoint::double_x(x);
         }
+        // Above the cached-fft size, SIMD coefficient vectors are stored
+        // vec-transposed; permute the mappings the same way
+        // [`Self::generate_evaluation_mappings`] does so the basis pairs with the
+        // stored coefficient order.
+        if log_size > CACHED_FFT_LOG_SIZE {
+            mappings.reverse();
+            let n = mappings.len();
+            let n0 = (n - LOG_N_LANES as usize) / 2;
+            let n1 = (n - LOG_N_LANES as usize).div_ceil(2);
+            let (ab, c) = mappings.split_at_mut(n1);
+            let (a, _b) = ab.split_at_mut(n0);
+            a.swap_with_slice(&mut c[0..n0]);
+            mappings.reverse();
+        }
         mappings.reverse();
 
         let (high_mappings, low_mappings) =
@@ -734,7 +748,9 @@ mod tests {
         use crate::prover::backend::CpuBackend;
 
         let mut rng = SmallRng::seed_from_u64(7);
-        for log_size in 1..=10u32 {
+        // Sizes span CACHED_FFT_LOG_SIZE: above it the SIMD coefficient layout is
+        // vec-transposed and the basis must pair with that order.
+        for log_size in (1..=10u32).chain(15..=18) {
             let coeffs: Vec<BaseField> = (0..1 << log_size)
                 .map(|_| BaseField::from(rng.gen::<u32>() >> 1))
                 .collect();
@@ -751,20 +767,34 @@ mod tests {
 
             // The SIMD slow-eval fallback assumes larger sizes; compare against the CPU
             // value, which the CPU assertion above already ties to eval_at_point.
-            let simd_poly = crate::prover::poly::circle::CircleCoefficients::<SimdBackend>::new(
-                coeffs.into_iter().collect(),
-            );
+            // Above the cached-fft size the SIMD layout is vec-transposed; convert the
+            // natural coefficients into the stored order first.
+            let mut simd_coeffs: BaseColumn = coeffs.into_iter().collect();
+            crate::prover::backend::cpu::circle::convert_simd_coeff_order(&mut simd_coeffs);
+            let simd_poly =
+                crate::prover::poly::circle::CircleCoefficients::<SimdBackend>::new(simd_coeffs);
+            if log_size > LOG_N_LANES {
+                assert_eq!(
+                    <SimdBackend as PolyOps>::eval_at_point(&simd_poly, point),
+                    <CpuBackend as PolyOps>::eval_at_point(&cpu_poly, point),
+                    "simd eval_at_point log_size {log_size}"
+                );
+            }
             let simd_basis = <SimdBackend as PolyOps>::eval_basis_at_point(log_size, point);
             assert_eq!(
                 <SimdBackend as PolyOps>::eval_at_point_with_basis(&simd_poly, &simd_basis),
                 <CpuBackend as PolyOps>::eval_at_point(&cpu_poly, point),
                 "simd log_size {log_size}"
             );
-            assert_eq!(
-                cpu_basis,
-                simd_basis.to_cpu(),
-                "basis mismatch log_size {log_size}"
-            );
+            // Above the cached-fft size the SIMD basis is deliberately permuted to the
+            // vec-transposed coefficient order, so it differs from the CPU basis.
+            if log_size <= CACHED_FFT_LOG_SIZE {
+                assert_eq!(
+                    cpu_basis,
+                    simd_basis.to_cpu(),
+                    "basis mismatch log_size {log_size}"
+                );
+            }
         }
     }
     use itertools::Itertools;

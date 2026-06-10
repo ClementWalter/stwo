@@ -819,6 +819,28 @@ mod bench {
     #[test]
     #[ignore]
     fn fft_kernel_bench() {
+        // Per-size probe: 2^14 is a single fully-contiguous pass; larger sizes add
+        // the strided second pass, exposing its bandwidth efficiency.
+        for probe_log in [14u32, 17, 20] {
+            let twiddles = <CpuBackend as PolyOps>::precompute_twiddles(
+                CanonicCoset::new(probe_log + 2).circle_domain().half_coset,
+            );
+            let domain = CanonicCoset::new(probe_log).circle_domain();
+            let mut values: Vec<BaseField> = (0..1u32 << probe_log)
+                .map(|i| BaseField::from_u32_unchecked((i.wrapping_mul(2654435761)) >> 1))
+                .collect();
+            assert!(ifft_metal(&mut values, domain, &twiddles));
+            let n = 50;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                ifft_metal(&mut values, domain, &twiddles);
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+            std::println!(
+                "ifft@2^{probe_log}: {ms:.3} ms ({:.1} ns/elem)",
+                ms * 1e6 / (1u64 << probe_log) as f64
+            );
+        }
         const LOG: u32 = 22;
         let twiddles = <CpuBackend as PolyOps>::precompute_twiddles(
             CanonicCoset::new(LOG + 2).circle_domain().half_coset,

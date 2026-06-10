@@ -512,6 +512,7 @@ mod tests {
                 commitment_scheme,
             )
             .unwrap();
+            crate::maybe_dump_proof_hash("simd_wide_fib", &proof);
 
             // Verify.
             let verifier_channel = &mut Blake2sM31Channel::default();

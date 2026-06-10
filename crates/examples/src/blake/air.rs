@@ -546,6 +546,7 @@ mod tests {
 
         // Prove.
         let proof = prove_blake::<Blake2sMerkleChannel>(log_n_instances, config);
+        crate::maybe_dump_proof_hash("simd_blake", &proof.stark_proof);
 
         // Verify.
         verify_blake::<Blake2sMerkleChannel>(proof).unwrap();
