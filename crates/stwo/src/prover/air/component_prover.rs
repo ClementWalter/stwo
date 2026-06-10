@@ -55,6 +55,14 @@ impl<B: Backend> Poly<B> {
         weights_hash_map: Option<&WeightsHashMap<B>>,
     ) -> SecureField {
         if let Some(coeffs) = &self.coeffs {
+            // When a precomputed FFT-basis column exists for this (size, point), the
+            // evaluation is its dot product with the coefficients; the basis is shared
+            // by every polynomial of the same size sampled at the same point.
+            if let Some(map) = weights_hash_map {
+                if let Some(basis) = map.get(&(coeffs.log_size(), point)) {
+                    return B::eval_at_point_with_basis(coeffs, &basis);
+                }
+            }
             coeffs.eval_at_point(point)
         } else {
             self.evals.barycentric_eval_at_point(

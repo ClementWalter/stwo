@@ -1,5 +1,7 @@
+use std::iter::zip;
+
 use itertools::Itertools;
-use num_traits::Zero;
+use num_traits::{One, Zero};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
@@ -96,6 +98,50 @@ impl PolyOps for CpuBackend {
         mappings.reverse();
 
         fold(&poly.coeffs, &mappings)
+    }
+
+    fn eval_basis_at_point(log_size: u32, point: CirclePoint<SecureField>) -> Vec<SecureField> {
+        if log_size == 0 {
+            return vec![SecureField::one()];
+        }
+        // Folding factors in [`fold`]'s order: factors[0] selects the most significant
+        // coefficient-index bit, so the basis doubles through them in reverse.
+        let mut mappings = vec![point.y];
+        let mut x = point.x;
+        for _ in 1..log_size {
+            mappings.push(x);
+            x = CirclePoint::double_x(x);
+        }
+        mappings.reverse();
+
+        let mut basis = Vec::with_capacity(1 << log_size);
+        basis.push(SecureField::one());
+        for &m in mappings.iter().rev() {
+            let len = basis.len();
+            // The high half is the low half scaled by the factor.
+            #[cfg(feature = "parallel")]
+            if len >= 1 << 14 {
+                let mut high: Vec<SecureField> = Vec::with_capacity(len);
+                basis[..len]
+                    .par_iter()
+                    .map(|&b| b * m)
+                    .collect_into_vec(&mut high);
+                basis.extend_from_slice(&high);
+                continue;
+            }
+            for i in 0..len {
+                basis.push(basis[i] * m);
+            }
+        }
+        basis
+    }
+
+    fn eval_at_point_with_basis(
+        poly: &CircleCoefficients<Self>,
+        basis: &Vec<SecureField>,
+    ) -> SecureField {
+        assert_eq!(poly.coeffs.len(), basis.len());
+        zip(&poly.coeffs, basis).fold(SecureField::zero(), |acc, (&c, &b)| acc + b * c)
     }
 
     fn barycentric_weights(
