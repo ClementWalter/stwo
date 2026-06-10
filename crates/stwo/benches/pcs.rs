@@ -10,6 +10,7 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::{BackendForChannel, CpuBackend};
 use stwo::prover::mempool::BaseColumnPool;
 use stwo::prover::poly::circle::CircleEvaluation;
+use stwo::prover::poly::circle::EvalsOrCoeffs;
 use stwo::prover::poly::twiddles::TwiddleTree;
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::CommitmentTreeProver;
@@ -22,13 +23,10 @@ fn benched_fn<B: BackendForChannel<Blake2sMerkleChannel>>(
     evals: Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
     twiddles: &TwiddleTree<B>,
 ) {
-    let polys = evals
-        .into_iter()
-        .map(|eval| eval.interpolate_with_twiddles(twiddles))
-        .collect();
+    let columns = evals.into_iter().map(EvalsOrCoeffs::Evals).collect();
 
     CommitmentTreeProver::<B, Blake2sMerkleChannel>::new(
-        polys,
+        columns,
         LOG_BLOWUP_FACTOR,
         twiddles,
         false,
