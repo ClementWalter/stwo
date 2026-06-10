@@ -21,7 +21,7 @@ use stwo::prover::secure_column::SecureColumnByCoords;
 use stwo::prover::{ComponentProver, DomainEvaluationAccumulator, EvaluationMode, Poly, Trace};
 use tracing::{span, Level};
 
-use super::{CpuDomainEvaluator, SimdDomainEvaluator};
+use super::{BatchCpuDomainEvaluator, CpuDomainEvaluator, SimdDomainEvaluator};
 use crate::{FrameworkComponent, FrameworkEval, PREPROCESSED_TRACE_IDX};
 
 /// Number of very-packed rows evaluated per rayon task. Large enough to amortize
@@ -329,11 +329,17 @@ fn accumulate_pointwise_cpu<E: FrameworkEval + Sync>(
 ) -> SecureColumnByCoords<CpuBackend> {
     let mut res = SecureColumnByCoords::zeros(1 << eval_log_size);
 
-    // Rows are independent; evaluate disjoint row chunks concurrently. Each chunk owns
-    // a disjoint range of every coordinate column.
+    // Rows are independent; evaluate disjoint row chunks concurrently (each chunk owns
+    // a disjoint range of every coordinate column), and within a chunk evaluate BATCH
+    // consecutive rows at a time: lanes break the per-row dependency chains of deep
+    // constraint expressions.
+    const BATCH: usize = 8;
     let chunk_size = 1 << 12;
     let trace_cols = &trace_cols;
     let denom_inv = &denom_inv;
+    let batch_powers =
+        BatchCpuDomainEvaluator::<BATCH>::broadcast_random_coeff_powers(random_coeff_powers);
+    let batch_powers = &batch_powers;
     let mut chunk_views = {
         let [c0, c1, c2, c3]: &mut [Vec<BaseField>; 4] = &mut res.columns;
         (c0.chunks_mut(chunk_size))
@@ -346,7 +352,37 @@ fn accumulate_pointwise_cpu<E: FrameworkEval + Sync>(
     };
 
     let process_chunk = |(start, chunk): &mut (usize, [&mut [BaseField]; 4])| {
-        for idx in 0..chunk[0].len() {
+        let rows = chunk[0].len();
+        let mut idx = 0;
+        while idx + BATCH <= rows {
+            let row = *start + idx;
+            // Evaluate constraints at rows row..row + BATCH.
+            let eval = BatchCpuDomainEvaluator::<BATCH>::new(
+                trace_cols,
+                row,
+                batch_powers,
+                trace_log_size,
+                eval_log_size,
+                component_eval.log_size(),
+                claimed_sum,
+            );
+            let row_res = component_eval.evaluate(eval).row_res;
+
+            // Finalize the batch.
+            for (k, lane_res) in row_res.0.into_iter().enumerate() {
+                let lane_row = row + k;
+                let row_denom_inv = denom_inv[lane_row >> trace_log_size];
+                let [v0, v1, v2, v3] =
+                    (accum.at(lane_row) + lane_res * row_denom_inv).to_m31_array();
+                chunk[0][idx + k] = v0;
+                chunk[1][idx + k] = v1;
+                chunk[2][idx + k] = v2;
+                chunk[3][idx + k] = v3;
+            }
+            idx += BATCH;
+        }
+        // Tail rows shorter than a batch.
+        for idx in idx..rows {
             let row = *start + idx;
             // Evaluate constrains at row.
             let eval = CpuDomainEvaluator::new(
