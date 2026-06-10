@@ -60,11 +60,16 @@ impl<H: MerkleHasherLifted + Send + Sync> MerkleOpsLifted<H> for CpuBackend {
                 .collect();
 
             // We chunk by 16 because it's the amount of M31 elements needed to trigger a
-            // hash permutation, both in blake and in poseidon. Rows absorb independently.
+            // hash permutation, both in blake and in poseidon. Rows absorb independently;
+            // each row gathers its chunk values into a stack buffer.
             for chunk in &group.into_iter().chunks(16) {
                 let vec = chunk.into_iter().collect_vec();
                 let update_row = |(i, hasher): (usize, &mut H)| {
-                    hasher.update_leaf(&vec.iter().map(|v| v[i]).collect_vec());
+                    let mut row_values = [BaseField::default(); 16];
+                    for (slot, col) in row_values.iter_mut().zip(vec.iter()) {
+                        *slot = col[i];
+                    }
+                    hasher.update_leaf(&row_values[..vec.len()]);
                 };
                 #[cfg(feature = "parallel")]
                 prev_layer.par_iter_mut().enumerate().for_each(update_row);
