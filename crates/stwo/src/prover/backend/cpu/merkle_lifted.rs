@@ -1,6 +1,6 @@
 use itertools::Itertools;
 #[cfg(feature = "parallel")]
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::prelude::*;
 
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SECURE_EXTENSION_DEGREE;
@@ -10,7 +10,7 @@ use crate::parallel_iter;
 use crate::prover::backend::{Col, Column, CpuBackend};
 use crate::prover::vcs_lifted::ops::{MerkleOpsLifted, PackLeavesOps};
 
-impl<H: MerkleHasherLifted> MerkleOpsLifted<H> for CpuBackend {
+impl<H: MerkleHasherLifted + Send + Sync> MerkleOpsLifted<H> for CpuBackend {
     /// Computes the leaves of the Merkle tree. This is the core logic of the lifted Merkle
     /// commitment. The input columns are assumed to be in increasing order of length.
     ///
@@ -54,7 +54,7 @@ impl<H: MerkleHasherLifted> MerkleOpsLifted<H> for CpuBackend {
         let mut prev_layer_log_size: u32 = 1;
         for (log_size, group) in columns.iter().group_by(|c| c.len().ilog2()).into_iter() {
             let log_ratio = log_size - prev_layer_log_size;
-            prev_layer = (0..1 << log_size)
+            prev_layer = parallel_iter!(0..1 << log_size)
                 // We only clone when starting a column chunk of different size.
                 .map(|idx| prev_layer[(idx >> (log_ratio + 1) << 1) + (idx & 1)].clone())
                 .collect();
@@ -62,22 +62,29 @@ impl<H: MerkleHasherLifted> MerkleOpsLifted<H> for CpuBackend {
             // We chunk by 16 — the amount of M31 elements that triggers a hash permutation
             // in Blake2s (block = 64 bytes = 16 × 4) and matches Poseidon252's absorption rate.
             // For Keccak256 the rate is larger (136 bytes ≈ 34 M31s), so this chunking is
-            // suboptimal but still correct.
+            // suboptimal but still correct. Rows absorb independently.
             for chunk in &group.into_iter().chunks(16) {
                 let vec = chunk.into_iter().collect_vec();
-                prev_layer.iter_mut().enumerate().for_each(|(i, hasher)| {
+                let update_row = |(i, hasher): (usize, &mut H)| {
                     hasher.update_leaf(&vec.iter().map(|v| v[i]).collect_vec());
-                })
+                };
+                #[cfg(feature = "parallel")]
+                prev_layer.par_iter_mut().enumerate().for_each(update_row);
+                #[cfg(not(feature = "parallel"))]
+                prev_layer.iter_mut().enumerate().for_each(update_row);
             }
             prev_layer_log_size = log_size;
         }
 
         let log_ratio = lifting_log_size - prev_layer_log_size;
         if log_ratio > 0 {
-            prev_layer = (0..1 << lifting_log_size)
+            prev_layer = parallel_iter!(0..1 << lifting_log_size)
                 .map(|idx| prev_layer[(idx >> (log_ratio + 1) << 1) + (idx & 1)].clone())
                 .collect();
         }
+        #[cfg(feature = "parallel")]
+        return prev_layer.into_par_iter().map(|x| x.finalize()).collect();
+        #[cfg(not(feature = "parallel"))]
         prev_layer.into_iter().map(|x| x.finalize()).collect()
     }
 

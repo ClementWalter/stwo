@@ -428,6 +428,67 @@ mod tests {
         verify(&[&component], verifier_channel, commitment_scheme, proof).unwrap();
     }
 
+    /// End-to-end CPU-backend proof of the wide Fibonacci AIR. The CPU backend is the
+    /// proving path for consumers without nightly SIMD; size is overridable for
+    /// benchmarking:
+    ///   CPU_FIB_LOG_N_INSTANCES=18 cargo test --release test_cpu_e2e_wide_fib_prove
+    #[test]
+    fn test_cpu_e2e_wide_fib_prove() {
+        let log_n_instances: u32 = std::env::var("CPU_FIB_LOG_N_INSTANCES")
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(8);
+        let config = PcsConfig::default();
+        // Precompute twiddles.
+        let twiddles = CpuBackend::precompute_twiddles(
+            CanonicCoset::new(log_n_instances + 1 + config.fri_config.log_blowup_factor)
+                .circle_domain()
+                .half_coset,
+        );
+
+        // Setup protocol.
+        let prover_channel = &mut Blake2sM31Channel::default();
+        let mut commitment_scheme =
+            CommitmentSchemeProver::<CpuBackend, Blake2sM31MerkleChannel>::new(config, &twiddles);
+        commitment_scheme.set_store_polynomials_coefficients();
+        // Preprocessed trace
+        let mut tree_builder = commitment_scheme.tree_builder();
+        tree_builder.extend_evals(vec![]);
+        tree_builder.commit(prover_channel);
+
+        // Trace.
+        let trace =
+            generate_trace::<FIB_SEQUENCE_LENGTH, _>(&generate_test_inputs(log_n_instances));
+        let mut tree_builder = commitment_scheme.tree_builder();
+        tree_builder.extend_evals(trace);
+        tree_builder.commit(prover_channel);
+
+        // Generate component.
+        let component = WideFibonacciComponent::new(
+            &mut TraceLocationAllocator::default(),
+            WideFibonacciEval::<FIB_SEQUENCE_LENGTH> {
+                log_n_rows: log_n_instances,
+            },
+            SecureField::zero(),
+        );
+
+        // Prove.
+        let proof = prove::<CpuBackend, Blake2sM31MerkleChannel>(
+            &[&component],
+            prover_channel,
+            commitment_scheme,
+        )
+        .unwrap();
+
+        // Verify.
+        let verifier_channel = &mut Blake2sM31Channel::default();
+        let commitment_scheme =
+            &mut CommitmentSchemeVerifier::<Blake2sM31MerkleChannel>::new(config);
+        let sizes = component.trace_log_degree_bounds();
+        commitment_scheme.commit(proof.commitments[0], &sizes[0], verifier_channel);
+        commitment_scheme.commit(proof.commitments[1], &sizes[1], verifier_channel);
+        verify(&[&component], verifier_channel, commitment_scheme, proof).unwrap();
+    }
+
     #[test]
     fn test_e2e_lifted_fib_prove() {
         const LOG_SIZE_SHORT: u32 = 3;
