@@ -128,6 +128,70 @@ impl SimdBackend {
     }
 }
 
+/// Runs the inverse circle FFT in place over `2^domain.log_size()` M31 values in
+/// bit-reversed circle-domain order, leaving FFT-basis coefficients scaled by `1/N`
+/// (in the kernel's large-transform layout above `CACHED_FFT_LOG_SIZE`).
+///
+/// # Safety
+///
+/// `values` must be 64-byte aligned and valid for reads and writes of `domain.size()`
+/// u32 elements. `domain.log_size()` must be at least [`MIN_FFT_LOG_SIZE`].
+pub(crate) unsafe fn ifft_in_place_raw(
+    values: *mut u32,
+    domain: CircleDomain,
+    twiddles: &TwiddleTree<SimdBackend>,
+) {
+    let log_size = domain.log_size();
+    let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddles.itwiddles);
+    ifft::ifft(values, &line_twiddles, log_size as usize);
+
+    let inv = PackedBaseField::broadcast(BaseField::from(domain.size()).inverse());
+    let packed = std::slice::from_raw_parts_mut(
+        values as *mut PackedBaseField,
+        1 << (log_size - LOG_N_LANES),
+    );
+    packed.iter_mut().for_each(|x| *x *= inv);
+}
+
+/// Runs the circle FFT from `2^fft_log_size` coefficients at `src` (in the layout
+/// [`ifft_in_place_raw`] produces) onto `domain`, writing `domain.size()` evaluations to
+/// `dst`. Domains larger than the polynomial are covered subdomain by subdomain.
+///
+/// # Safety
+///
+/// `src`/`dst` must be 64-byte aligned, non-overlapping, and valid for reads of
+/// `2^fft_log_size` / writes of `domain.size()` u32 elements respectively.
+/// `fft_log_size` must be at least [`MIN_FFT_LOG_SIZE`] and at most `domain.log_size()`.
+pub(crate) unsafe fn rfft_raw(
+    src: *const u32,
+    dst: *mut u32,
+    fft_log_size: u32,
+    domain: CircleDomain,
+    twiddles: &TwiddleTree<SimdBackend>,
+) {
+    let log_size = domain.log_size();
+    let twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
+
+    // Evaluate on big domains by evaluating on several subdomains.
+    let log_subdomains = log_size - fft_log_size;
+    for i in 0..(1usize << log_subdomains) {
+        // The subdomain twiddles are a slice of the large domain twiddles.
+        let subdomain_twiddles = (0..(fft_log_size - 1))
+            .map(|layer_i| {
+                &twiddles[layer_i as usize]
+                    [i << (fft_log_size - 2 - layer_i)..(i + 1) << (fft_log_size - 2 - layer_i)]
+            })
+            .collect::<Vec<_>>();
+
+        rfft::fft(
+            src,
+            dst.add(i << fft_log_size),
+            &subdomain_twiddles,
+            fft_log_size as usize,
+        );
+    }
+}
+
 // TODO(shahars): Everything is returned in redundant representation, where values can also be P.
 // Decide if and when it's ok and what to do if it's not.
 impl PolyOps for SimdBackend {
@@ -148,20 +212,14 @@ impl PolyOps for SimdBackend {
         }
 
         let mut values = eval.values;
-        let twiddles = domain_line_twiddles_from_tree(eval.domain, &twiddles.itwiddles);
-
         // Safe because [PackedBaseField] is aligned on 64 bytes.
         unsafe {
-            ifft::ifft(
+            ifft_in_place_raw(
                 transmute::<*mut PackedBaseField, *mut u32>(values.data.as_mut_ptr()),
-                &twiddles,
-                log_size as usize,
+                eval.domain,
+                twiddles,
             );
         }
-
-        // TODO(alont): Cache this inversion.
-        let inv = PackedBaseField::broadcast(BaseField::from(eval.domain.size()).inverse());
-        values.data.iter_mut().for_each(|x| *x *= inv);
 
         CircleCoefficients::new(values)
     }
@@ -473,33 +531,16 @@ impl PolyOps for SimdBackend {
             );
         }
 
-        let twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
-
-        // Evaluate on big domains by evaluating on several subdomains.
-        let log_subdomains = log_size - fft_log_size;
-
-        for i in 0..(1 << log_subdomains) {
-            // The subdomain twiddles are a slice of the large domain twiddles.
-            let subdomain_twiddles = (0..(fft_log_size - 1))
-                .map(|layer_i| {
-                    &twiddles[layer_i as usize]
-                        [i << (fft_log_size - 2 - layer_i)..(i + 1) << (fft_log_size - 2 - layer_i)]
-                })
-                .collect::<Vec<_>>();
-
-            // FFT from the coefficients buffer directly into the provided buffer.
-            unsafe {
-                rfft::fft(
-                    transmute::<*const PackedBaseField, *const u32>(poly.coeffs.data.as_ptr()),
-                    transmute::<*mut PackedBaseField, *mut u32>(
-                        buffer.data[i << (fft_log_size - LOG_N_LANES)
-                            ..(i + 1) << (fft_log_size - LOG_N_LANES)]
-                            .as_mut_ptr(),
-                    ),
-                    &subdomain_twiddles,
-                    fft_log_size as usize,
-                );
-            }
+        // Safe because [PackedBaseField] is aligned on 64 bytes and the buffer has
+        // `domain.size()` writable elements.
+        unsafe {
+            rfft_raw(
+                transmute::<*const PackedBaseField, *const u32>(poly.coeffs.data.as_ptr()),
+                transmute::<*mut PackedBaseField, *mut u32>(buffer.data.as_mut_ptr()),
+                fft_log_size,
+                domain,
+                twiddles,
+            );
         }
 
         CircleEvaluation::new(domain, buffer)
