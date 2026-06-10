@@ -79,6 +79,57 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
     }
 }
 
+/// Single-pass leaf builder for the common case where every column has the same length,
+/// equal to the lifting size. The Blake state stays in registers across all absorb
+/// blocks of a row group, instead of streaming 512B of intermediate state per 16 rows
+/// through memory once per 16-column chunk as the general mixed-size path does.
+#[allow(clippy::uninit_vec)]
+fn build_leaves_uniform<const IS_M31_OUTPUT: bool>(columns: &[&[u32]]) -> Vec<Blake2sHash> {
+    let n_groups = columns[0].len() / N_LANES;
+    let last_chunk_index =
+        (columns.len() - 1) / N_FELTS_IN_BLAKE_MESSAGE * N_FELTS_IN_BLAKE_MESSAGE;
+
+    // Safety: every entry is written exactly once below.
+    let mut res: Vec<Blake2sHash> = unsafe { uninit_vec(n_groups << LOG_N_HASHES_PER_SIMD_STATE) };
+
+    let hash_group = |(i, dst): (usize, &mut [Blake2sHash])| {
+        let mut state = INITIAL_STATE;
+        let mut byte_count = 0_u64;
+        for chunk in columns[..last_chunk_index].chunks(N_FELTS_IN_BLAKE_MESSAGE) {
+            byte_count += N_BYTES_IN_BLAKE_MESSAGE;
+            let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = std::array::from_fn(|j| {
+                u32x16::from_slice(&chunk[j][i * N_LANES..(i + 1) * N_LANES])
+            });
+            state = compress_unfinalized(state, msgs, byte_count);
+        }
+        byte_count += ((columns.len() - last_chunk_index) * N_BYTES_FELT) as u64;
+        let mut msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = unsafe { std::mem::zeroed() };
+        for (j, column) in columns[last_chunk_index..].iter().enumerate() {
+            msgs[j] = u32x16::from_slice(&column[i * N_LANES..(i + 1) * N_LANES]);
+        }
+        let state = compress_finalize(state, msgs, byte_count);
+        let untransposed = if IS_M31_OUTPUT {
+            let tmp = untranspose_states(state);
+            std::array::from_fn(|k| reduce_to_m31_simd(tmp[k]))
+        } else {
+            untranspose_states(state)
+        };
+        let dst: &mut [Blake2sHash; 16] = dst.try_into().unwrap();
+        *dst = unsafe { transmute::<[u32x16; 8], [Blake2sHash; 16]>(untransposed) };
+    };
+
+    #[cfg(feature = "parallel")]
+    res.par_chunks_exact_mut(1 << LOG_N_HASHES_PER_SIMD_STATE)
+        .enumerate()
+        .for_each(hash_group);
+    #[cfg(not(feature = "parallel"))]
+    res.chunks_exact_mut(1 << LOG_N_HASHES_PER_SIMD_STATE)
+        .enumerate()
+        .for_each(hash_group);
+
+    res
+}
+
 /// Computes the lifted-tree leaves for blake2s over flat `u32` field-representative
 /// columns (each a power-of-two length, sorted increasingly, all >= [`N_LANES`]),
 /// hashing 16 rows per SIMD state. Shared by the SIMD backend and the CPU backend's
@@ -89,6 +140,11 @@ pub(crate) fn build_leaves_from_flat_columns<const IS_M31_OUTPUT: bool>(
     lifting_log_size: u32,
 ) -> Vec<Blake2sHash> {
     {
+        if columns.iter().all(|c| c.len() == columns[0].len())
+            && columns[0].len() / N_LANES == 1 << (lifting_log_size - LOG_N_LANES)
+        {
+            return build_leaves_uniform::<IS_M31_OUTPUT>(columns);
+        }
         // Note that, in this function, all variables that track log sizes
         // refer to the "size" in terms of PackedM31 (e.g. the log size of a column
         // of 4 PackedM31 elements is 2).
