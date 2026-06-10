@@ -1,11 +1,13 @@
 use itertools::Itertools;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::FieldExpOps;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::ColumnVec;
 use stwo::prover::backend::simd::m31::PackedBaseField;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::{Backend, Col, Column};
+use stwo::prover::backend::{Backend, Col, Column, CpuBackend};
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
 use stwo_constraint_framework::{EvalAtRow, FrameworkComponent, FrameworkEval};
@@ -46,6 +48,62 @@ pub fn generate_trace<const N: usize, B: Backend>(
     trace
         .into_iter()
         .map(|eval| CircleEvaluation::<B, _, BitReversedOrder>::new(domain, eval))
+        .collect_vec()
+}
+
+/// Same as [`generate_trace`] for the CPU backend, filling row chunks in parallel.
+pub fn generate_trace_cpu_parallel<const N: usize>(
+    inputs: &[FibInput],
+) -> ColumnVec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>> {
+    assert!(inputs.len().is_power_of_two());
+    let log_size = inputs.len().ilog2();
+    let mut trace: Vec<Vec<BaseField>> = (0..N)
+        .map(|_| Col::<CpuBackend, BaseField>::zeros(1 << log_size))
+        .collect_vec();
+
+    // Rows (instances) are independent; fill disjoint row chunks of every column
+    // concurrently.
+    let chunk_size = 1 << 12;
+    let mut col_chunks = trace
+        .iter_mut()
+        .map(|c| c.chunks_mut(chunk_size))
+        .collect_vec();
+    let n_chunks = inputs.len().div_ceil(chunk_size);
+    let mut chunk_views = (0..n_chunks)
+        .map(|i| {
+            (
+                i * chunk_size,
+                col_chunks
+                    .iter_mut()
+                    .map(|it| it.next().unwrap())
+                    .collect_vec(),
+            )
+        })
+        .collect_vec();
+
+    let process_chunk = |(start, cols): &mut (usize, Vec<&mut [BaseField]>)| {
+        for idx in 0..cols[0].len() {
+            let input = &inputs[*start + idx];
+            let mut a = input.a;
+            let mut b = input.b;
+            cols[0][idx] = a;
+            cols[1][idx] = b;
+            cols.iter_mut().skip(2).for_each(|col| {
+                (a, b) = (b, a.square() + b.square());
+                col[idx] = b;
+            });
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    chunk_views.par_iter_mut().for_each(process_chunk);
+    #[cfg(not(feature = "parallel"))]
+    chunk_views.iter_mut().for_each(process_chunk);
+
+    let domain = CanonicCoset::new(log_size).circle_domain();
+    trace
+        .into_iter()
+        .map(|eval| CircleEvaluation::<CpuBackend, _, BitReversedOrder>::new(domain, eval))
         .collect_vec()
 }
 
@@ -126,7 +184,9 @@ mod tests {
     };
 
     use super::WideFibonacciEval;
-    use crate::wide_fibonacci::{generate_trace, FibInput, WideFibonacciComponent};
+    use crate::wide_fibonacci::{
+        generate_trace, generate_trace_cpu_parallel, FibInput, WideFibonacciComponent,
+    };
 
     const FIB_SEQUENCE_LENGTH: usize = 100;
 
@@ -456,8 +516,9 @@ mod tests {
         tree_builder.commit(prover_channel);
 
         // Trace.
-        let trace =
-            generate_trace::<FIB_SEQUENCE_LENGTH, _>(&generate_test_inputs(log_n_instances));
+        let trace = generate_trace_cpu_parallel::<FIB_SEQUENCE_LENGTH>(&generate_test_inputs(
+            log_n_instances,
+        ));
         let mut tree_builder = commitment_scheme.tree_builder();
         tree_builder.extend_evals(trace);
         tree_builder.commit(prover_channel);
