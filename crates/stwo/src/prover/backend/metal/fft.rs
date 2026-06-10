@@ -476,6 +476,27 @@ pub(crate) fn fused_transform_metal(
     twiddles: &TwiddleTree<CpuBackend>,
     store_polynomials_coefficients: bool,
 ) -> Result<Vec<Poly<CpuBackend>>, Vec<EvalsOrCoeffs<CpuBackend>>> {
+    fused_transform_metal_with_itwiddles(
+        columns,
+        log_blowup_factor,
+        twiddles,
+        None,
+        store_polynomials_coefficients,
+    )
+}
+
+/// Like [`fused_transform_metal`], with a separate inverse-twiddle tree for the
+/// interpolation step — needed when the evaluations live on a split subdomain, whose
+/// twiddles are a strided extraction from the full tree rather than its tail layers.
+#[allow(clippy::type_complexity)]
+pub(crate) fn fused_transform_metal_with_itwiddles(
+    columns: Vec<EvalsOrCoeffs<CpuBackend>>,
+    log_blowup_factor: u32,
+    twiddles: &TwiddleTree<CpuBackend>,
+    ifft_twiddles: Option<&TwiddleTree<CpuBackend>>,
+    store_polynomials_coefficients: bool,
+) -> Result<Vec<Poly<CpuBackend>>, Vec<EvalsOrCoeffs<CpuBackend>>> {
+    let itw = ifft_twiddles.unwrap_or(twiddles);
     let small = columns.iter().any(|column| {
         let log_size = match column {
             EvalsOrCoeffs::Evals(evals) => evals.domain.log_size(),
@@ -527,13 +548,7 @@ pub(crate) fn fused_transform_metal(
     let domains: Vec<CircleDomain> = work.iter().map(|w| w.1).collect();
     for &domain in &domains {
         let ext_domain = CanonicCoset::new(domain.log_size() + log_blowup_factor).circle_domain();
-        pack_twiddles(
-            &mut ctx,
-            domain,
-            twiddles.root_coset,
-            &twiddles.itwiddles,
-            true,
-        );
+        pack_twiddles(&mut ctx, domain, itw.root_coset, &itw.itwiddles, true);
         pack_twiddles(
             &mut ctx,
             ext_domain,
@@ -554,8 +569,8 @@ pub(crate) fn fused_transform_metal(
         }
         let n_log = domain.log_size();
         let key = (
-            twiddles.root_coset.initial_index.0 as u32,
-            twiddles.root_coset.log_size,
+            itw.root_coset.initial_index.0 as u32,
+            itw.root_coset.log_size,
             n_log,
             true,
         );

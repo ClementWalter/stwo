@@ -251,6 +251,58 @@ fn extend_quotients(
     eval_domain: crate::core::poly::circle::CircleDomain,
     twiddles: &TwiddleTree<CpuBackend>,
 ) -> SecureEvaluation<CpuBackend, BitReversedOrder> {
+    // Apple-GPU path: all four coordinate transforms (interpolate on the subdomain with
+    // its extracted twiddles + evaluate on the lifted domain) in one submission instead
+    // of eight synchronized single-column dispatches.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    let quotients: SecureColumnByCoords<CpuBackend> = {
+        use crate::prover::poly::circle::EvalsOrCoeffs;
+        let columns = quotients
+            .columns
+            .into_iter()
+            .map(|column| {
+                EvalsOrCoeffs::Evals(
+                    CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+                        eval_subdomain,
+                        column,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let log_blowup = eval_domain.log_size() - eval_subdomain.log_size();
+        let subdomain_twiddles = TwiddleTree {
+            root_coset: eval_subdomain.half_coset,
+            twiddles: TwiddleBuffer::empty(),
+            itwiddles: twiddles
+                .itwiddles
+                .extract_subdomain_twiddles(eval_domain.log_size(), eval_subdomain.log_size()),
+        };
+        match crate::prover::backend::metal::fft::fused_transform_metal_with_itwiddles(
+            columns,
+            log_blowup,
+            twiddles,
+            Some(&subdomain_twiddles),
+            false,
+        ) {
+            Ok(polys) => {
+                let mut values = polys.into_iter().map(|poly| poly.evals.values);
+                let evals = SecureColumnByCoords {
+                    columns: std::array::from_fn(|_| values.next().unwrap()),
+                };
+                return SecureEvaluation::new(eval_domain, evals);
+            }
+            Err(columns) => {
+                let mut values = columns.into_iter().map(|column| match column {
+                    EvalsOrCoeffs::Evals(evals) => evals.values,
+                    EvalsOrCoeffs::Coeffs(coeffs) => coeffs.coeffs,
+                });
+                SecureColumnByCoords {
+                    columns: std::array::from_fn(|_| values.next().unwrap()),
+                }
+            }
+        }
+    };
+
     let subdomain_twiddles = TwiddleTree {
         root_coset: eval_subdomain.half_coset,
         twiddles: TwiddleBuffer::empty(),
