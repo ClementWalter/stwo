@@ -175,6 +175,22 @@ impl<const N: usize> FrameworkEval for WideFibonacciEval<N> {
         }
         eval
     }
+
+    /// Same constraints as [`Self::evaluate`], as a Metal body (see the trait docs).
+    fn metal_constraint_body(&self) -> Option<String> {
+        Some(format!(
+            r#"
+    uint a = TRACE_AT(1, 0);
+    uint b = TRACE_AT(1, 1);
+    for (uint j = 2; j < {N}u; j++) {{
+        uint c = TRACE_AT(1, j);
+        ADD_CONSTRAINT(m31_sub(c, m31_add(m31_mul(a, a), m31_mul(b, b))));
+        a = b;
+        b = c;
+    }}
+"#
+        ))
+    }
 }
 
 #[cfg(test)]
