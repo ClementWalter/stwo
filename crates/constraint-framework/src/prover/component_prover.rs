@@ -333,13 +333,15 @@ fn accumulate_pointwise_cpu<E: FrameworkEval + Sync>(
     // a disjoint range of every coordinate column), and within a chunk evaluate BATCH
     // consecutive rows at a time: lanes break the per-row dependency chains of deep
     // constraint expressions.
-    const BATCH: usize = 32;
+    const BATCH: usize = crate::prover::batch_cpu_domain::BATCH_ROWS;
     let chunk_size = 1 << 12;
     let trace_cols = &trace_cols;
     let denom_inv = &denom_inv;
-    let batch_powers =
-        BatchCpuDomainEvaluator::<BATCH>::broadcast_random_coeff_powers(random_coeff_powers);
+    let batch_powers = BatchCpuDomainEvaluator::broadcast_random_coeff_powers(random_coeff_powers);
     let batch_powers = &batch_powers;
+    // The packed finalize broadcasts one vanishing-denominator inverse per batch, which
+    // requires the batch to stay inside one coset repetition.
+    let batch_path = BATCH <= (1 << trace_log_size);
     let mut chunk_views = {
         let [c0, c1, c2, c3]: &mut [Vec<BaseField>; 4] = &mut res.columns;
         (c0.chunks_mut(chunk_size))
@@ -352,12 +354,16 @@ fn accumulate_pointwise_cpu<E: FrameworkEval + Sync>(
     };
 
     let process_chunk = |(start, chunk): &mut (usize, [&mut [BaseField]; 4])| {
+        use stwo::prover::backend::simd::m31::{PackedM31, N_LANES};
+
+        use crate::prover::batch_cpu_domain::load_secure_coords;
+
         let rows = chunk[0].len();
         let mut idx = 0;
-        while idx + BATCH <= rows {
+        while batch_path && idx + BATCH <= rows {
             let row = *start + idx;
             // Evaluate constraints at rows row..row + BATCH.
-            let eval = BatchCpuDomainEvaluator::<BATCH>::new(
+            let eval = BatchCpuDomainEvaluator::new(
                 trace_cols,
                 row,
                 batch_powers,
@@ -368,16 +374,17 @@ fn accumulate_pointwise_cpu<E: FrameworkEval + Sync>(
             );
             let row_res = component_eval.evaluate(eval).row_res;
 
-            // Finalize the batch.
-            for (k, lane_res) in row_res.0.into_iter().enumerate() {
-                let lane_row = row + k;
-                let row_denom_inv = denom_inv[lane_row >> trace_log_size];
-                let [v0, v1, v2, v3] =
-                    (accum.at(lane_row) + lane_res * row_denom_inv).to_m31_array();
-                chunk[0][idx + k] = v0;
-                chunk[1][idx + k] = v1;
-                chunk[2][idx + k] = v2;
-                chunk[3][idx + k] = v3;
+            // Finalize the batch with packed ops; the denominator inverse is constant
+            // across the batch (chunks and batches stay coset-repetition aligned).
+            let row_denom_inv = PackedM31::broadcast(denom_inv[row >> trace_log_size]);
+            for (j, lane_res) in row_res.0.into_iter().enumerate() {
+                let lane_row = row + j * N_LANES;
+                let acc = load_secure_coords(&accum.columns, lane_row);
+                let coords = (acc + lane_res * row_denom_inv).into_packed_m31s();
+                for (c, coord) in coords.into_iter().enumerate() {
+                    chunk[c][idx + j * N_LANES..idx + (j + 1) * N_LANES]
+                        .copy_from_slice(&coord.to_array());
+                }
             }
             idx += BATCH;
         }
