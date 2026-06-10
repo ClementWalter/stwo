@@ -6,6 +6,7 @@
 pub(crate) mod blake2s;
 pub mod constraints;
 pub(crate) mod fft;
+pub(crate) mod fri;
 pub(crate) mod quotients;
 pub(crate) mod twiddles;
 
@@ -17,4 +18,5 @@ pub fn warmup() {
     fft::warmup();
     quotients::warmup();
     twiddles::warmup();
+    fri::warmup();
 }

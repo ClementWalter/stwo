@@ -45,6 +45,37 @@ impl FriOps for CpuBackend {
         let fold_step = alphas.len();
         assert!(fold_step >= 1);
 
+        // Apple-GPU path: one kernel per fold step; bit-identical to the scalar fold.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if eval.len() / 2 >= 1 << crate::prover::backend::metal::fri::MIN_METAL_FOLD_LOG_SIZE {
+            let mut domain = eval.domain();
+            let mut values = None;
+            let mut ok = true;
+            for &alpha in alphas {
+                let src = values.as_ref().unwrap_or(&eval.values);
+                match crate::prover::backend::metal::fri::fold_metal(
+                    src,
+                    domain.coset(),
+                    false,
+                    alpha,
+                ) {
+                    Some(folded) => {
+                        values = Some(folded);
+                        domain = domain.double();
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                if let Some(values) = values {
+                    return LineEvaluation::new(domain, values);
+                }
+            }
+        }
+
         // Large folds dispatch to the shared SIMD kernels (cached packed twiddles); the
         // scalar folds below remain the reference, pinned equal by the fri tests.
         if eval.len().ilog2() >= SIMD_FOLD_DISPATCH_LOG_SIZE {
@@ -71,6 +102,23 @@ impl FriOps for CpuBackend {
         alpha: SecureField,
         twiddles: &TwiddleTree<Self>,
     ) -> LineEvaluation<Self> {
+        // Apple-GPU path; bit-identical to the scalar fold.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if src.len() / 2 >= 1 << crate::prover::backend::metal::fri::MIN_METAL_FOLD_LOG_SIZE {
+            if let Some(values) = crate::prover::backend::metal::fri::fold_metal(
+                &src.values,
+                src.domain.half_coset,
+                true,
+                alpha,
+            ) {
+                let line_log_size = src.domain.log_size() - 1;
+                return LineEvaluation::new(
+                    LineDomain::new(Coset::half_odds(line_log_size)),
+                    values,
+                );
+            }
+        }
+
         // Large folds dispatch to the shared SIMD kernels; see [`FriOps::fold_line`].
         if src.len().ilog2() >= SIMD_FOLD_DISPATCH_LOG_SIZE {
             use crate::prover::backend::simd::SimdBackend;
