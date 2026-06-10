@@ -23,7 +23,7 @@ use crate::prover::backend::{BackendForChannel, Col};
 use crate::prover::fri::{FriDecommitResult, FriProver};
 use crate::prover::mempool::BaseColumnPool;
 use crate::prover::pcs::quotient_ops::compute_fri_quotients;
-use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation};
+use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, EvalsOrCoeffs};
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::vcs_lifted::prover::MerkleProverLifted;
@@ -72,12 +72,12 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         self.store_polynomials_coefficients = true;
     }
 
-    /// Evaluates the given polynomials, commits them into a Merkle tree, mixes the root into
-    /// the channel, and appends the resulting tree to the scheme.
-    fn commit(&mut self, polynomials: ColumnVec<CircleCoefficients<B>>, channel: &mut MC::C) {
+    /// Interpolates and evaluates the given columns, commits them into a Merkle tree,
+    /// mixes the root into the channel, and appends the resulting tree to the scheme.
+    fn commit(&mut self, columns: ColumnVec<EvalsOrCoeffs<B>>, channel: &mut MC::C) {
         let _span = span!(Level::INFO, "Commitment").entered();
         let tree = CommitmentTreeProver::new(
-            polynomials,
+            columns,
             self.config.fri_config.log_blowup_factor,
             self.twiddles,
             self.store_polynomials_coefficients,
@@ -358,18 +358,24 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
 pub struct TreeBuilder<'a, 'b, B: BackendForChannel<MC>, MC: MerkleChannel> {
     tree_index: usize,
     commitment_scheme: &'a mut CommitmentSchemeProver<'b, B, MC>,
-    polys: ColumnVec<CircleCoefficients<B>>,
+    polys: ColumnVec<EvalsOrCoeffs<B>>,
 }
 impl<B: BackendForChannel<MC>, MC: MerkleChannel> TreeBuilder<'_, '_, B, MC> {
+    /// Registers evaluations for commitment. Interpolation happens fused with the
+    /// low-degree extension when the tree is committed.
     pub fn extend_evals(
         &mut self,
         columns: Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
     ) -> TreeSubspan {
-        let span = span!(Level::INFO, "Interpolation for commitment").entered();
-        let polys = B::interpolate_columns(columns, self.commitment_scheme.twiddles);
-        span.exit();
-
-        self.extend_polys(polys)
+        let col_start = self.polys.len();
+        self.polys
+            .extend(columns.into_iter().map(EvalsOrCoeffs::Evals));
+        let col_end = self.polys.len();
+        TreeSubspan {
+            tree_index: self.tree_index,
+            col_start,
+            col_end,
+        }
     }
 
     pub fn extend_polys(
@@ -377,7 +383,8 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> TreeBuilder<'_, '_, B, MC> {
         columns: impl IntoIterator<Item = CircleCoefficients<B>>,
     ) -> TreeSubspan {
         let col_start = self.polys.len();
-        self.polys.extend(columns);
+        self.polys
+            .extend(columns.into_iter().map(EvalsOrCoeffs::Coeffs));
         let col_end = self.polys.len();
         TreeSubspan {
             tree_index: self.tree_index,
@@ -401,7 +408,7 @@ pub struct CommitmentTreeProver<B: BackendForChannel<MC>, MC: MerkleChannel> {
 
 impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
     pub fn new(
-        polynomials: ColumnVec<CircleCoefficients<B>>,
+        columns: ColumnVec<EvalsOrCoeffs<B>>,
         log_blowup_factor: u32,
         twiddles: &TwiddleTree<B>,
         store_polynomials_coefficients: bool,
@@ -409,8 +416,8 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         base_column_pool: &BaseColumnPool<B>,
     ) -> Self {
         let span = span!(Level::INFO, "Extension").entered();
-        let polynomials = B::evaluate_polynomials(
-            polynomials,
+        let polynomials = B::interpolate_and_evaluate_polynomials(
+            columns,
             log_blowup_factor,
             twiddles,
             store_polynomials_coefficients,
