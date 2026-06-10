@@ -156,6 +156,27 @@ impl QuotientOps for CpuBackend {
         let eval_domain = CanonicCoset::new(lifting_log_size).circle_domain();
         let (eval_subdomain, _) = eval_domain.split(log_blowup_factor);
         let subdomain_log_size = eval_subdomain.log_size();
+
+        // Apple-GPU path: the whole per-row combine in one submission (denominator
+        // inverses by Fermat exponentiation equal batch_inverse exactly).
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        let gpu_quotients = if subdomain_log_size
+            >= crate::prover::backend::metal::quotients::MIN_METAL_QUOTIENT_LOG_SIZE
+        {
+            crate::prover::backend::metal::quotients::combine_quotients_metal(
+                &accumulations,
+                eval_subdomain,
+                1 << subdomain_log_size,
+            )
+        } else {
+            None
+        };
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        let gpu_quotients: Option<SecureColumnByCoords<CpuBackend>> = None;
+        if let Some(quotients) = gpu_quotients {
+            return extend_quotients(quotients, eval_subdomain, eval_domain, twiddles);
+        }
+
         let mut quotients: SecureColumnByCoords<CpuBackend> =
             unsafe { SecureColumnByCoords::uninitialized(1 << subdomain_log_size) };
         let sample_points: Vec<CirclePoint<SecureField>> =
@@ -218,24 +239,34 @@ impl QuotientOps for CpuBackend {
         chunk_views.par_iter_mut().for_each(process_chunk);
         #[cfg(not(feature = "parallel"))]
         chunk_views.iter_mut().for_each(process_chunk);
-        // Interpolate on subdomain and evaluate on full domain.
-        let subdomain_twiddles = TwiddleTree {
-            root_coset: eval_subdomain.half_coset,
-            twiddles: TwiddleBuffer::empty(),
-            itwiddles: twiddles
-                .itwiddles
-                .extract_subdomain_twiddles(eval_domain.log_size(), eval_subdomain.log_size()),
-        };
-        let evals = SecureColumnByCoords {
-            columns: quotients.columns.map(|eval| {
-                let poly = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
-                    eval_subdomain,
-                    eval,
-                )
-                .interpolate_with_twiddles(&subdomain_twiddles);
-                poly.evaluate_with_twiddles(eval_domain, twiddles).values
-            }),
-        };
-        SecureEvaluation::new(eval_domain, evals)
+        extend_quotients(quotients, eval_subdomain, eval_domain, twiddles)
     }
+}
+
+/// Interpolates the combined quotients on the subdomain and evaluates them on the full
+/// lifted domain, shared by the CPU and GPU combine paths.
+fn extend_quotients(
+    quotients: SecureColumnByCoords<CpuBackend>,
+    eval_subdomain: crate::core::poly::circle::CircleDomain,
+    eval_domain: crate::core::poly::circle::CircleDomain,
+    twiddles: &TwiddleTree<CpuBackend>,
+) -> SecureEvaluation<CpuBackend, BitReversedOrder> {
+    let subdomain_twiddles = TwiddleTree {
+        root_coset: eval_subdomain.half_coset,
+        twiddles: TwiddleBuffer::empty(),
+        itwiddles: twiddles
+            .itwiddles
+            .extract_subdomain_twiddles(eval_domain.log_size(), eval_subdomain.log_size()),
+    };
+    let evals = SecureColumnByCoords {
+        columns: quotients.columns.map(|eval| {
+            let poly = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+                eval_subdomain,
+                eval,
+            )
+            .interpolate_with_twiddles(&subdomain_twiddles);
+            poly.evaluate_with_twiddles(eval_domain, twiddles).values
+        }),
+    };
+    SecureEvaluation::new(eval_domain, evals)
 }
