@@ -689,12 +689,45 @@ pub(crate) fn build_packed_tree_metal(
             input_buffer(&ctx.device, words)
         })
         .collect();
+    let command_buffer = ctx.queue.new_command_buffer();
+    let pending = encode_packed_tree_inner(
+        &ctx,
+        command_buffer,
+        &coord_buffers,
+        n_leaves,
+        is_m31_output,
+    )?;
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    Some(pending.finish())
+}
 
+/// Encodes the packed-leaf kernel and the layer chain into the caller's command
+/// buffer; see [`build_packed_tree_metal`].
+pub(crate) fn encode_packed_tree(
+    command_buffer: &metal::CommandBufferRef,
+    coord_buffers: &[Buffer],
+    n_leaves: usize,
+    is_m31_output: bool,
+) -> Option<PendingTree> {
+    let ctx = context()?;
+    let ctx = ctx.lock().unwrap();
+    encode_packed_tree_inner(&ctx, command_buffer, coord_buffers, n_leaves, is_m31_output)
+}
+
+fn encode_packed_tree_inner(
+    ctx: &MetalContext,
+    command_buffer: &metal::CommandBufferRef,
+    coord_buffers: &[Buffer],
+    n_leaves: usize,
+    is_m31_output: bool,
+) -> Option<PendingTree> {
     let mut leaves: Vec<Blake2sHash> = unsafe { uninit_vec(n_leaves) };
     prefault(&mut leaves);
     let (leaves_buffer, leaves_zero_copy) = output_buffer(&ctx.device, &mut leaves);
-
-    let command_buffer = ctx.queue.new_command_buffer();
+    if !leaves_zero_copy {
+        return None;
+    }
     {
         let encoder = command_buffer.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&ctx.packed_leaves_pipeline);
@@ -720,7 +753,6 @@ pub(crate) fn build_packed_tree_metal(
     let mut levels: Vec<Vec<Blake2sHash>> =
         sizes.iter().map(|&n| unsafe { uninit_vec(n) }).collect();
     levels.iter_mut().for_each(|level| prefault(level));
-    let leaves_src = leaves_buffer.clone();
     let mut prev_buffer = leaves_buffer;
     let mut copy_outs = vec![];
     for level in levels.iter_mut() {
@@ -741,34 +773,11 @@ pub(crate) fn build_packed_tree_metal(
         copy_outs.push((out_buffer.clone(), if zero_copy { 0 } else { level.len() }));
         prev_buffer = out_buffer;
     }
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
-
-    if !leaves_zero_copy {
-        // Safety: the kernel wrote all leaves into the shared buffer.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                leaves_src.contents() as *const Blake2sHash,
-                leaves.as_mut_ptr(),
-                n_leaves,
-            );
-        }
-    }
-    for ((buffer, copy_len), level) in copy_outs.iter().zip(levels.iter_mut()) {
-        if *copy_len > 0 {
-            // Safety: the kernel wrote all entries into the shared buffer.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    buffer.contents() as *const Blake2sHash,
-                    level.as_mut_ptr(),
-                    *copy_len,
-                );
-            }
-        }
-    }
-    let mut layers = vec![leaves];
-    layers.extend(levels);
-    Some(layers)
+    Some(PendingTree {
+        leaves,
+        levels,
+        copy_outs,
+    })
 }
 
 #[cfg(test)]

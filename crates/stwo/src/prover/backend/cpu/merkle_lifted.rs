@@ -111,6 +111,55 @@ impl<H: MerkleHasherLifted + Send + Sync + 'static> MerkleOpsLifted<H> for CpuBa
         prev_layer.into_iter().map(|x| x.finalize()).collect()
     }
 
+    #[allow(clippy::type_complexity)]
+    fn fold_line_and_packed_tree(
+        eval: &crate::prover::line::LineEvaluation<Self>,
+        alphas: &[crate::core::fields::qm31::SecureField],
+        _twiddles: &crate::prover::poly::twiddles::TwiddleTree<Self>,
+    ) -> Option<(crate::prover::line::LineEvaluation<Self>, Vec<Vec<H::Hash>>)>
+    where
+        Self: crate::prover::fri::FriOps,
+    {
+        // Blake2s fast path: all fold steps and the folded evaluation's packed tree in
+        // one GPU submission (one synchronization between two channel interactions).
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            use crate::core::vcs_lifted::verifier::LOG_PACKED_LEAF_SIZE;
+            let is_m31 = TypeId::of::<H>() == TypeId::of::<Blake2sMerkleHasherGeneric<true>>();
+            let is_bytes = TypeId::of::<H>() == TypeId::of::<Blake2sMerkleHasherGeneric<false>>();
+            if is_m31 || is_bytes {
+                if let Some((folded, Some(layers))) =
+                    crate::prover::backend::metal::fri::fold_line_chain_and_packed_tree_metal(
+                        &eval.values,
+                        eval.domain().coset(),
+                        alphas,
+                        is_m31,
+                    )
+                {
+                    let mut domain = eval.domain();
+                    for _ in 0..alphas.len() {
+                        domain = domain.double();
+                    }
+                    let folded_eval = crate::prover::line::LineEvaluation::new(domain, folded);
+                    let lifting = folded_eval.values.len().ilog2() - LOG_PACKED_LEAF_SIZE;
+                    // Safety: TypeId equality makes this an identity conversion.
+                    let mut layers: Vec<Vec<H::Hash>> = unsafe {
+                        std::mem::transmute::<Vec<Vec<Blake2sHash>>, Vec<Vec<H::Hash>>>(layers)
+                    };
+                    while (layers.len() as u32) < lifting + 1 {
+                        let next =
+                            <Self as MerkleOpsLifted<H>>::build_next_layer(layers.last().unwrap());
+                        layers.push(next);
+                    }
+                    layers.reverse();
+                    return Some((folded_eval, layers));
+                }
+            }
+        }
+        let _ = (eval, alphas);
+        None
+    }
+
     fn build_packed_tree(
         columns: &[&Vec<BaseField>; SECURE_EXTENSION_DEGREE],
         _n_layers: u32,

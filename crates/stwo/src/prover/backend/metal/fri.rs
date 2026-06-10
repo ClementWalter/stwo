@@ -312,3 +312,124 @@ pub(crate) fn fold_metal(
         columns: [c0, c1, c2, c3],
     })
 }
+
+/// Chains all fold steps of one FRI layer and the packed Merkle tree of the final
+/// folded evaluation into one submission. Returns the folded coordinates and, when the
+/// folded size clears the tree threshold, the tree layers (leaves first, above-threshold
+/// only). `None` without a usable device or for sub-threshold sizes.
+#[allow(clippy::type_complexity)]
+pub(crate) fn fold_line_chain_and_packed_tree_metal(
+    values: &SecureColumnByCoords<CpuBackend>,
+    mut coset: Coset,
+    alphas: &[SecureField],
+    is_m31_output: bool,
+) -> Option<(
+    SecureColumnByCoords<CpuBackend>,
+    Option<Vec<Vec<crate::core::vcs::blake2_hash::Blake2sHash>>>,
+)> {
+    use crate::core::utils::uninit_vec;
+    let n0 = values.len();
+    if alphas.is_empty() || (n0 >> alphas.len()) < (1 << MIN_METAL_FOLD_LOG_SIZE) {
+        return None;
+    }
+    let ctx = context()?;
+    let ctx = ctx.lock().unwrap();
+
+    let command_buffer = ctx.queue.new_command_buffer();
+    let mut in_buffers: Vec<Buffer> = values
+        .columns
+        .iter()
+        .map(|c| bind_input(&ctx.device, c))
+        .collect();
+    // Keep every step's output storage alive until the wait.
+    let mut step_outputs: Vec<[Vec<BaseField>; 4]> = Vec::with_capacity(alphas.len());
+    let mut step_buffers: Vec<Vec<Buffer>> = Vec::with_capacity(alphas.len());
+    for (step, &alpha) in alphas.iter().enumerate() {
+        let half_n = n0 >> (step + 1);
+        // Safety: the fold kernel writes every entry before anything reads them.
+        let out: [Vec<BaseField>; 4] = std::array::from_fn(|_| unsafe { uninit_vec(half_n) });
+        let out_buffers: Vec<Buffer> = out.iter().map(|c| bind_input(&ctx.device, c)).collect();
+
+        let initial = coset.at(0);
+        let alpha_coords = alpha.to_m31_array();
+        let params = FoldParams {
+            initial_x: initial.x.0,
+            initial_y: initial.y.0,
+            step_x: coset.step.x.0,
+            step_y: coset.step.y.0,
+            half_log: half_n.ilog2(),
+            coord_is_y: 0,
+            alpha: [
+                alpha_coords[0].0,
+                alpha_coords[1].0,
+                alpha_coords[2].0,
+                alpha_coords[3].0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        };
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&ctx.pipeline);
+        for (k, buffer) in in_buffers.iter().enumerate() {
+            encoder.set_buffer(k as u64, Some(buffer), 0);
+        }
+        for (k, buffer) in out_buffers.iter().enumerate() {
+            encoder.set_buffer(4 + k as u64, Some(buffer), 0);
+        }
+        encoder.set_bytes(
+            8,
+            std::mem::size_of::<FoldParams>() as u64,
+            &params as *const _ as *const std::ffi::c_void,
+        );
+        encoder.dispatch_threads(MTLSize::new(half_n as u64, 1, 1), MTLSize::new(256, 1, 1));
+        encoder.end_encoding();
+
+        in_buffers = out_buffers.clone();
+        step_outputs.push(out);
+        step_buffers.push(out_buffers);
+        coset = coset.double();
+    }
+
+    // Packed tree over the final fold output, in the same submission.
+    let final_half = n0 >> alphas.len();
+    let n_leaves = final_half / 4;
+    let pending = if n_leaves >= (1 << crate::prover::backend::metal::blake2s::MIN_METAL_LOG_SIZE) {
+        super::blake2s::encode_packed_tree(
+            command_buffer,
+            step_buffers.last().unwrap(),
+            n_leaves,
+            is_m31_output,
+        )
+    } else {
+        None
+    };
+
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    // Copy out any fold output that couldn't bind zero-copy.
+    let final_buffers = step_buffers.last().unwrap();
+    let mut final_out = step_outputs.pop().unwrap();
+    for (vec, buffer) in final_out.iter_mut().zip(final_buffers) {
+        let zero_copy = std::ptr::eq(buffer.contents() as *const BaseField, vec.as_ptr());
+        if !zero_copy {
+            // Safety: the kernel wrote all entries into the shared buffer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buffer.contents() as *const BaseField,
+                    vec.as_mut_ptr(),
+                    vec.len(),
+                );
+            }
+        }
+    }
+    let [c0, c1, c2, c3] = final_out;
+    Some((
+        SecureColumnByCoords {
+            columns: [c0, c1, c2, c3],
+        },
+        pending.map(super::blake2s::PendingTree::finish),
+    ))
+}

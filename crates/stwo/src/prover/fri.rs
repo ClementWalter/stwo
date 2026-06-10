@@ -174,25 +174,48 @@ impl<'a, B: FriOps + MerkleOpsLifted<MC::H>, MC: MerkleChannel> FriProver<'a, B,
         if line_log_size == last_layer_log_domain_size {
             return (layers, layer_evaluation);
         }
-        // While we can, skip `config.fold_step` layers.
-        while line_log_size > last_layer_log_domain_size + config.fold_step {
-            let layer = FriInnerLayerProver::new(layer_evaluation, config.fold_step);
+        // Fold `config.fold_step` layers at a time until one final (possibly shorter)
+        // fold reaches the last-layer size. A backend can chain a layer's folds with
+        // the NEXT layer's packed tree (nothing but the channel separates them); the
+        // pre-built tree carries into the next iteration.
+        let mut pending_tree: Option<MerkleProverLifted<B, MC::H>> = None;
+        loop {
+            let is_final = line_log_size <= last_layer_log_domain_size + config.fold_step;
+            let fold_step = if is_final {
+                line_log_size - last_layer_log_domain_size
+            } else {
+                config.fold_step
+            };
+            let packs =
+                layer_evaluation.values.len().ilog2() >= LOG_PACKED_LEAF_SIZE && fold_step > 1;
+            let layer = match pending_tree.take() {
+                Some(merkle_tree) if packs => {
+                    FriInnerLayerProver::from_packed_parts(layer_evaluation, merkle_tree, fold_step)
+                }
+                _ => FriInnerLayerProver::new(layer_evaluation, fold_step),
+            };
             MC::mix_root(channel, layer.merkle_tree.root());
             let folding_alpha = channel.draw_secure_felt();
-            let alpha_sq_powers = squared_alpha_powers(folding_alpha, config.fold_step);
-            layer_evaluation = B::fold_line(&layer.evaluation, &alpha_sq_powers, twiddles);
+            let alpha_sq_powers = squared_alpha_powers(folding_alpha, fold_step);
+            if is_final {
+                layer_evaluation = B::fold_line(&layer.evaluation, &alpha_sq_powers, twiddles);
+                layers.push(layer);
+                break;
+            }
+            match B::fold_line_and_packed_tree(&layer.evaluation, &alpha_sq_powers, twiddles) {
+                Some((folded, tree_layers)) => {
+                    layer_evaluation = folded;
+                    pending_tree = Some(MerkleProverLifted {
+                        layers: tree_layers,
+                    });
+                }
+                None => {
+                    layer_evaluation = B::fold_line(&layer.evaluation, &alpha_sq_powers, twiddles);
+                }
+            }
             layers.push(layer);
-            line_log_size -= config.fold_step;
+            line_log_size -= fold_step;
         }
-
-        // Do one last fold (of size 0 < k <= config.fold_step) to reach the correct size.
-        let last_fold_step = line_log_size - last_layer_log_domain_size;
-        let layer = FriInnerLayerProver::new(layer_evaluation, last_fold_step);
-        MC::mix_root(channel, layer.merkle_tree.root());
-        let folding_alpha = channel.draw_secure_felt();
-        let alpha_sq_powers = squared_alpha_powers(folding_alpha, last_fold_step);
-        layer_evaluation = B::fold_line(&layer.evaluation, &alpha_sq_powers, twiddles);
-        layers.push(layer);
 
         (layers, layer_evaluation)
     }
@@ -365,6 +388,21 @@ struct FriInnerLayerProver<B: FriOps + MerkleOpsLifted<H>, H: MerkleHasherLifted
 }
 
 impl<B: FriOps + MerkleOpsLifted<H>, H: MerkleHasherLifted> FriInnerLayerProver<B, H> {
+    /// Builds the layer from a packed-leaf tree the backend already committed
+    /// (see [`MerkleOpsLifted::fold_line_and_packed_tree`]).
+    const fn from_packed_parts(
+        evaluation: LineEvaluation<B>,
+        merkle_tree: MerkleProverLifted<B, H>,
+        fold_step: u32,
+    ) -> Self {
+        FriInnerLayerProver {
+            evaluation,
+            merkle_tree,
+            fold_step,
+            pack_leaves: true,
+        }
+    }
+
     fn new(evaluation: LineEvaluation<B>, fold_step: u32) -> Self {
         let pack_leaves = evaluation.values.len().ilog2() >= LOG_PACKED_LEAF_SIZE && fold_step > 1;
         let log_rows_per_leaf = if pack_leaves { LOG_PACKED_LEAF_SIZE } else { 0 };
