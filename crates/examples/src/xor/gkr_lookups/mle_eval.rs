@@ -6,6 +6,8 @@ use std::iter::zip;
 
 use itertools::{chain, zip_eq, Itertools};
 use num_traits::{One, Zero};
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use stwo::core::air::accumulation::PointEvaluationAccumulator;
 use stwo::core::air::Component;
 use stwo::core::circle::{CirclePoint, Coset};
@@ -15,9 +17,11 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::fields::{Field, FieldExpOps};
 use stwo::core::pcs::{TreeSubspan, TreeVec};
 use stwo::core::poly::circle::CanonicCoset;
-use stwo::core::utils::{bit_reverse, bit_reverse_index, coset_index_to_circle_domain_index};
+use stwo::core::utils::{bit_reverse, bit_reverse_index};
 use stwo::core::ColumnVec;
-use stwo::prover::backend::simd::column::{SecureColumn, VeryPackedSecureColumnByCoords};
+use stwo::prover::backend::simd::column::{
+    SecureColumn, VeryPackedSecureColumnByCoords, VeryPackedSecureColumnByCoordsMutSlice,
+};
 use stwo::prover::backend::simd::m31::LOG_N_LANES;
 use stwo::prover::backend::simd::prefix_sum::inclusive_prefix_sum;
 use stwo::prover::backend::simd::qm31::PackedSecureField;
@@ -245,44 +249,83 @@ impl<O: MleCoeffColumnOracle> ComponentProver<SimdBackend> for MleEvalProverComp
         let acc_col = unsafe { VeryPackedSecureColumnByCoords::transform_under_mut(acc.col) };
 
         let _span = span!(Level::INFO, "Constraint pointwise eval").entered();
-        let n_very_packed_rows =
+        let n_very_packed_rows: usize =
             1 << (eval_domain.log_size() - LOG_N_LANES - LOG_N_VERY_PACKED_ELEMS);
         let broadcast_powers =
             SimdDomainEvaluator::broadcast_random_coeff_powers(&acc.random_coeff_powers);
-        for vec_row in 0..n_very_packed_rows {
-            // Evaluate constrains at row.
-            let mut eval = SimdDomainEvaluator::new(
-                &component_trace,
-                vec_row,
-                &broadcast_powers,
-                trace_domain.log_size(),
-                eval_domain.log_size(),
-                self.log_size(),
-                SecureField::zero(),
-            );
-            let [mle_coeffs_col_eval] = eval.next_extension_interaction_mask(aux_interaction, [0]);
-            let [carry_quotients_col_eval] =
-                eval.next_extension_interaction_mask(aux_interaction, [0]);
-            let [is_first, is_second] = eval.next_interaction_mask(aux_interaction, [0, -1]);
-            eval_mle_eval_constraints(
-                self.interaction,
-                &mut eval,
-                mle_coeffs_col_eval,
-                &self.mle_eval_point,
-                self.mle_claim_shift,
-                carry_quotients_col_eval,
-                is_first,
-                is_second,
-            );
 
-            // Finalize row.
-            let row_res = eval.row_res;
-            let denom_inv = VeryPackedBaseField::broadcast(
-                denom_inv
-                    [vec_row >> (trace_domain.log_size() - LOG_N_LANES - LOG_N_VERY_PACKED_ELEMS)],
-            );
-            unsafe { acc_col.set_packed(vec_row, acc_col.packed_at(vec_row) + row_res * denom_inv) }
-        }
+        // Rows are independent; evaluate them in parallel chunks of the accumulation
+        // column. The transformed column's inner vectors keep their pre-transform
+        // lengths, so chunks are clamped to the valid row count.
+        const CHUNK_SIZE: usize = 32;
+        let component_trace = &component_trace;
+        let broadcast_powers = &broadcast_powers;
+        let denom_inv = &denom_inv;
+        // Capture plain values instead of `self` so the closure has no `Sync`
+        // requirement on the oracle type.
+        let self_interaction = self.interaction;
+        let self_mle_eval_point = &self.mle_eval_point;
+        let self_mle_claim_shift = self.mle_claim_shift;
+        let self_log_size = self.log_size();
+
+        let row_task =
+            |(chunk_start_row, mut chunk): (usize, VeryPackedSecureColumnByCoordsMutSlice<'_>)| {
+                let chunk_rows = chunk.0[0].0.len().min(n_very_packed_rows - chunk_start_row);
+                for idx_in_chunk in 0..chunk_rows {
+                    let vec_row = chunk_start_row + idx_in_chunk;
+                    // Evaluate constrains at row.
+                    let mut eval = SimdDomainEvaluator::new(
+                        component_trace,
+                        vec_row,
+                        broadcast_powers,
+                        trace_domain.log_size(),
+                        eval_domain.log_size(),
+                        self_log_size,
+                        SecureField::zero(),
+                    );
+                    let [mle_coeffs_col_eval] =
+                        eval.next_extension_interaction_mask(aux_interaction, [0]);
+                    let [carry_quotients_col_eval] =
+                        eval.next_extension_interaction_mask(aux_interaction, [0]);
+                    let [is_first, is_second] =
+                        eval.next_interaction_mask(aux_interaction, [0, -1]);
+                    eval_mle_eval_constraints(
+                        self_interaction,
+                        &mut eval,
+                        mle_coeffs_col_eval,
+                        self_mle_eval_point,
+                        self_mle_claim_shift,
+                        carry_quotients_col_eval,
+                        is_first,
+                        is_second,
+                    );
+
+                    // Finalize row.
+                    let row_res = eval.row_res;
+                    let denom_inv = VeryPackedBaseField::broadcast(
+                        denom_inv[vec_row
+                            >> (trace_domain.log_size() - LOG_N_LANES - LOG_N_VERY_PACKED_ELEMS)],
+                    );
+                    unsafe {
+                        chunk.set_packed(
+                            idx_in_chunk,
+                            chunk.packed_at(idx_in_chunk) + row_res * denom_inv,
+                        )
+                    }
+                }
+            };
+
+        #[cfg(feature = "parallel")]
+        (0..n_very_packed_rows)
+            .into_par_iter()
+            .step_by(CHUNK_SIZE)
+            .zip(acc_col.par_chunks_mut(CHUNK_SIZE))
+            .for_each(row_task);
+        #[cfg(not(feature = "parallel"))]
+        (0..n_very_packed_rows)
+            .step_by(CHUNK_SIZE)
+            .zip(acc_col.chunks_mut(CHUNK_SIZE))
+            .for_each(row_task);
     }
 }
 
@@ -614,24 +657,45 @@ fn gen_carry_quotient_col(
         gen_half_coset_carry_quotients(&mle_eval_point);
 
     let log_size = mle_eval_point.n_variables() as u32;
-    let size = 1 << log_size;
+    let size: usize = 1 << log_size;
     let half_coset_size = size / 2;
     let mut col = SecureColumnByCoords::<SimdBackend>::zeros(size);
 
-    // TODO(andrew): Optimize.
-    for i in 0..half_coset_size {
-        let half_coset0_index = coset_index_to_circle_domain_index(i * 2, log_size);
-        let half_coset1_index = coset_index_to_circle_domain_index(i * 2 + 1, log_size);
-        let half_coset0_index_bit_rev = bit_reverse_index(half_coset0_index, log_size);
-        let half_coset1_index_bit_rev = bit_reverse_index(half_coset1_index, log_size);
+    // Output-driven fill: for output (bit-reversed circle domain) index b, the natural
+    // circle-domain index c = bit_reverse(b) originates from the even (first half-coset)
+    // entry of pair i = c when c < size / 2, and from the odd entry of pair
+    // i = size - 1 - c otherwise; the value only depends on i's trailing ones. Driving
+    // by output index lets disjoint pack-aligned ranges be filled concurrently.
+    struct ColPtr(*mut SecureColumnByCoords<SimdBackend>);
+    unsafe impl Sync for ColPtr {}
+    let col_ptr = ColPtr(&mut col);
+    let col_ptr = &col_ptr;
 
-        let n_trailing_ones = i.trailing_ones() as usize;
-        let half_coset0_carry_quotient = half_coset0_carry_quotients[n_trailing_ones];
-        let half_coset1_carry_quotient = half_coset1_carry_quotients[n_trailing_ones];
+    let fill_range = |range: std::ops::Range<usize>| {
+        // Safety: ranges are disjoint and pack-aligned, so the packed read-modify-write
+        // in `set` never touches another task's lanes.
+        let col = unsafe { &mut *col_ptr.0 };
+        for b in range {
+            let c = bit_reverse_index(b, log_size);
+            let value = if c < half_coset_size {
+                half_coset0_carry_quotients[c.trailing_ones() as usize]
+            } else {
+                half_coset1_carry_quotients[(size - 1 - c).trailing_ones() as usize]
+            };
+            col.set(b, value);
+        }
+    };
 
-        col.set(half_coset0_index_bit_rev, half_coset0_carry_quotient);
-        col.set(half_coset1_index_bit_rev, half_coset1_carry_quotient);
+    #[cfg(feature = "parallel")]
+    {
+        // A multiple of the SIMD lane count, keeping each task's writes pack-aligned.
+        const CHUNK: usize = 1 << 12;
+        (0..size.div_ceil(CHUNK))
+            .into_par_iter()
+            .for_each(|chunk| fill_range(chunk * CHUNK..((chunk + 1) * CHUNK).min(size)));
     }
+    #[cfg(not(feature = "parallel"))]
+    fill_range(0..size);
 
     let domain = CanonicCoset::new(log_size).circle_domain();
     SecureEvaluation::new(domain, col)
@@ -787,17 +851,21 @@ mod tests {
 
     #[test]
     fn mle_eval_prover_component() -> Result<(), VerificationError> {
-        const N_VARIABLES: usize = 8;
+        // Size (in MLE variables) is overridable to benchmark the e2e proof at scale:
+        //   MLE_N_VARIABLES=20 cargo test --release mle_eval_prover_component
+        let n_variables: usize = std::env::var("MLE_N_VARIABLES")
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(8);
         const COEFFS_COL_TRACE: usize = 1;
         const MLE_EVAL_TRACE: usize = 2;
         const LOG_EXPAND: u32 = 1;
         // Create the test MLE.
         let mut rng = SmallRng::seed_from_u64(0);
-        let log_size = N_VARIABLES as u32;
+        let log_size = n_variables as u32;
         let size = 1 << log_size;
         let mle_coeffs = (0..size).map(|_| rng.gen::<SecureField>()).collect();
         let mle = Mle::<SimdBackend, SecureField>::new(mle_coeffs);
-        let eval_point: [SecureField; N_VARIABLES] = array::from_fn(|_| rng.gen());
+        let eval_point: Vec<SecureField> = (0..n_variables).map(|_| rng.gen()).collect();
         let claim = mle_eval_at_point(&mle, &eval_point);
         // Setup protocol.
         let twiddles = SimdBackend::precompute_twiddles(
@@ -808,6 +876,9 @@ mod tests {
         let config = PcsConfig::default();
         let mut commitment_scheme =
             CommitmentSchemeProver::<_, Blake2sMerkleChannel>::new(config, &twiddles);
+        // Keep coefficients so out-of-domain sampling evaluates from them instead of
+        // computing barycentric weights over the blown-up evaluations.
+        commitment_scheme.set_store_polynomials_coefficients();
         let channel = &mut Blake2sChannel::default();
         // TODO(ilya): remove the following once preprocessed columns are not mandatory.
         // Preprocessed trace
