@@ -38,11 +38,24 @@ impl PolyOps for CpuBackend {
         // Large transforms dispatch to the shared SIMD FFT (cached packed twiddles, one
         // aligned copy in, zero-copy out); [`interpolate_scalar`] remains the reference.
         if eval.domain.log_size() >= SIMD_DISPATCH_LOG_SIZE {
+            use crate::prover::backend::simd::circle::ifft_in_place_raw;
             use crate::prover::backend::simd::column::BaseColumn;
             use crate::prover::backend::simd::SimdBackend;
             let simd_twiddles = cached_simd_twiddles(twiddles.root_coset);
             let domain = eval.domain;
-            let packed = BaseColumn::from_cpu(&eval.values);
+            let mut values = eval.values;
+
+            // In-place transform on the CPU-owned allocation when it is SIMD-aligned;
+            // no packing copy and no intermediate allocation.
+            if let Some(ptr) = simd_aligned_ptr(&mut values) {
+                unsafe {
+                    ifft_in_place_raw(ptr, domain, &simd_twiddles);
+                    convert_simd_coeff_order_raw(ptr, domain.log_size());
+                }
+                return CircleCoefficients::new(values);
+            }
+
+            let packed = BaseColumn::from_cpu(&values);
             let mut coeffs = crate::prover::poly::circle::CircleEvaluation::<
                 SimdBackend,
                 BaseField,
@@ -114,7 +127,9 @@ impl PolyOps for CpuBackend {
         // commitment over that coset.
         let simd_twiddles = cached_simd_twiddles(twiddles.root_coset);
 
-        let process = |column: EvalsOrCoeffs<Self>| {
+        // Packing fallback for allocations that miss SIMD alignment (rare: large
+        // allocations come straight from the page allocator).
+        let process_packed = |column: EvalsOrCoeffs<Self>| {
             let mut simd_coeffs = match column {
                 EvalsOrCoeffs::Evals(evals) => {
                     let domain = evals.domain;
@@ -149,6 +164,58 @@ impl PolyOps for CpuBackend {
                 CircleCoefficients::<Self>::new(simd_coeffs.coeffs.into_cpu_vec())
             });
             Poly::new(coeffs, evals)
+        };
+
+        let process = |column: EvalsOrCoeffs<Self>| {
+            use crate::prover::backend::simd::circle::{ifft_in_place_raw, rfft_raw};
+
+            // Fast path: both transforms run in place on / straight between the
+            // CPU-owned allocations, with no packing copies and no intermediate
+            // allocations. The ifft leaves the kernel's coefficient layout in `values`,
+            // which is exactly what the rfft consumes; stored coefficients are
+            // converted to natural order afterwards for scalar consumers (OODS
+            // sampling, FRI decomposition).
+            let (mut values, domain, already_coeffs) = match column {
+                EvalsOrCoeffs::Evals(evals) => (evals.values, evals.domain, false),
+                EvalsOrCoeffs::Coeffs(coeffs) => {
+                    let domain = CanonicCoset::new(coeffs.log_size()).circle_domain();
+                    (coeffs.coeffs, domain, true)
+                }
+            };
+            let ext_domain =
+                CanonicCoset::new(domain.log_size() + log_blowup_factor).circle_domain();
+            let mut out: Vec<BaseField> = Vec::with_capacity(ext_domain.size());
+            let aligned = simd_aligned_ptr(&mut values)
+                .filter(|_| (out.as_mut_ptr() as usize).is_multiple_of(64));
+            let Some(src) = aligned else {
+                let column = if already_coeffs {
+                    EvalsOrCoeffs::Coeffs(CircleCoefficients::new(values))
+                } else {
+                    EvalsOrCoeffs::Evals(CircleEvaluation::new(domain, values))
+                };
+                return process_packed(column);
+            };
+            unsafe {
+                if already_coeffs {
+                    // Stored natural order -> kernel layout for the rfft.
+                    convert_simd_coeff_order_raw(src, domain.log_size());
+                } else {
+                    ifft_in_place_raw(src, domain, &simd_twiddles);
+                }
+                rfft_raw(
+                    src,
+                    out.as_mut_ptr() as *mut u32,
+                    domain.log_size(),
+                    ext_domain,
+                    &simd_twiddles,
+                );
+                out.set_len(ext_domain.size());
+            }
+            let coeffs = store_polynomials_coefficients.then(|| {
+                unsafe { convert_simd_coeff_order_raw(src, domain.log_size()) };
+                CircleCoefficients::<Self>::new(values)
+            });
+            Poly::new(coeffs, CircleEvaluation::new(ext_domain, out))
         };
 
         #[cfg(feature = "parallel")]
@@ -328,8 +395,48 @@ impl PolyOps for CpuBackend {
         if domain.log_size() >= SIMD_DISPATCH_LOG_SIZE
             && poly.coeffs.len().ilog2() >= SIMD_DISPATCH_LOG_SIZE
         {
+            use crate::prover::backend::simd::circle::rfft_raw;
+            use crate::prover::backend::simd::fft::CACHED_FFT_LOG_SIZE;
+            use crate::prover::backend::simd::m31::N_LANES;
             use crate::prover::backend::simd::SimdBackend;
             let simd_twiddles = cached_simd_twiddles(twiddles.root_coset);
+            let fft_log_size = poly.coeffs.len().ilog2();
+
+            // Raw path: run the rfft straight from the CPU coefficient buffer into a
+            // fresh output vector — no packing copies. Above the cached-fft size the
+            // kernel consumes its transposed layout, so a scratch copy is converted
+            // first; at or below it the layouts coincide and the stored coefficients
+            // are read directly.
+            let mut out: Vec<BaseField> = Vec::with_capacity(domain.size());
+            if (out.as_mut_ptr() as usize).is_multiple_of(64) {
+                let mut scratch: Vec<BaseField> = Vec::new();
+                let src: Option<*const u32> = if fft_log_size > CACHED_FFT_LOG_SIZE {
+                    scratch = poly.coeffs.clone();
+                    simd_aligned_ptr(&mut scratch).map(|ptr| {
+                        unsafe { convert_simd_coeff_order_raw(ptr, fft_log_size) };
+                        ptr as *const u32
+                    })
+                } else {
+                    let ptr = poly.coeffs.as_ptr() as usize;
+                    (ptr.is_multiple_of(64) && poly.coeffs.len().is_multiple_of(N_LANES))
+                        .then_some(ptr as *const u32)
+                };
+                if let Some(src) = src {
+                    unsafe {
+                        rfft_raw(
+                            src,
+                            out.as_mut_ptr() as *mut u32,
+                            fft_log_size,
+                            domain,
+                            &simd_twiddles,
+                        );
+                        out.set_len(domain.size());
+                    }
+                    drop(scratch);
+                    return CircleEvaluation::new(domain, out);
+                }
+            }
+
             let mut simd_coeffs =
                 crate::prover::poly::circle::CircleCoefficients::<SimdBackend>::new(
                     poly.coeffs.iter().copied().collect(),
@@ -434,17 +541,34 @@ const SIMD_DISPATCH_LOG_SIZE: u32 = 10;
 pub(crate) fn convert_simd_coeff_order(
     column: &mut crate::prover::backend::simd::column::BaseColumn,
 ) {
+    // Safe: PackedBaseField data is 64-byte aligned and fully initialized.
+    unsafe {
+        convert_simd_coeff_order_raw(column.data.as_mut_ptr() as *mut u32, column.len().ilog2());
+    }
+}
+
+/// Raw-pointer form of [`convert_simd_coeff_order`] for coefficient buffers held in
+/// CPU-owned allocations.
+///
+/// # Safety
+///
+/// `ptr` must be 64-byte aligned and valid for reads and writes of `2^log_size` u32s.
+pub(crate) unsafe fn convert_simd_coeff_order_raw(ptr: *mut u32, log_size: u32) {
     use crate::prover::backend::simd::fft::{transpose_vecs, CACHED_FFT_LOG_SIZE};
     use crate::prover::backend::simd::m31::LOG_N_LANES;
-    let log_size = column.len().ilog2();
     if log_size > CACHED_FFT_LOG_SIZE {
-        unsafe {
-            transpose_vecs(
-                column.data.as_mut_ptr() as *mut u32,
-                (log_size - LOG_N_LANES) as usize,
-            );
-        }
+        transpose_vecs(ptr, (log_size - LOG_N_LANES) as usize);
     }
+}
+
+/// Returns the column's base pointer when the allocation happens to satisfy the SIMD
+/// kernels' 64-byte alignment, allowing in-place transforms without packing copies.
+/// Large allocations come straight from the page allocator, so this holds in practice;
+/// callers must keep a packing fallback for when it doesn't.
+fn simd_aligned_ptr(values: &mut [BaseField]) -> Option<*mut u32> {
+    use crate::prover::backend::simd::m31::N_LANES;
+    let ptr = values.as_mut_ptr() as usize;
+    (ptr.is_multiple_of(64) && values.len().is_multiple_of(N_LANES)).then_some(ptr as *mut u32)
 }
 
 /// Scalar circle FFT into a caller-provided buffer, the reference implementation behind
