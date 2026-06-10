@@ -334,6 +334,11 @@ impl PolyOps for CpuBackend {
         basis: &Vec<SecureField>,
     ) -> Vec<SecureField> {
         use crate::prover::backend::simd::m31::{PackedBaseField, N_LANES};
+        // Apple-GPU path; summation regrouping only, values exactly equal.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(values) = crate::prover::backend::metal::ood::eval_many_metal(polys, basis) {
+            return values;
+        }
         let n = basis.len();
         if polys.len() < 2 || n < (1 << 12) || !n.is_multiple_of(N_LANES) {
             return polys

@@ -8,6 +8,7 @@ pub mod constraints;
 pub(crate) mod context;
 pub(crate) mod fft;
 pub(crate) mod fri;
+pub(crate) mod ood;
 pub(crate) mod quotients;
 pub(crate) mod twiddles;
 
@@ -20,4 +21,5 @@ pub fn warmup() {
     quotients::warmup();
     twiddles::warmup();
     fri::warmup();
+    ood::warmup();
 }
