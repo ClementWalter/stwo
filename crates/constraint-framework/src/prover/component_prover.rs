@@ -316,6 +316,7 @@ fn subdomain_eval_domain(max_constraint_log_degree_bound: u32, log_expansion: u3
     committed_domain.split(log_expansion).0
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accumulate_pointwise_cpu<E: FrameworkEval + Sync>(
     component_eval: &E,
     claimed_sum: SecureField,
