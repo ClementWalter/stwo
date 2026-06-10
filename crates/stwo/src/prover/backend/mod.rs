@@ -18,7 +18,8 @@ pub mod metal;
 pub mod simd;
 
 pub trait Backend:
-    Copy
+    'static
+    + Copy
     + Clone
     + Debug
     + ColumnOps<BaseField>

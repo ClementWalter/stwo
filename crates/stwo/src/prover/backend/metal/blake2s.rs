@@ -501,6 +501,134 @@ pub(crate) fn build_layers_metal(
     Ok(layers)
 }
 
+/// Tree outputs of [`encode_tree`], finalized after the caller's submission completes.
+pub(crate) struct PendingTree {
+    pub leaves: Vec<Blake2sHash>,
+    levels: Vec<Vec<Blake2sHash>>,
+    copy_outs: Vec<(Buffer, usize)>,
+}
+
+impl PendingTree {
+    /// Resolves any non-zero-copy level buffers; call only after the submission that
+    /// ran the encoded kernels has completed.
+    pub(crate) fn finish(mut self) -> Vec<Vec<Blake2sHash>> {
+        for ((buffer, copy_len), level) in self.copy_outs.iter().zip(self.levels.iter_mut()) {
+            if *copy_len > 0 {
+                // Safety: the kernel wrote all entries into the shared buffer.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        buffer.contents() as *const Blake2sHash,
+                        level.as_mut_ptr(),
+                        *copy_len,
+                    );
+                }
+            }
+        }
+        let mut layers = vec![self.leaves];
+        layers.extend(self.levels);
+        layers
+    }
+}
+
+/// Encodes the whole Merkle tree (uniform-size leaves + every above-threshold layer)
+/// into the caller's command buffer, reading the already-bound LDE column buffers.
+/// Sub-threshold tail layers must be finished by the caller after the wait. Returns
+/// `None` when no usable device exists.
+pub(crate) fn encode_tree(
+    command_buffer: &metal::CommandBufferRef,
+    column_buffers: &[Buffer],
+    n_rows: usize,
+    is_m31_output: bool,
+) -> Option<PendingTree> {
+    let ctx = context()?;
+    let mut ctx = ctx.lock().unwrap();
+
+    // Leaves: chunked absorption, exactly as build_leaves_metal.
+    let mut leaves: Vec<Blake2sHash> = unsafe { uninit_vec(n_rows) };
+    prefault(&mut leaves);
+    let state_bytes = (n_rows * 32) as u64;
+    if ctx
+        .state_buffer
+        .as_ref()
+        .is_none_or(|b| b.length() < state_bytes)
+    {
+        ctx.state_buffer = Some(
+            ctx.device
+                .new_buffer(state_bytes, MTLResourceOptions::StorageModePrivate),
+        );
+    }
+    let (leaves_buffer, leaves_zero_copy) = output_buffer(&ctx.device, &mut leaves);
+    if !leaves_zero_copy {
+        // The chain relies on zero-copy outputs throughout; bail to the separate path.
+        return None;
+    }
+    let n_chunks = column_buffers.len().div_ceil(CHUNK_COLS);
+    let mut byte_count = 0u32;
+    for (chunk_idx, chunk) in column_buffers.chunks(CHUNK_COLS).enumerate() {
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&ctx.absorb_pipeline);
+        for slot in 0..CHUNK_COLS {
+            // Unused slots must still be bound; alias the first column (never read).
+            let buffer = chunk.get(slot).unwrap_or(&chunk[0]);
+            encoder.set_buffer(slot as u64, Some(buffer), 0);
+        }
+        encoder.set_buffer(16, ctx.state_buffer.as_ref().map(|b| b as _), 0);
+        encoder.set_buffer(17, Some(&leaves_buffer), 0);
+        let params = AbsorbParams {
+            n_rows: n_rows as u32,
+            n_cols: chunk.len() as u32,
+            byte_count_base: byte_count,
+            mode: u32::from(chunk_idx == 0) | (u32::from(chunk_idx == n_chunks - 1) << 1),
+            is_m31_output: u32::from(is_m31_output),
+        };
+        encoder.set_bytes(
+            18,
+            std::mem::size_of::<AbsorbParams>() as u64,
+            &params as *const _ as *const std::ffi::c_void,
+        );
+        encoder.dispatch_threads(MTLSize::new(n_rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+        encoder.end_encoding();
+        byte_count += chunk.len() as u32 * 4;
+    }
+
+    // Layer chain, exactly as build_layers_metal.
+    let mut sizes = vec![];
+    let mut n = n_rows / 2;
+    while n >= (1 << MIN_METAL_LOG_SIZE) {
+        sizes.push(n);
+        n /= 2;
+    }
+    let mut levels: Vec<Vec<Blake2sHash>> =
+        sizes.iter().map(|&n| unsafe { uninit_vec(n) }).collect();
+    levels.iter_mut().for_each(|level| prefault(level));
+    let mut prev_buffer = leaves_buffer;
+    let mut copy_outs = vec![];
+    for level in levels.iter_mut() {
+        let (out_buffer, zero_copy) = output_buffer(&ctx.device, level);
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&ctx.children_pipeline);
+        encoder.set_buffer(0, Some(&prev_buffer), 0);
+        encoder.set_buffer(1, Some(&out_buffer), 0);
+        let n = level.len() as u32;
+        encoder.set_bytes(2, 4, &n as *const _ as *const std::ffi::c_void);
+        let m31 = u32::from(is_m31_output);
+        encoder.set_bytes(3, 4, &m31 as *const _ as *const std::ffi::c_void);
+        encoder.dispatch_threads(
+            MTLSize::new(level.len() as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        encoder.end_encoding();
+        copy_outs.push((out_buffer.clone(), if zero_copy { 0 } else { level.len() }));
+        prev_buffer = out_buffer;
+    }
+
+    Some(PendingTree {
+        leaves,
+        levels,
+        copy_outs,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

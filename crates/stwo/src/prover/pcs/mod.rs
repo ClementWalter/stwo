@@ -494,6 +494,71 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         lifting_log_size: Option<u32>,
         base_column_pool: &BaseColumnPool<B>,
     ) -> Self {
+        // Apple-GPU chained commitment: interpolation, extension, Merkle leaves and
+        // tree layers in one submission with one wait (CpuBackend + blake2s only).
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        let columns = {
+            use std::any::TypeId;
+
+            use crate::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasherGeneric;
+            let is_cpu = TypeId::of::<B>() == TypeId::of::<crate::prover::backend::CpuBackend>();
+            let is_m31 = TypeId::of::<MC::H>() == TypeId::of::<Blake2sMerkleHasherGeneric<true>>();
+            let is_bytes =
+                TypeId::of::<MC::H>() == TypeId::of::<Blake2sMerkleHasherGeneric<false>>();
+            if is_cpu && (is_m31 || is_bytes) {
+                // Safety: TypeId equality makes these transmutes identity conversions.
+                type CpuCols = Vec<EvalsOrCoeffs<crate::prover::backend::CpuBackend>>;
+                let cpu_columns: CpuCols = unsafe { std::mem::transmute_copy(&columns) };
+                std::mem::forget(columns);
+                let cpu_twiddles: &TwiddleTree<crate::prover::backend::CpuBackend> =
+                    unsafe { std::mem::transmute(twiddles) };
+                let span = span!(Level::INFO, "Extension").entered();
+                let result = crate::prover::backend::metal::commit::commit_polynomials_metal(
+                    cpu_columns,
+                    log_blowup_factor,
+                    cpu_twiddles,
+                    store_polynomials_coefficients,
+                    lifting_log_size,
+                    is_m31,
+                );
+                span.exit();
+                match result {
+                    Ok((cpu_polys, Some(mut cpu_layers))) => {
+                        let _span = span!(Level::INFO, "Merkle").entered();
+                        cpu_layers.reverse();
+                        // Safety: identity conversions under the TypeId checks above.
+                        let polynomials: ColumnVec<Poly<B>> =
+                            unsafe { std::mem::transmute_copy(&cpu_polys) };
+                        std::mem::forget(cpu_polys);
+                        let layers: Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>> =
+                            unsafe { std::mem::transmute_copy(&cpu_layers) };
+                        std::mem::forget(cpu_layers);
+                        return CommitmentTreeProver {
+                            polynomials,
+                            commitment: crate::prover::vcs_lifted::prover::MerkleProverLifted {
+                                layers,
+                            },
+                        };
+                    }
+                    Ok((cpu_polys, None)) => {
+                        // Transforms ran; only the tree fell back. Build it normally.
+                        let polynomials: ColumnVec<Poly<B>> =
+                            unsafe { std::mem::transmute_copy(&cpu_polys) };
+                        std::mem::forget(cpu_polys);
+                        return Self::commit_polynomials(polynomials, lifting_log_size);
+                    }
+                    Err(cpu_columns) => {
+                        let columns: ColumnVec<EvalsOrCoeffs<B>> =
+                            unsafe { std::mem::transmute_copy(&cpu_columns) };
+                        std::mem::forget(cpu_columns);
+                        columns
+                    }
+                }
+            } else {
+                columns
+            }
+        };
+
         let span = span!(Level::INFO, "Extension").entered();
         let polynomials = B::interpolate_and_evaluate_polynomials(
             columns,
@@ -504,6 +569,11 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         );
         span.exit();
 
+        Self::commit_polynomials(polynomials, lifting_log_size)
+    }
+
+    /// Builds the Merkle commitment over already-extended polynomials.
+    fn commit_polynomials(polynomials: ColumnVec<Poly<B>>, lifting_log_size: Option<u32>) -> Self {
         let _span = span!(Level::INFO, "Merkle").entered();
         let max_log_domain_size = polynomials
             .iter()

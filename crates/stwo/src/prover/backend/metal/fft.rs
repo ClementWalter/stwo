@@ -589,6 +589,31 @@ pub(crate) fn fused_transform_metal_with_itwiddles(
     ifft_twiddles: Option<&TwiddleTree<CpuBackend>>,
     store_polynomials_coefficients: bool,
 ) -> Result<Vec<Poly<CpuBackend>>, Vec<EvalsOrCoeffs<CpuBackend>>> {
+    fused_transform_metal_chained(
+        columns,
+        log_blowup_factor,
+        twiddles,
+        ifft_twiddles,
+        store_polynomials_coefficients,
+        |_, _| Some(()),
+    )
+    .map(|(polys, _)| polys)
+}
+
+/// Like the fused transform, additionally letting `chain` encode follow-up kernels
+/// (e.g. the Merkle tree over these evaluations) into the same submission, right after
+/// the extension transforms and before the single wait. `chain` receives the command
+/// buffer and the per-column LDE output buffers; a `None` from it only omits the
+/// chained outputs — the transforms still complete.
+#[allow(clippy::type_complexity)]
+pub(crate) fn fused_transform_metal_chained<R>(
+    columns: Vec<EvalsOrCoeffs<CpuBackend>>,
+    log_blowup_factor: u32,
+    twiddles: &TwiddleTree<CpuBackend>,
+    ifft_twiddles: Option<&TwiddleTree<CpuBackend>>,
+    store_polynomials_coefficients: bool,
+    chain: impl FnOnce(&metal::CommandBufferRef, &[Buffer]) -> Option<R>,
+) -> Result<(Vec<Poly<CpuBackend>>, Option<R>), Vec<EvalsOrCoeffs<CpuBackend>>> {
     let itw = ifft_twiddles.unwrap_or(twiddles);
     let small = columns.iter().any(|column| {
         let log_size = match column {
@@ -741,13 +766,15 @@ pub(crate) fn fused_transform_metal_with_itwiddles(
             );
         }
     }
+    let out_buffers: Vec<Buffer> = bindings.iter().map(|(_, out)| out.clone()).collect();
+    let chained = chain(command_buffer, &out_buffers);
     tracing::debug!("metal fused: encode {:?}", t_encode.elapsed());
     let t_wait = std::time::Instant::now();
     command_buffer.commit();
     command_buffer.wait_until_completed();
     tracing::debug!("metal fused: gpu {:?}", t_wait.elapsed());
 
-    Ok(work
+    let polys = work
         .into_iter()
         .map(|(values, domain, _, out)| {
             let ext_domain =
@@ -759,7 +786,8 @@ pub(crate) fn fused_transform_metal_with_itwiddles(
                 crate::prover::poly::circle::CircleEvaluation::new(ext_domain, out),
             )
         })
-        .collect())
+        .collect();
+    Ok((polys, chained))
 }
 
 fn repack(
