@@ -2,13 +2,17 @@ use std::iter::zip;
 
 use itertools::Itertools;
 use num_traits::Zero;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use super::CpuBackend;
 use crate::core::circle::CirclePoint;
+use crate::core::fields::cm31::CM31;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
+use crate::core::fields::FieldExpOps;
 use crate::core::pcs::quotients::{
-    accumulate_row_partial_numerators, denominator_inverses, quotient_constants, ColumnSampleBatch,
+    accumulate_row_partial_numerators, denominators, quotient_constants, ColumnSampleBatch,
 };
 use crate::core::poly::circle::CanonicCoset;
 use crate::core::utils::bit_reverse_index;
@@ -33,12 +37,43 @@ impl QuotientOps for CpuBackend {
         for (batch, coeffs) in zip(sample_batches, quotient_constants.line_coeffs) {
             let mut partial_numerators_acc =
                 unsafe { SecureColumnByCoords::uninitialized(subdomain_size) };
-            for row in 0..subdomain_size {
-                let query_values_at_row = columns.iter().map(|col| col[row]).collect_vec();
-                let row_value =
-                    accumulate_row_partial_numerators(batch, &query_values_at_row, &coeffs);
-                partial_numerators_acc.set(row, row_value);
-            }
+
+            // Rows are independent; process disjoint row chunks concurrently. Each chunk
+            // writes a disjoint row range of every coordinate column.
+            let chunk_size = 1 << 12;
+            let mut chunk_views = {
+                let [c0, c1, c2, c3]: &mut [Vec<BaseField>; 4] =
+                    &mut partial_numerators_acc.columns;
+                (c0.chunks_mut(chunk_size))
+                    .zip(c1.chunks_mut(chunk_size))
+                    .zip(c2.chunks_mut(chunk_size))
+                    .zip(c3.chunks_mut(chunk_size))
+                    .enumerate()
+                    .map(|(i, (((d0, d1), d2), d3))| (i * chunk_size, [d0, d1, d2, d3]))
+                    .collect_vec()
+            };
+
+            let process_chunk = |(start, chunk): &mut (usize, [&mut [BaseField]; 4])| {
+                let mut query_values_at_row = Vec::with_capacity(columns.len());
+                for idx in 0..chunk[0].len() {
+                    let row = *start + idx;
+                    query_values_at_row.clear();
+                    query_values_at_row.extend(columns.iter().map(|col| col[row]));
+                    let row_value =
+                        accumulate_row_partial_numerators(batch, &query_values_at_row, &coeffs);
+                    let [v0, v1, v2, v3] = row_value.to_m31_array();
+                    chunk[0][idx] = v0;
+                    chunk[1][idx] = v1;
+                    chunk[2][idx] = v2;
+                    chunk[3][idx] = v3;
+                }
+            };
+
+            #[cfg(feature = "parallel")]
+            chunk_views.par_iter_mut().for_each(process_chunk);
+            #[cfg(not(feature = "parallel"))]
+            chunk_views.iter_mut().for_each(process_chunk);
+
             let first_linear_term_acc: SecureField = coeffs.iter().map(|(a, ..)| a).sum();
             accumulated_numerators_vec.push(AccumulatedNumerators {
                 sample_point: batch.point,
@@ -61,24 +96,64 @@ impl QuotientOps for CpuBackend {
             unsafe { SecureColumnByCoords::uninitialized(1 << subdomain_log_size) };
         let sample_points: Vec<CirclePoint<SecureField>> =
             accumulations.iter().map(|x| x.sample_point).collect();
-        // Populate `quotients` on the subdomain.
-        for row in 0..quotients.len() {
-            let domain_point = eval_subdomain.at(bit_reverse_index(row, subdomain_log_size));
-            let inverses = denominator_inverses(&sample_points, domain_point);
-            let mut quotient = SecureField::zero();
-            for (acc, den_inv) in accumulations.iter().zip_eq(inverses) {
-                let mut full_numerator = SecureField::zero();
-                let log_ratio = subdomain_log_size - acc.partial_numerators_acc.len().ilog2();
-                let lifted_idx = (row >> (log_ratio + 1) << 1) + (row & 1);
+        let n_samples = sample_points.len();
+        // Populate `quotients` on the subdomain: rows are independent, so disjoint row
+        // chunks are processed concurrently, with the denominator inversions of a whole
+        // chunk batched into a single field inversion.
+        let chunk_size = 1 << 12;
+        let n_rows = quotients.len();
+        let mut chunk_views = {
+            let [c0, c1, c2, c3]: &mut [Vec<BaseField>; 4] = &mut quotients.columns;
+            (c0.chunks_mut(chunk_size))
+                .zip(c1.chunks_mut(chunk_size))
+                .zip(c2.chunks_mut(chunk_size))
+                .zip(c3.chunks_mut(chunk_size))
+                .enumerate()
+                .map(|(i, (((d0, d1), d2), d3))| (i * chunk_size, [d0, d1, d2, d3]))
+                .collect_vec()
+        };
+        let _ = n_rows;
 
-                full_numerator += acc.partial_numerators_acc.at(lifted_idx)
-                    - acc.first_linear_term_acc * domain_point.y;
-                // Note that `den_inv` is an element of CM31 (see the docs and comments in the
-                // function [`crates::core::pcs::quotients::denominator_inverses`]).
-                quotient += full_numerator.mul_cm31(den_inv)
+        let process_chunk = |(start, chunk): &mut (usize, [&mut [BaseField]; 4])| {
+            let start = *start;
+            let rows = chunk[0].len();
+            let mut domain_points = Vec::with_capacity(rows);
+            let mut chunk_denominators = Vec::with_capacity(rows * n_samples);
+            for idx in 0..rows {
+                let domain_point =
+                    eval_subdomain.at(bit_reverse_index(start + idx, subdomain_log_size));
+                chunk_denominators.extend(denominators(&sample_points, domain_point));
+                domain_points.push(domain_point);
             }
-            quotients.set(row, quotient);
-        }
+            let inverses = CM31::batch_inverse(&chunk_denominators);
+
+            for (idx, &domain_point) in domain_points.iter().enumerate() {
+                let row = start + idx;
+                let row_inverses = &inverses[idx * n_samples..(idx + 1) * n_samples];
+                let mut quotient = SecureField::zero();
+                for (acc, &den_inv) in accumulations.iter().zip_eq(row_inverses) {
+                    let mut full_numerator = SecureField::zero();
+                    let log_ratio = subdomain_log_size - acc.partial_numerators_acc.len().ilog2();
+                    let lifted_idx = (row >> (log_ratio + 1) << 1) + (row & 1);
+
+                    full_numerator += acc.partial_numerators_acc.at(lifted_idx)
+                        - acc.first_linear_term_acc * domain_point.y;
+                    // Note that `den_inv` is an element of CM31 (see the docs and comments in
+                    // the function [`crates::core::pcs::quotients::denominator_inverses`]).
+                    quotient += full_numerator.mul_cm31(den_inv)
+                }
+                let [v0, v1, v2, v3] = quotient.to_m31_array();
+                chunk[0][idx] = v0;
+                chunk[1][idx] = v1;
+                chunk[2][idx] = v2;
+                chunk[3][idx] = v3;
+            }
+        };
+
+        #[cfg(feature = "parallel")]
+        chunk_views.par_iter_mut().for_each(process_chunk);
+        #[cfg(not(feature = "parallel"))]
+        chunk_views.iter_mut().for_each(process_chunk);
         // Interpolate on subdomain and evaluate on full domain.
         let subdomain_twiddles = TwiddleTree {
             root_coset: eval_subdomain.half_coset,

@@ -148,7 +148,8 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
             let trace_cols = trace.as_cols_ref().map_cols(|c| c.to_cpu());
             let trace_cols = trace_cols.as_cols_ref();
             *accum.col = SecureColumnByCoords::from_cpu(accumulate_pointwise_cpu(
-                self,
+                &self.eval,
+                self.claimed_sum,
                 trace_cols,
                 eval_domain.log_size(),
                 trace_domain.log_size(),
@@ -291,7 +292,8 @@ impl<E: FrameworkEval + Sync> ComponentProver<CpuBackend> for FrameworkComponent
         let trace_cols = trace.as_cols_ref().map_cols(|c| c.as_ref());
 
         *accum.col = accumulate_pointwise_cpu(
-            self,
+            &self.eval,
+            self.claimed_sum,
             trace_cols,
             eval_domain.log_size(),
             trace_domain.log_size(),
@@ -314,8 +316,9 @@ fn subdomain_eval_domain(max_constraint_log_degree_bound: u32, log_expansion: u3
     committed_domain.split(log_expansion).0
 }
 
-fn accumulate_pointwise_cpu<E: FrameworkEval>(
-    component: &FrameworkComponent<E>,
+fn accumulate_pointwise_cpu<E: FrameworkEval + Sync>(
+    component_eval: &E,
+    claimed_sum: SecureField,
     trace_cols: TreeVec<Vec<&CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>>,
     eval_log_size: u32,
     trace_log_size: u32,
@@ -324,22 +327,52 @@ fn accumulate_pointwise_cpu<E: FrameworkEval>(
     accum: &SecureColumnByCoords<CpuBackend>,
 ) -> SecureColumnByCoords<CpuBackend> {
     let mut res = SecureColumnByCoords::zeros(1 << eval_log_size);
-    for row in 0..(1 << eval_log_size) {
-        // Evaluate constrains at row.
-        let eval = CpuDomainEvaluator::new(
-            &trace_cols,
-            row,
-            random_coeff_powers,
-            trace_log_size,
-            eval_log_size,
-            component.eval.log_size(),
-            component.claimed_sum,
-        );
-        let row_res = component.eval.evaluate(eval).row_res;
 
-        // Finalize row.
-        let row_denom_inv = denom_inv[row >> trace_log_size];
-        res.set(row, accum.at(row) + row_res * row_denom_inv)
-    }
+    // Rows are independent; evaluate disjoint row chunks concurrently. Each chunk owns
+    // a disjoint range of every coordinate column.
+    let chunk_size = 1 << 12;
+    let trace_cols = &trace_cols;
+    let denom_inv = &denom_inv;
+    let mut chunk_views = {
+        let [c0, c1, c2, c3]: &mut [Vec<BaseField>; 4] = &mut res.columns;
+        (c0.chunks_mut(chunk_size))
+            .zip(c1.chunks_mut(chunk_size))
+            .zip(c2.chunks_mut(chunk_size))
+            .zip(c3.chunks_mut(chunk_size))
+            .enumerate()
+            .map(|(i, (((d0, d1), d2), d3))| (i * chunk_size, [d0, d1, d2, d3]))
+            .collect_vec()
+    };
+
+    let process_chunk = |(start, chunk): &mut (usize, [&mut [BaseField]; 4])| {
+        for idx in 0..chunk[0].len() {
+            let row = *start + idx;
+            // Evaluate constrains at row.
+            let eval = CpuDomainEvaluator::new(
+                trace_cols,
+                row,
+                random_coeff_powers,
+                trace_log_size,
+                eval_log_size,
+                component_eval.log_size(),
+                claimed_sum,
+            );
+            let row_res = component_eval.evaluate(eval).row_res;
+
+            // Finalize row.
+            let row_denom_inv = denom_inv[row >> trace_log_size];
+            let [v0, v1, v2, v3] = (accum.at(row) + row_res * row_denom_inv).to_m31_array();
+            chunk[0][idx] = v0;
+            chunk[1][idx] = v1;
+            chunk[2][idx] = v2;
+            chunk[3][idx] = v3;
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    chunk_views.par_iter_mut().for_each(process_chunk);
+    #[cfg(not(feature = "parallel"))]
+    chunk_views.iter_mut().for_each(process_chunk);
+
     res
 }
