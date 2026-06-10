@@ -36,10 +36,43 @@ impl IsFirst {
 
 #[cfg(test)]
 mod test {
+    use num_traits::{One, Zero};
+    #[cfg(feature = "parallel")]
+    use rayon::prelude::*;
     use stwo::core::fields::qm31::SecureField;
     use stwo::core::fields::{ExtensionOf, Field};
+    use stwo::prover::backend::simd::m31::N_LANES;
+    use stwo::prover::backend::simd::qm31::PackedSecureField;
+    use stwo::prover::backend::simd::SimdBackend;
     use stwo::prover::backend::Column;
+    use stwo::prover::lookups::gkr_prover::GkrOps;
     use stwo::prover::lookups::mle::{Mle, MleOps};
+
+    /// Evaluates a SIMD multilinear polynomial at `point` as the dot product of its
+    /// evaluations with the eq-evals basis at `point`. Equivalent to
+    /// [`mle_eval_at_point`] but packed and parallel.
+    pub(crate) fn mle_eval_at_point_simd(
+        mle: &Mle<SimdBackend, SecureField>,
+        point: &[SecureField],
+    ) -> SecureField {
+        if mle.len() < N_LANES {
+            return mle_eval_at_point(mle, point);
+        }
+        let eq_evals = SimdBackend::gen_eq_evals(point, SecureField::one()).into_evals();
+        assert_eq!(eq_evals.len(), mle.len());
+
+        #[cfg(feature = "parallel")]
+        let sum = (mle.data.par_iter())
+            .zip(eq_evals.data.par_iter())
+            .map(|(&a, &b)| a * b)
+            .reduce(PackedSecureField::zero, |a, b| a + b);
+        #[cfg(not(feature = "parallel"))]
+        let sum = (mle.data.iter())
+            .zip(eq_evals.data.iter())
+            .fold(PackedSecureField::zero(), |acc, (&a, &b)| acc + a * b);
+
+        sum.pointwise_sum()
+    }
 
     /// Evaluates the multilinear polynomial at `point`.
     pub(crate) fn mle_eval_at_point<B, F>(

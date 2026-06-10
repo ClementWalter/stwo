@@ -44,7 +44,7 @@ use stwo_constraint_framework::{
 use tracing::{span, Level};
 
 #[cfg(test)]
-use crate::xor::gkr_lookups::test::mle_eval_at_point;
+use crate::xor::gkr_lookups::test::mle_eval_at_point_simd;
 use crate::xor::gkr_lookups::IsFirst;
 
 /// Prover component that carries out a univariate IOP for multilinear eval at point.
@@ -88,7 +88,7 @@ impl<'twiddles, 'oracle, O: MleCoeffColumnOracle> MleEvalProverComponent<'twiddl
         interaction: usize,
     ) -> Self {
         #[cfg(test)]
-        assert_eq!(mle_claim, mle_eval_at_point(&mle, mle_eval_point));
+        assert_eq!(mle_claim, mle_eval_at_point_simd(&mle, mle_eval_point));
         let n_variables = mle.n_variables();
         let mle_claim_shift = mle_claim / BaseField::from(1 << n_variables);
 
@@ -626,7 +626,7 @@ pub fn build_trace(
     let mle_terms_cols = mle_terms.into_secure_column_by_coords().columns;
 
     #[cfg(test)]
-    debug_assert_eq!(claim, mle_eval_at_point(mle, eval_point));
+    debug_assert_eq!(claim, mle_eval_at_point_simd(mle, eval_point));
     let shift = claim / BaseField::from(mle.len());
     let packed_shift_coords = PackedSecureField::broadcast(shift).into_packed_m31s();
     let mut shifted_mle_terms_cols = mle_terms_cols;
@@ -870,7 +870,7 @@ mod tests {
     use crate::xor::gkr_lookups::accumulation::MIN_LOG_BLOWUP_FACTOR;
     use crate::xor::gkr_lookups::mle_eval::eval_step_selector_with_offset;
     use crate::xor::gkr_lookups::preprocessed_columns::IsStepWithOffset;
-    use crate::xor::gkr_lookups::test::mle_eval_at_point;
+    use crate::xor::gkr_lookups::test::{mle_eval_at_point, mle_eval_at_point_simd};
     use crate::xor::gkr_lookups::IsFirst;
 
     #[test]
@@ -890,7 +890,7 @@ mod tests {
         let mle_coeffs = (0..size).map(|_| rng.gen::<SecureField>()).collect();
         let mle = Mle::<SimdBackend, SecureField>::new(mle_coeffs);
         let eval_point: Vec<SecureField> = (0..n_variables).map(|_| rng.gen()).collect();
-        let claim = mle_eval_at_point(&mle, &eval_point);
+        let claim = mle_eval_at_point_simd(&mle, &eval_point);
         // Setup protocol.
         let twiddles = SimdBackend::precompute_twiddles(
             CanonicCoset::new(log_size + LOG_EXPAND + MIN_LOG_BLOWUP_FACTOR)
