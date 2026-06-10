@@ -242,6 +242,25 @@ fn input_buffer(device: &Device, data: &[u32]) -> Buffer {
     }
 }
 
+/// Faults a fresh allocation's pages in on the CPU (parallel) so GPU kernels don't
+/// stall on first-touch page faults; contents are fully overwritten by the kernels.
+fn prefault<T: Send>(data: &mut [T]) {
+    let page_elems = 16384 / std::mem::size_of::<T>();
+    let fill = |chunk: &mut [T]| {
+        for slot in chunk.iter_mut().step_by(page_elems) {
+            // Safety: writing zero bytes into allocated memory of any plain type.
+            unsafe { std::ptr::write_bytes(slot, 0, 1) };
+        }
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        data.par_chunks_mut(page_elems * 256).for_each(fill);
+    }
+    #[cfg(not(feature = "parallel"))]
+    fill(data);
+}
+
 /// Binds the result vector as a zero-copy shared buffer when page-aligned, else
 /// allocates a shared scratch buffer the caller copies out of after completion.
 /// Returns (buffer, is_zero_copy).
@@ -291,6 +310,7 @@ pub(crate) fn build_leaves_metal(
 
     // Safety: every entry is written by the final GPU chunk before being read.
     let mut res: Vec<Blake2sHash> = unsafe { uninit_vec(n_rows) };
+    prefault(&mut res);
 
     let state_bytes = (n_rows * 32) as u64;
     if ctx
@@ -370,6 +390,7 @@ pub(crate) fn build_next_layer_metal(
 
     // Safety: every entry is written by the kernel before being read.
     let mut res: Vec<Blake2sHash> = unsafe { uninit_vec(n_out) };
+    prefault(&mut res);
     let prev_words = unsafe {
         std::slice::from_raw_parts(prev_layer.as_ptr() as *const u32, prev_layer.len() * 8)
     };
@@ -431,6 +452,7 @@ pub(crate) fn build_layers_metal(
     // Safety: every entry of every level is written by its kernel before being read.
     let mut levels: Vec<Vec<Blake2sHash>> =
         sizes.iter().map(|&n| unsafe { uninit_vec(n) }).collect();
+    levels.iter_mut().for_each(|level| prefault(level));
 
     let command_buffer = ctx.queue.new_command_buffer();
     let mut prev_buffer = {
