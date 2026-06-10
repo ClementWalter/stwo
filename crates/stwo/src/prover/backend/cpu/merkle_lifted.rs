@@ -109,6 +109,50 @@ impl<H: MerkleHasherLifted + Send + Sync + 'static> MerkleOpsLifted<H> for CpuBa
         prev_layer.into_iter().map(|x| x.finalize()).collect()
     }
 
+    fn build_layers(leaves: Vec<H::Hash>, n_layers: u32) -> Vec<Vec<H::Hash>> {
+        // Blake2s fast path: chain every large layer in one GPU submission.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let is_m31 = TypeId::of::<H>() == TypeId::of::<Blake2sMerkleHasherGeneric<true>>();
+            let is_bytes = TypeId::of::<H>() == TypeId::of::<Blake2sMerkleHasherGeneric<false>>();
+            if is_m31 || is_bytes {
+                let leaves_b: Vec<Blake2sHash> = unsafe { std::mem::transmute(leaves) };
+                match crate::prover::backend::metal::blake2s::build_layers_metal(
+                    leaves_b, n_layers, is_m31,
+                ) {
+                    Ok(layers) => {
+                        // Finish the sub-threshold tail on the CPU/SIMD path.
+                        let mut layers: Vec<Vec<H::Hash>> = unsafe { std::mem::transmute(layers) };
+                        while (layers.len() as u32) < n_layers + 1 {
+                            let next = <Self as MerkleOpsLifted<H>>::build_next_layer(
+                                layers.last().unwrap(),
+                            );
+                            layers.push(next);
+                        }
+                        return layers;
+                    }
+                    Err(leaves_b) => {
+                        let leaves: Vec<H::Hash> = unsafe { std::mem::transmute(leaves_b) };
+                        let mut layers = vec![leaves];
+                        (0..n_layers).for_each(|_| {
+                            let next = <Self as MerkleOpsLifted<H>>::build_next_layer(
+                                layers.last().unwrap(),
+                            );
+                            layers.push(next);
+                        });
+                        return layers;
+                    }
+                }
+            }
+        }
+        let mut layers = vec![leaves];
+        (0..n_layers).for_each(|_| {
+            let next = <Self as MerkleOpsLifted<H>>::build_next_layer(layers.last().unwrap());
+            layers.push(next);
+        });
+        layers
+    }
+
     fn build_next_layer(prev_layer: &Vec<H::Hash>) -> Vec<H::Hash> {
         // Blake2s fast path; see `build_leaves`.
         if TypeId::of::<H>() == TypeId::of::<Blake2sMerkleHasherGeneric<true>>() {

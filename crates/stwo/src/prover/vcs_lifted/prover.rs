@@ -68,9 +68,8 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
             layers.push(B::build_leaves(&sorted_columns, lifting_log_size));
         }
 
-        (0..lifting_log_size).for_each(|_| {
-            layers.push(B::build_next_layer(layers.last().unwrap()));
-        });
+        let leaves = layers.pop().unwrap();
+        layers = B::build_layers(leaves, lifting_log_size);
         layers.reverse();
 
         Self { layers }
