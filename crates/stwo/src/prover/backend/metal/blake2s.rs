@@ -403,6 +403,84 @@ pub(crate) fn build_next_layer_metal(
     Some(res)
 }
 
+/// Builds all `n_layers` Merkle layers above `leaves` in one GPU submission (one
+/// synchronization for the whole chain); layers below the dispatch threshold are
+/// finished by the caller's fallback. Returns `None` when no usable device exists,
+/// passing `leaves` back untouched via the `Err`-like option contract (callers keep
+/// ownership by cloning nothing: `leaves` is returned as the first layer on success).
+pub(crate) fn build_layers_metal(
+    leaves: Vec<Blake2sHash>,
+    n_layers: u32,
+    is_m31_output: bool,
+) -> Result<Vec<Vec<Blake2sHash>>, Vec<Blake2sHash>> {
+    if (leaves.len() / 2) < (1 << MIN_METAL_LOG_SIZE) {
+        return Err(leaves);
+    }
+    let Some(ctx) = context() else {
+        return Err(leaves);
+    };
+    let ctx = ctx.lock().unwrap();
+
+    // GPU levels: every level whose output is still >= the dispatch threshold.
+    let mut sizes = vec![];
+    let mut n = leaves.len() / 2;
+    while n >= (1 << MIN_METAL_LOG_SIZE) && (sizes.len() as u32) < n_layers {
+        sizes.push(n);
+        n /= 2;
+    }
+    // Safety: every entry of every level is written by its kernel before being read.
+    let mut levels: Vec<Vec<Blake2sHash>> =
+        sizes.iter().map(|&n| unsafe { uninit_vec(n) }).collect();
+
+    let command_buffer = ctx.queue.new_command_buffer();
+    let mut prev_buffer = {
+        let words =
+            unsafe { std::slice::from_raw_parts(leaves.as_ptr() as *const u32, leaves.len() * 8) };
+        input_buffer(&ctx.device, words)
+    };
+    let mut copy_outs = vec![];
+    for level in levels.iter_mut() {
+        let (out_buffer, zero_copy) = output_buffer(&ctx.device, level);
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&ctx.children_pipeline);
+        encoder.set_buffer(0, Some(&prev_buffer), 0);
+        encoder.set_buffer(1, Some(&out_buffer), 0);
+        let n = level.len() as u32;
+        encoder.set_bytes(2, 4, &n as *const _ as *const std::ffi::c_void);
+        let m31 = u32::from(is_m31_output);
+        encoder.set_bytes(3, 4, &m31 as *const _ as *const std::ffi::c_void);
+        encoder.dispatch_threads(
+            MTLSize::new(level.len() as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        encoder.end_encoding();
+        if !zero_copy {
+            copy_outs.push((out_buffer.clone(), level.len()));
+        } else {
+            copy_outs.push((out_buffer.clone(), 0));
+        }
+        prev_buffer = out_buffer;
+    }
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    for ((buffer, copy_len), level) in copy_outs.into_iter().zip(levels.iter_mut()) {
+        if copy_len > 0 {
+            // Safety: the kernel wrote all entries into the shared buffer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buffer.contents() as *const Blake2sHash,
+                    level.as_mut_ptr(),
+                    copy_len,
+                );
+            }
+        }
+    }
+
+    let mut layers = vec![leaves];
+    layers.extend(levels);
+    Ok(layers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

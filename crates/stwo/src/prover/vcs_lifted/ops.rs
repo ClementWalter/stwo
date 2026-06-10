@@ -17,6 +17,16 @@ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
     /// Given a layer of hashes as input, computes a new layer by hashing pairs
     /// of adjacent elements of the input, as in a standard Merkle tree.
     fn build_next_layer(prev_layer: &Col<Self, H::Hash>) -> Col<Self, H::Hash>;
+
+    /// Builds all `n_layers` tree layers above `leaves` (leaves first). Backends can
+    /// override to batch the whole chain (e.g. one GPU submission).
+    fn build_layers(leaves: Col<Self, H::Hash>, n_layers: u32) -> Vec<Col<Self, H::Hash>> {
+        let mut layers = vec![leaves];
+        (0..n_layers).for_each(|_| {
+            layers.push(Self::build_next_layer(layers.last().unwrap()));
+        });
+        layers
+    }
 }
 
 pub trait PackLeavesOps: ColumnOps<BaseField> {
