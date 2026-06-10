@@ -64,6 +64,9 @@ struct PassParams {
     uint inverse;   // 1: ibutterfly (ifft), 0: butterfly (rfft)
     uint descending;// 1: apply the pass's layers from highest to lowest (rfft)
     uint scale;     // multiply outputs by this on the final store (1 = no-op)
+    // When nonzero, stage from `src` (zero-extended past src_len) instead of `values`,
+    // fusing the coefficient extension into the transform's first pass.
+    uint src_len;
     // Offset of each layer's twiddle slice in the packed twiddle buffer, indexed by
     // LOCAL layer j (0..n_layers).
     uint twiddle_offsets[16];
@@ -75,6 +78,7 @@ kernel void fft_pass(
     device uint* values [[buffer(0)]],
     device const uint* twiddles [[buffer(1)]],
     constant PassParams& p [[buffer(2)]],
+    device const uint* src [[buffer(3)]],
     uint tid [[thread_position_in_threadgroup]],
     uint gid [[threadgroup_position_in_grid]])
 {
@@ -94,7 +98,8 @@ kernel void fft_pass(
     for (uint local = tid; local < n_local; local += 512u) {
         uint r = local >> c_log;
         uint c = local & c_mask;
-        tile[local] = values[base + (r << p.i0) + c];
+        uint g = base + (r << p.i0) + c;
+        tile[local] = (p.src_len != 0u) ? ((g < p.src_len) ? src[g] : 0u) : values[g];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -134,22 +139,12 @@ kernel void fft_pass(
         values[base + (r << p.i0) + c] = v;
     }
 }
-
-kernel void extend_zero(
-    device const uint* src [[buffer(0)]],
-    device uint* dst [[buffer(1)]],
-    constant uint& src_len [[buffer(2)]],
-    uint i [[thread_position_in_grid]])
-{
-    dst[i] = (i < src_len) ? src[i] : 0u;
-}
 "#;
 
 struct FftContext {
     device: Device,
     queue: CommandQueue,
     pass_pipeline: ComputePipelineState,
-    extend_pipeline: ComputePipelineState,
     /// Packed twiddle buffers keyed by
     /// (root initial index, root log size, domain log size, inverse).
     twiddle_cache: HashMap<(u32, u32, u32, bool), TwiddleBuffers>,
@@ -180,16 +175,11 @@ fn context() -> Option<&'static Mutex<FftContext>> {
             let pass_pipeline = device
                 .new_compute_pipeline_state_with_function(&pass)
                 .ok()?;
-            let extend = library.get_function("extend_zero", None).ok()?;
-            let extend_pipeline = device
-                .new_compute_pipeline_state_with_function(&extend)
-                .ok()?;
             let queue = device.new_command_queue();
             Some(Mutex::new(FftContext {
                 device,
                 queue,
                 pass_pipeline,
-                extend_pipeline,
                 twiddle_cache: HashMap::new(),
             }))
         })
@@ -210,6 +200,7 @@ struct PassParams {
     inverse: u32,
     descending: u32,
     scale: u32,
+    src_len: u32,
     twiddle_offsets: [u32; 16],
 }
 
@@ -289,6 +280,7 @@ fn encode_pass(
     inverse: bool,
     descending: bool,
     scale: u32,
+    src: Option<(&Buffer, u32)>,
 ) {
     let c_log = (TILE_LOG - n_layers).min(i0);
     debug_assert!(n_layers <= 16);
@@ -303,12 +295,14 @@ fn encode_pass(
         inverse: u32::from(inverse),
         descending: u32::from(descending),
         scale,
+        src_len: src.map_or(0, |(_, len)| len),
         twiddle_offsets: offsets,
     };
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&ctx.pass_pipeline);
     encoder.set_buffer(0, Some(values), 0);
     encoder.set_buffer(1, Some(&twiddles.buffer), 0);
+    encoder.set_buffer(3, Some(src.map_or(values, |(buffer, _)| buffer)), 0);
     encoder.set_bytes(
         2,
         std::mem::size_of::<PassParams>() as u64,
@@ -387,6 +381,7 @@ pub(crate) fn ifft_metal(
             true,
             false,
             scale,
+            None,
         );
     }
     command_buffer.commit();
@@ -432,22 +427,11 @@ pub(crate) fn rfft_metal(
     let tw = unsafe { &*tw_ptr };
 
     let command_buffer = ctx.queue.new_command_buffer();
-    // Zero-extend the coefficients into the output buffer.
-    {
-        let encoder = command_buffer.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(&ctx.extend_pipeline);
-        encoder.set_buffer(0, Some(&coeffs_buffer), 0);
-        encoder.set_buffer(1, Some(&out_buffer), 0);
-        let src_len = coeffs.len() as u32;
-        encoder.set_bytes(2, 4, &src_len as *const _ as *const std::ffi::c_void);
-        encoder.dispatch_threads(
-            MTLSize::new(domain.size() as u64, 1, 1),
-            MTLSize::new(THREADS_PER_GROUP, 1, 1),
-        );
-        encoder.end_encoding();
-    }
     // Layers run from highest to lowest: passes in reverse, descending within a pass.
-    for &pass in pass_split(n_log).iter().rev() {
+    // The first pass stages from the coefficient buffer (zero-extended), fusing the
+    // extension into the transform.
+    for (idx, &pass) in pass_split(n_log).iter().rev().enumerate() {
+        let src = (idx == 0).then_some((&coeffs_buffer, coeffs.len() as u32));
         encode_pass(
             &ctx,
             command_buffer,
@@ -458,6 +442,7 @@ pub(crate) fn rfft_metal(
             false,
             true,
             1,
+            src,
         );
     }
     command_buffer.commit();
@@ -592,6 +577,7 @@ pub(crate) fn fused_transform_metal_with_itwiddles(
                 true,
                 false,
                 scale,
+                None,
             );
         }
     }
@@ -620,20 +606,7 @@ pub(crate) fn fused_transform_metal_with_itwiddles(
     for ((values, domain, _, out), (values_buffer, out_buffer)) in work.iter().zip(&bindings) {
         let n_log = domain.log_size();
         let ext_domain = CanonicCoset::new(n_log + log_blowup_factor).circle_domain();
-        // Zero-extend coefficients into the output, then run the rfft layers.
-        {
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(&ctx.extend_pipeline);
-            encoder.set_buffer(0, Some(values_buffer), 0);
-            encoder.set_buffer(1, Some(out_buffer), 0);
-            let src_len = values.len() as u32;
-            encoder.set_bytes(2, 4, &src_len as *const _ as *const std::ffi::c_void);
-            encoder.dispatch_threads(
-                MTLSize::new(out.len() as u64, 1, 1),
-                MTLSize::new(THREADS_PER_GROUP, 1, 1),
-            );
-            encoder.end_encoding();
-        }
+        let _ = out;
         let ext_log = ext_domain.log_size();
         let key = (
             twiddles.root_coset.initial_index.0 as u32,
@@ -642,7 +615,10 @@ pub(crate) fn fused_transform_metal_with_itwiddles(
             false,
         );
         let tw = &ctx.twiddle_cache[&key];
-        for &pass in pass_split(ext_log).iter().rev() {
+        // The first (highest) pass stages from the coefficient buffer, zero-extended,
+        // fusing the extension into the transform.
+        for (idx, &pass) in pass_split(ext_log).iter().rev().enumerate() {
+            let src = (idx == 0).then_some((values_buffer, values.len() as u32));
             encode_pass(
                 &ctx,
                 command_buffer,
@@ -653,6 +629,7 @@ pub(crate) fn fused_transform_metal_with_itwiddles(
                 false,
                 true,
                 1,
+                src,
             );
         }
     }
@@ -691,4 +668,50 @@ fn repack(
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::core::poly::circle::CanonicCoset;
+    use crate::prover::backend::cpu::CpuBackend;
+    use crate::prover::poly::circle::PolyOps;
+
+    /// GPU kernel micro-benchmark (CPU-load insensitive). Run manually:
+    /// `cargo test -p stwo --features prover,metal --release --lib fft_kernel_bench -- --ignored
+    /// --nocapture`
+    #[test]
+    #[ignore]
+    fn fft_kernel_bench() {
+        const LOG: u32 = 22;
+        let twiddles = <CpuBackend as PolyOps>::precompute_twiddles(
+            CanonicCoset::new(LOG + 2).circle_domain().half_coset,
+        );
+        let domain = CanonicCoset::new(LOG).circle_domain();
+        let ext_domain = CanonicCoset::new(LOG + 1).circle_domain();
+        let mut values: Vec<BaseField> = (0..1u32 << LOG)
+            .map(|i| BaseField::from_u32_unchecked((i.wrapping_mul(2654435761)) >> 1))
+            .collect();
+        let mut out = vec![BaseField::from_u32_unchecked(0); 1 << (LOG + 1)];
+        // Warm: twiddle upload + pipeline.
+        assert!(ifft_metal(&mut values, domain, &twiddles));
+        assert!(rfft_metal(&values, ext_domain, &twiddles, &mut out));
+        let n = 20;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            ifft_metal(&mut values, domain, &twiddles);
+        }
+        let ifft_ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            rfft_metal(&values, ext_domain, &twiddles, &mut out);
+        }
+        let rfft_ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        std::println!(
+            "ifft@2^{LOG}: {ifft_ms:.2} ms ({:.0} GB/s), rfft->2^{}: {rfft_ms:.2} ms ({:.0} GB/s)",
+            (2.0 * 4.0 * (1u64 << LOG) as f64 * 2.0) / ifft_ms / 1e6,
+            LOG + 1,
+            (3.0 * 4.0 * (1u64 << (LOG + 1)) as f64 * 2.0) / rfft_ms / 1e6,
+        );
+    }
 }
