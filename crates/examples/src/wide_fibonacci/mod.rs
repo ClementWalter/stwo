@@ -492,7 +492,7 @@ mod tests {
     /// proving path for consumers without nightly SIMD; size is overridable for
     /// benchmarking:
     ///   CPU_FIB_LOG_N_INSTANCES=18 cargo test --release test_cpu_e2e_wide_fib_prove
-    #[test]
+    #[test_log::test]
     fn test_cpu_e2e_wide_fib_prove() {
         let log_n_instances: u32 = std::env::var("CPU_FIB_LOG_N_INSTANCES")
             .map(|s| s.parse().unwrap())

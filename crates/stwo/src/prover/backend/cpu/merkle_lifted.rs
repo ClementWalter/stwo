@@ -62,11 +62,16 @@ impl<H: MerkleHasherLifted + Send + Sync> MerkleOpsLifted<H> for CpuBackend {
             // We chunk by 16 — the amount of M31 elements that triggers a hash permutation
             // in Blake2s (block = 64 bytes = 16 × 4) and matches Poseidon252's absorption rate.
             // For Keccak256 the rate is larger (136 bytes ≈ 34 M31s), so this chunking is
-            // suboptimal but still correct. Rows absorb independently.
+            // suboptimal but still correct. Rows absorb independently; each row gathers its
+            // chunk values into a stack buffer.
             for chunk in &group.into_iter().chunks(16) {
                 let vec = chunk.into_iter().collect_vec();
                 let update_row = |(i, hasher): (usize, &mut H)| {
-                    hasher.update_leaf(&vec.iter().map(|v| v[i]).collect_vec());
+                    let mut row_values = [BaseField::default(); 16];
+                    for (slot, col) in row_values.iter_mut().zip(vec.iter()) {
+                        *slot = col[i];
+                    }
+                    hasher.update_leaf(&row_values[..vec.len()]);
                 };
                 #[cfg(feature = "parallel")]
                 prev_layer.par_iter_mut().enumerate().for_each(update_row);

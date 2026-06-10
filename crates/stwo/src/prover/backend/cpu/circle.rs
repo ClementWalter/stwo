@@ -257,6 +257,16 @@ impl PolyOps for CpuBackend {
         }
 
         let mut itwiddles = vec![BaseField::zero(); twiddles.len()];
+        #[cfg(feature = "parallel")]
+        twiddles
+            .as_chunks::<CHUNK_SIZE>()
+            .0
+            .par_iter()
+            .zip(itwiddles.as_chunks_mut::<CHUNK_SIZE>().0.par_iter_mut())
+            .for_each(|(src, dst)| {
+                batch_inverse_in_place(src, dst);
+            });
+        #[cfg(not(feature = "parallel"))]
         twiddles
             .array_chunks::<CHUNK_SIZE>()
             .zip(itwiddles.array_chunks_mut::<CHUNK_SIZE>())
