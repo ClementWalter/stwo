@@ -35,52 +35,24 @@ impl PolyOps for CpuBackend {
     ) -> CircleCoefficients<Self> {
         assert!(eval.domain.half_coset.is_doubling_of(twiddles.root_coset));
 
-        let mut values = eval.values;
-
-        if eval.domain.log_size() == 1 {
-            let y = eval.domain.half_coset.initial.y;
-            let n = BaseField::from(2);
-            let yn_inv = (y * n).inverse();
-            let y_inv = yn_inv * n;
-            let n_inv = yn_inv * y;
-            let (mut v0, mut v1) = (values[0], values[1]);
-            ibutterfly(&mut v0, &mut v1, y_inv);
-            return CircleCoefficients::new(vec![v0 * n_inv, v1 * n_inv]);
+        // Large transforms dispatch to the shared SIMD FFT (cached packed twiddles, one
+        // aligned copy in, zero-copy out); [`interpolate_scalar`] remains the reference.
+        if eval.domain.log_size() >= SIMD_DISPATCH_LOG_SIZE {
+            use crate::prover::backend::simd::column::BaseColumn;
+            use crate::prover::backend::simd::SimdBackend;
+            let simd_twiddles = cached_simd_twiddles(twiddles.root_coset);
+            let domain = eval.domain;
+            let packed = BaseColumn::from_cpu(&eval.values);
+            let coeffs = crate::prover::poly::circle::CircleEvaluation::<
+                SimdBackend,
+                BaseField,
+                BitReversedOrder,
+            >::new(domain, packed)
+            .interpolate_with_twiddles(&simd_twiddles);
+            return CircleCoefficients::new(coeffs.coeffs.into_cpu_vec());
         }
 
-        if eval.domain.log_size() == 2 {
-            let CirclePoint { x, y } = eval.domain.half_coset.initial;
-            let n = BaseField::from(4);
-            let xyn_inv = (x * y * n).inverse();
-            let x_inv = xyn_inv * y * n;
-            let y_inv = xyn_inv * x * n;
-            let n_inv = xyn_inv * x * y;
-            let (mut v0, mut v1, mut v2, mut v3) = (values[0], values[1], values[2], values[3]);
-            ibutterfly(&mut v0, &mut v1, y_inv);
-            ibutterfly(&mut v2, &mut v3, -y_inv);
-            ibutterfly(&mut v0, &mut v2, x_inv);
-            ibutterfly(&mut v1, &mut v3, x_inv);
-            return CircleCoefficients::new(vec![v0 * n_inv, v1 * n_inv, v2 * n_inv, v3 * n_inv]);
-        }
-
-        let line_twiddles = domain_line_twiddles_from_tree(eval.domain, &twiddles.itwiddles);
-        let circle_twiddles = circle_twiddles_from_line_twiddles(line_twiddles[0]).collect_vec();
-
-        fft_full_layer(&mut values, 0, |h| circle_twiddles[h], ibutterfly);
-        for (layer, layer_twiddles) in line_twiddles.into_iter().enumerate() {
-            fft_full_layer(&mut values, layer + 1, |h| layer_twiddles[h], ibutterfly);
-        }
-
-        // Divide all values by 2^log_size.
-        let inv = BaseField::from_u32_unchecked(eval.domain.size() as u32).inverse();
-        #[cfg(feature = "parallel")]
-        values.par_iter_mut().for_each(|val| *val *= inv);
-        #[cfg(not(feature = "parallel"))]
-        for val in &mut values {
-            *val *= inv;
-        }
-
-        CircleCoefficients::new(values)
+        interpolate_scalar(eval, twiddles)
     }
 
     fn eval_at_point(
@@ -319,6 +291,13 @@ impl PolyOps for CpuBackend {
         domain: CircleDomain,
         twiddles: &TwiddleTree<Self>,
     ) -> CircleEvaluation<Self, BaseField, BitReversedOrder> {
+        // The SIMD-dispatched path of evaluate_into allocates its own aligned buffer;
+        // only allocate the scalar buffer when the scalar path will run.
+        if domain.log_size() >= SIMD_DISPATCH_LOG_SIZE
+            && poly.coeffs.len().ilog2() >= SIMD_DISPATCH_LOG_SIZE
+        {
+            return Self::evaluate_into(poly, domain, twiddles, Vec::new());
+        }
         let buffer = vec![BaseField::zero(); domain.size()];
         Self::evaluate_into(poly, domain, twiddles, buffer)
     }
@@ -327,49 +306,28 @@ impl PolyOps for CpuBackend {
         poly: &CircleCoefficients<Self>,
         domain: CircleDomain,
         twiddles: &TwiddleTree<Self>,
-        mut buffer: Col<Self, BaseField>,
+        buffer: Col<Self, BaseField>,
     ) -> CircleEvaluation<Self, BaseField, BitReversedOrder> {
         assert!(domain.half_coset.is_doubling_of(twiddles.root_coset));
+
+        // Large transforms dispatch to the shared SIMD FFT; see [`PolyOps::interpolate`].
+        // The polynomial itself must also clear the dispatch size: the SIMD backend's
+        // small-input fallback is this very function. The dispatched path allocates its
+        // own aligned output, ignoring `buffer`.
+        if domain.log_size() >= SIMD_DISPATCH_LOG_SIZE
+            && poly.coeffs.len().ilog2() >= SIMD_DISPATCH_LOG_SIZE
+        {
+            use crate::prover::backend::simd::SimdBackend;
+            let simd_twiddles = cached_simd_twiddles(twiddles.root_coset);
+            let simd_coeffs = crate::prover::poly::circle::CircleCoefficients::<SimdBackend>::new(
+                poly.coeffs.iter().copied().collect(),
+            );
+            let evals = simd_coeffs.evaluate_with_twiddles(domain, &simd_twiddles);
+            return CircleEvaluation::new(domain, evals.values.into_cpu_vec());
+        }
+
         assert_eq!(buffer.len(), domain.size());
-
-        // Copy extended coefficients into the buffer.
-        let poly_len = poly.coeffs.len();
-        buffer[..poly_len].copy_from_slice(&poly.coeffs);
-        for v in &mut buffer[poly_len..] {
-            *v = BaseField::zero();
-        }
-
-        if domain.log_size() == 1 {
-            let (mut v0, mut v1) = (buffer[0], buffer[1]);
-            butterfly(&mut v0, &mut v1, domain.half_coset.initial.y);
-            buffer[0] = v0;
-            buffer[1] = v1;
-            return CircleEvaluation::new(domain, buffer);
-        }
-
-        if domain.log_size() == 2 {
-            let (mut v0, mut v1, mut v2, mut v3) = (buffer[0], buffer[1], buffer[2], buffer[3]);
-            let CirclePoint { x, y } = domain.half_coset.initial;
-            butterfly(&mut v0, &mut v2, x);
-            butterfly(&mut v1, &mut v3, x);
-            butterfly(&mut v0, &mut v1, y);
-            butterfly(&mut v2, &mut v3, -y);
-            buffer[0] = v0;
-            buffer[1] = v1;
-            buffer[2] = v2;
-            buffer[3] = v3;
-            return CircleEvaluation::new(domain, buffer);
-        }
-
-        let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
-        let circle_twiddles = circle_twiddles_from_line_twiddles(line_twiddles[0]).collect_vec();
-
-        for (layer, layer_twiddles) in line_twiddles.iter().enumerate().rev() {
-            fft_full_layer(&mut buffer, layer + 1, |h| layer_twiddles[h], butterfly);
-        }
-        fft_full_layer(&mut buffer, 0, |h| circle_twiddles[h], butterfly);
-
-        CircleEvaluation::new(domain, buffer)
+        evaluate_into_scalar(poly, domain, twiddles, buffer)
     }
 
     fn precompute_twiddles(coset: Coset) -> TwiddleTree<Self> {
@@ -424,6 +382,133 @@ impl PolyOps for CpuBackend {
             CircleCoefficients::new(right),
         )
     }
+}
+
+/// Returns a cached SIMD twiddle tree for `root_coset`, building it on first use. The
+/// proof's transforms reuse one or two distinct root cosets, so the cache stays tiny.
+#[allow(clippy::type_complexity)]
+fn cached_simd_twiddles(
+    root_coset: Coset,
+) -> std::sync::Arc<TwiddleTree<crate::prover::backend::simd::SimdBackend>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use crate::prover::backend::simd::SimdBackend;
+
+    static CACHE: OnceLock<Mutex<HashMap<(u32, u32), Arc<TwiddleTree<SimdBackend>>>>> =
+        OnceLock::new();
+    let key = (root_coset.initial_index.0 as u32, root_coset.log_size);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(tree) = cache.lock().unwrap().get(&key) {
+        return tree.clone();
+    }
+    let tree = Arc::new(SimdBackend::precompute_twiddles(root_coset));
+    cache.lock().unwrap().entry(key).or_insert(tree).clone()
+}
+
+/// Size from which single-column transforms dispatch to the shared SIMD FFT kernels.
+const SIMD_DISPATCH_LOG_SIZE: u32 = 10;
+
+/// Scalar circle FFT into a caller-provided buffer, the reference implementation behind
+/// [`PolyOps::evaluate_into`]'s SIMD dispatch.
+pub(crate) fn evaluate_into_scalar(
+    poly: &CircleCoefficients<CpuBackend>,
+    domain: CircleDomain,
+    twiddles: &TwiddleTree<CpuBackend>,
+    mut buffer: Col<CpuBackend, BaseField>,
+) -> CircleEvaluation<CpuBackend, BaseField, BitReversedOrder> {
+    // Copy extended coefficients into the buffer.
+    let poly_len = poly.coeffs.len();
+    buffer[..poly_len].copy_from_slice(&poly.coeffs);
+    for v in &mut buffer[poly_len..] {
+        *v = BaseField::zero();
+    }
+
+    if domain.log_size() == 1 {
+        let (mut v0, mut v1) = (buffer[0], buffer[1]);
+        butterfly(&mut v0, &mut v1, domain.half_coset.initial.y);
+        buffer[0] = v0;
+        buffer[1] = v1;
+        return CircleEvaluation::new(domain, buffer);
+    }
+
+    if domain.log_size() == 2 {
+        let (mut v0, mut v1, mut v2, mut v3) = (buffer[0], buffer[1], buffer[2], buffer[3]);
+        let CirclePoint { x, y } = domain.half_coset.initial;
+        butterfly(&mut v0, &mut v2, x);
+        butterfly(&mut v1, &mut v3, x);
+        butterfly(&mut v0, &mut v1, y);
+        butterfly(&mut v2, &mut v3, -y);
+        buffer[0] = v0;
+        buffer[1] = v1;
+        buffer[2] = v2;
+        buffer[3] = v3;
+        return CircleEvaluation::new(domain, buffer);
+    }
+
+    let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
+    let circle_twiddles = circle_twiddles_from_line_twiddles(line_twiddles[0]).collect_vec();
+
+    for (layer, layer_twiddles) in line_twiddles.iter().enumerate().rev() {
+        fft_full_layer(&mut buffer, layer + 1, |h| layer_twiddles[h], butterfly);
+    }
+    fft_full_layer(&mut buffer, 0, |h| circle_twiddles[h], butterfly);
+
+    CircleEvaluation::new(domain, buffer)
+}
+
+/// Scalar circle iFFT, the reference implementation behind
+/// [`PolyOps::interpolate`]'s SIMD dispatch.
+pub(crate) fn interpolate_scalar(
+    eval: CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>,
+    twiddles: &TwiddleTree<CpuBackend>,
+) -> CircleCoefficients<CpuBackend> {
+    let mut values = eval.values;
+
+    if eval.domain.log_size() == 1 {
+        let y = eval.domain.half_coset.initial.y;
+        let n = BaseField::from(2);
+        let yn_inv = (y * n).inverse();
+        let y_inv = yn_inv * n;
+        let n_inv = yn_inv * y;
+        let (mut v0, mut v1) = (values[0], values[1]);
+        ibutterfly(&mut v0, &mut v1, y_inv);
+        return CircleCoefficients::new(vec![v0 * n_inv, v1 * n_inv]);
+    }
+
+    if eval.domain.log_size() == 2 {
+        let CirclePoint { x, y } = eval.domain.half_coset.initial;
+        let n = BaseField::from(4);
+        let xyn_inv = (x * y * n).inverse();
+        let x_inv = xyn_inv * y * n;
+        let y_inv = xyn_inv * x * n;
+        let n_inv = xyn_inv * x * y;
+        let (mut v0, mut v1, mut v2, mut v3) = (values[0], values[1], values[2], values[3]);
+        ibutterfly(&mut v0, &mut v1, y_inv);
+        ibutterfly(&mut v2, &mut v3, -y_inv);
+        ibutterfly(&mut v0, &mut v2, x_inv);
+        ibutterfly(&mut v1, &mut v3, x_inv);
+        return CircleCoefficients::new(vec![v0 * n_inv, v1 * n_inv, v2 * n_inv, v3 * n_inv]);
+    }
+
+    let line_twiddles = domain_line_twiddles_from_tree(eval.domain, &twiddles.itwiddles);
+    let circle_twiddles = circle_twiddles_from_line_twiddles(line_twiddles[0]).collect_vec();
+
+    fft_full_layer(&mut values, 0, |h| circle_twiddles[h], ibutterfly);
+    for (layer, layer_twiddles) in line_twiddles.into_iter().enumerate() {
+        fft_full_layer(&mut values, layer + 1, |h| layer_twiddles[h], ibutterfly);
+    }
+
+    // Divide all values by 2^log_size.
+    let inv = BaseField::from_u32_unchecked(eval.domain.size() as u32).inverse();
+    #[cfg(feature = "parallel")]
+    values.par_iter_mut().for_each(|val| *val *= inv);
+    #[cfg(not(feature = "parallel"))]
+    for val in &mut values {
+        *val *= inv;
+    }
+
+    CircleCoefficients::new(values)
 }
 
 pub fn slow_precompute_twiddles(mut coset: Coset) -> Vec<BaseField> {
