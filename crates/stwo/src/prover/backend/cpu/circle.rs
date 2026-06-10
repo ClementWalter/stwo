@@ -43,12 +43,13 @@ impl PolyOps for CpuBackend {
             let simd_twiddles = cached_simd_twiddles(twiddles.root_coset);
             let domain = eval.domain;
             let packed = BaseColumn::from_cpu(&eval.values);
-            let coeffs = crate::prover::poly::circle::CircleEvaluation::<
+            let mut coeffs = crate::prover::poly::circle::CircleEvaluation::<
                 SimdBackend,
                 BaseField,
                 BitReversedOrder,
             >::new(domain, packed)
             .interpolate_with_twiddles(&simd_twiddles);
+            convert_simd_coeff_order(&mut coeffs.coeffs);
             return CircleCoefficients::new(coeffs.coeffs.into_cpu_vec());
         }
 
@@ -114,7 +115,7 @@ impl PolyOps for CpuBackend {
         let simd_twiddles = cached_simd_twiddles(twiddles.root_coset);
 
         let process = |column: EvalsOrCoeffs<Self>| {
-            let simd_coeffs = match column {
+            let mut simd_coeffs = match column {
                 EvalsOrCoeffs::Evals(evals) => {
                     let domain = evals.domain;
                     let packed = BaseColumn::from_cpu(&evals.values);
@@ -124,9 +125,14 @@ impl PolyOps for CpuBackend {
                     .interpolate_with_twiddles(&simd_twiddles)
                 }
                 EvalsOrCoeffs::Coeffs(coeffs) => {
-                    crate::prover::poly::circle::CircleCoefficients::<SimdBackend>::new(
-                        coeffs.coeffs.into_iter().collect(),
-                    )
+                    // CPU coefficients are in natural order; the SIMD rfft consumes its
+                    // large-transform layout, so convert on the way in.
+                    let mut simd_coeffs =
+                        crate::prover::poly::circle::CircleCoefficients::<SimdBackend>::new(
+                            coeffs.coeffs.into_iter().collect(),
+                        );
+                    convert_simd_coeff_order(&mut simd_coeffs.coeffs);
+                    simd_coeffs
                 }
             };
             let ext_domain =
@@ -136,8 +142,12 @@ impl PolyOps for CpuBackend {
                 ext_domain,
                 evals.values.into_cpu_vec(),
             );
-            let coeffs = store_polynomials_coefficients
-                .then(|| CircleCoefficients::<Self>::new(simd_coeffs.coeffs.into_cpu_vec()));
+            let coeffs = store_polynomials_coefficients.then(|| {
+                // Stored coefficients feed scalar consumers (OODS sampling, FRI
+                // decomposition), which require natural order.
+                convert_simd_coeff_order(&mut simd_coeffs.coeffs);
+                CircleCoefficients::<Self>::new(simd_coeffs.coeffs.into_cpu_vec())
+            });
             Poly::new(coeffs, evals)
         };
 
@@ -320,9 +330,11 @@ impl PolyOps for CpuBackend {
         {
             use crate::prover::backend::simd::SimdBackend;
             let simd_twiddles = cached_simd_twiddles(twiddles.root_coset);
-            let simd_coeffs = crate::prover::poly::circle::CircleCoefficients::<SimdBackend>::new(
-                poly.coeffs.iter().copied().collect(),
-            );
+            let mut simd_coeffs =
+                crate::prover::poly::circle::CircleCoefficients::<SimdBackend>::new(
+                    poly.coeffs.iter().copied().collect(),
+                );
+            convert_simd_coeff_order(&mut simd_coeffs.coeffs);
             let evals = simd_coeffs.evaluate_with_twiddles(domain, &simd_twiddles);
             return CircleEvaluation::new(domain, evals.values.into_cpu_vec());
         }
@@ -411,6 +423,29 @@ pub(crate) fn cached_simd_twiddles(
 
 /// Size from which single-column transforms dispatch to the shared SIMD FFT kernels.
 const SIMD_DISPATCH_LOG_SIZE: u32 = 10;
+
+/// Converts a coefficient column between the SIMD kernels' large-transform layout and
+/// natural coefficient order. Above [`CACHED_FFT_LOG_SIZE`] the SIMD ifft leaves
+/// coefficients vec-transposed (its rfft and eval_at_point consume that same layout),
+/// while every scalar consumer requires natural order — so coefficient columns crossing
+/// the CPU<->SIMD dispatch boundary must be converted. The transpose is an involution,
+/// hence one function serves both directions. Below the threshold the layouts coincide
+/// and this is a no-op.
+pub(crate) fn convert_simd_coeff_order(
+    column: &mut crate::prover::backend::simd::column::BaseColumn,
+) {
+    use crate::prover::backend::simd::fft::{transpose_vecs, CACHED_FFT_LOG_SIZE};
+    use crate::prover::backend::simd::m31::LOG_N_LANES;
+    let log_size = column.len().ilog2();
+    if log_size > CACHED_FFT_LOG_SIZE {
+        unsafe {
+            transpose_vecs(
+                column.data.as_mut_ptr() as *mut u32,
+                (log_size - LOG_N_LANES) as usize,
+            );
+        }
+    }
+}
 
 /// Scalar circle FFT into a caller-provided buffer, the reference implementation behind
 /// [`PolyOps::evaluate_into`]'s SIMD dispatch.
@@ -897,53 +932,195 @@ mod dispatch_tests {
 
     use super::*;
     use crate::core::poly::circle::CanonicCoset;
+    use crate::core::utils::bit_reverse_index;
     use crate::prover::poly::circle::{CircleEvaluation, EvalsOrCoeffs, PolyOps};
     use crate::prover::poly::BitReversedOrder;
 
-    /// The SIMD-dispatched fused interpolation+extension must produce exactly the scalar
-    /// path's coefficients and evaluations, across the dispatch size threshold.
+    fn test_values(log_size: u32) -> Vec<BaseField> {
+        (0..1u32 << log_size)
+            .map(|i| BaseField::from(i.wrapping_mul(2654435761) >> 4))
+            .collect()
+    }
+
+    /// The per-layer twiddle slices served to a domain must be independent of the tree's
+    /// root size — the invariant behind sharing one big tree across all domain sizes.
+    #[test]
+    fn twiddle_layers_independent_of_tree_root() {
+        let domain = CanonicCoset::new(17).circle_domain();
+        let t17 = CpuBackend::precompute_twiddles(CanonicCoset::new(17).circle_domain().half_coset);
+        let t18 = CpuBackend::precompute_twiddles(CanonicCoset::new(18).circle_domain().half_coset);
+        let l17 = domain_line_twiddles_from_tree(domain, &t17.itwiddles);
+        let l18 = domain_line_twiddles_from_tree(domain, &t18.itwiddles);
+        assert_eq!(l17.len(), l18.len());
+        for (i, (a, b)) in l17.iter().zip(l18.iter()).enumerate() {
+            assert_eq!(
+                a, b,
+                "itwiddle layer {i} differs between root 17 and root 18"
+            );
+        }
+    }
+
+    /// Same root-independence invariant for the SIMD twiddle tree's flat buffer.
+    #[test]
+    fn simd_twiddle_layers_independent_of_tree_root() {
+        use crate::prover::backend::simd::SimdBackend;
+        let domain = CanonicCoset::new(17).circle_domain();
+        let t17 =
+            SimdBackend::precompute_twiddles(CanonicCoset::new(17).circle_domain().half_coset);
+        let t18 =
+            SimdBackend::precompute_twiddles(CanonicCoset::new(18).circle_domain().half_coset);
+        let l17 = domain_line_twiddles_from_tree(domain, &t17.itwiddles);
+        let l18 = domain_line_twiddles_from_tree(domain, &t18.itwiddles);
+        assert_eq!(l17.len(), l18.len());
+        for (i, (a, b)) in l17.iter().zip(l18.iter()).enumerate() {
+            assert_eq!(
+                a,
+                b,
+                "simd itwiddle layer {i} (len {}) differs between root 17 and root 18",
+                a.len()
+            );
+        }
+    }
+
+    /// Dispatched interpolate vs the scalar reference, spanning the SIMD cached-fft
+    /// boundary (2^16) where the SIMD kernel switches to its vec-transposed layout, with
+    /// both exact-size and oversized twiddle trees.
+    #[test]
+    fn dispatched_interpolate_matches_scalar() {
+        for (log_size, tree_log) in [
+            (10u32, 11u32),
+            (15, 18),
+            (16, 18),
+            (17, 17),
+            (17, 18),
+            (18, 18),
+            (18, 19),
+        ] {
+            let twiddles = CpuBackend::precompute_twiddles(
+                CanonicCoset::new(tree_log).circle_domain().half_coset,
+            );
+            let domain = CanonicCoset::new(log_size).circle_domain();
+            let values = test_values(log_size);
+            let eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+                domain,
+                values.clone(),
+            );
+            let dispatched = <CpuBackend as PolyOps>::interpolate(eval, &twiddles);
+            let eval2 =
+                CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(domain, values);
+            let scalar = interpolate_scalar(eval2, &twiddles);
+            assert_eq!(
+                dispatched.coeffs, scalar.coeffs,
+                "log_size {log_size} tree {tree_log}"
+            );
+        }
+    }
+
+    /// Dispatched evaluate vs the scalar reference across the cached-fft boundary,
+    /// including blown-up domains (poly smaller than the evaluation domain).
+    #[test]
+    fn dispatched_evaluate_matches_scalar() {
+        for (log_size, log_blowup, tree_log) in [
+            (10u32, 1u32, 11u32),
+            (15, 1, 18),
+            (16, 1, 18),
+            (17, 1, 18),
+            (17, 0, 18),
+            (18, 1, 19),
+        ] {
+            let twiddles = CpuBackend::precompute_twiddles(
+                CanonicCoset::new(tree_log).circle_domain().half_coset,
+            );
+            let poly = CircleCoefficients::<CpuBackend>::new(test_values(log_size));
+            let domain = CanonicCoset::new(log_size + log_blowup).circle_domain();
+            let dispatched = <CpuBackend as PolyOps>::evaluate(&poly, domain, &twiddles);
+            let scalar = evaluate_into_scalar(
+                &poly,
+                domain,
+                &twiddles,
+                vec![BaseField::zero(); domain.size()],
+            );
+            assert_eq!(
+                dispatched.values, scalar.values,
+                "log_size {log_size} blowup {log_blowup} tree {tree_log}"
+            );
+        }
+    }
+
+    /// FFT-free mathematical oracle, independent of the scalar reference: interpolated
+    /// coefficients must evaluate back to the original values at domain points. Catches
+    /// coefficient-order corruption that any same-order roundtrip would mask.
+    #[test]
+    fn dispatched_interpolate_evaluates_back_to_values() {
+        let log_size = 17u32;
+        let twiddles =
+            CpuBackend::precompute_twiddles(CanonicCoset::new(18).circle_domain().half_coset);
+        let domain = CanonicCoset::new(log_size).circle_domain();
+        let values = test_values(log_size);
+        let eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+            domain,
+            values.clone(),
+        );
+        let coeffs = <CpuBackend as PolyOps>::interpolate(eval, &twiddles);
+        for idx in [0usize, 1, 12345, 99999, (1 << log_size) - 1] {
+            let point = domain.at(bit_reverse_index(idx, log_size)).into_ef();
+            let value = <CpuBackend as PolyOps>::eval_at_point(&coeffs, point);
+            assert_eq!(value, values[idx].into(), "domain point {idx}");
+        }
+    }
+
+    /// The SIMD-dispatched fused interpolation+extension must produce exactly the
+    /// explicitly-scalar pipeline's coefficients and evaluations, across both the
+    /// dispatch threshold and the SIMD cached-fft boundary.
     #[test]
     fn simd_dispatched_commit_matches_scalar() {
-        for log_size in [5u32, 9, 10, 12] {
+        for log_size in [5u32, 9, 10, 12, 15, 16, 17, 18] {
             let twiddles = CpuBackend::precompute_twiddles(
                 CanonicCoset::new(log_size + 1).circle_domain().half_coset,
             );
             let domain = CanonicCoset::new(log_size).circle_domain();
-            let make_columns = || {
-                (0..3usize)
-                    .map(|c| {
-                        let values = (0..1 << log_size)
-                            .map(|i| BaseField::from(((i + 1) * (c + 7)) as u32))
-                            .collect_vec();
-                        EvalsOrCoeffs::Evals(CircleEvaluation::<
-                            CpuBackend,
-                            BaseField,
-                            BitReversedOrder,
-                        >::new(domain, values))
-                    })
+            let make_values = |c: usize| {
+                (0..1 << log_size)
+                    .map(|i| BaseField::from(((i + 1) * (c + 7)) as u32))
                     .collect_vec()
             };
+            let columns = (0..3usize)
+                .map(|c| {
+                    EvalsOrCoeffs::Evals(
+                        CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+                            domain,
+                            make_values(c),
+                        ),
+                    )
+                })
+                .collect_vec();
             let pool = BaseColumnPool::new();
             let dispatched = <CpuBackend as PolyOps>::interpolate_and_evaluate_polynomials(
-                make_columns(),
-                1,
-                &twiddles,
-                true,
-                &pool,
+                columns, 1, &twiddles, true, &pool,
             );
-            let scalar = fallback_interpolate_and_evaluate_polynomials(
-                make_columns(),
-                1,
-                &twiddles,
-                true,
-                &pool,
-            );
-            for (d, s) in dispatched.iter().zip(scalar.iter()) {
-                assert_eq!(d.evals.values, s.evals.values, "evals log_size {log_size}");
+            // The reference side goes through the explicitly-scalar kernels, never the
+            // dispatched PolyOps entry points (those are the code under test).
+            let ext_domain = CanonicCoset::new(log_size + 1).circle_domain();
+            for (c, d) in dispatched.iter().enumerate() {
+                let eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+                    domain,
+                    make_values(c),
+                );
+                let scalar_coeffs = interpolate_scalar(eval, &twiddles);
+                let scalar_evals = evaluate_into_scalar(
+                    &scalar_coeffs,
+                    ext_domain,
+                    &twiddles,
+                    vec![BaseField::zero(); ext_domain.size()],
+                );
+                assert_eq!(
+                    d.evals.values, scalar_evals.values,
+                    "evals log_size {log_size} col {c}"
+                );
                 assert_eq!(
                     d.coeffs.as_ref().unwrap().coeffs,
-                    s.coeffs.as_ref().unwrap().coeffs,
-                    "coeffs log_size {log_size}"
+                    scalar_coeffs.coeffs,
+                    "coeffs log_size {log_size} col {c}"
                 );
             }
         }
