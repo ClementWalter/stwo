@@ -30,8 +30,8 @@ use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::Poly;
 
 /// log2 of the tile staged in threadgroup memory (2^13 u32 = 32KB).
-const TILE_LOG: u32 = 12;
-const THREADS_PER_GROUP: u64 = 512;
+const TILE_LOG: u32 = 13;
+const THREADS_PER_GROUP: u64 = 1024;
 /// Minimum transform size for GPU dispatch.
 pub(crate) const MIN_METAL_FFT_LOG_SIZE: u32 = 14;
 
@@ -72,7 +72,7 @@ struct PassParams {
     uint twiddle_offsets[16];
 };
 
-constant uint TILE_LOG = 12;
+constant uint TILE_LOG = 13;
 
 kernel void fft_pass(
     device uint* values [[buffer(0)]],
@@ -95,7 +95,7 @@ kernel void fft_pass(
     const uint c_mask = (1u << c_log) - 1u;
 
     // Stage the tile: local index = [r | c], global = base + r*2^i0 + c.
-    for (uint local = tid; local < n_local; local += 512u) {
+    for (uint local = tid; local < n_local; local += 1024u) {
         uint r = local >> c_log;
         uint c = local & c_mask;
         uint g = base + (r << p.i0) + c;
@@ -109,7 +109,7 @@ kernel void fft_pass(
         uint half_r = 1u << j;
         // Pairs: r with bit j clear vs set; iterate pair index q over r-pairs x c.
         uint n_pairs = n_local >> 1;
-        for (uint q = tid; q < n_pairs; q += 512u) {
+        for (uint q = tid; q < n_pairs; q += 1024u) {
             uint rq = q >> c_log;          // pair index in the r dimension
             uint c = q & c_mask;
             uint r0 = ((rq >> j) << (j + 1)) | (rq & (half_r - 1u));
@@ -131,7 +131,7 @@ kernel void fft_pass(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    for (uint local = tid; local < n_local; local += 512u) {
+    for (uint local = tid; local < n_local; local += 1024u) {
         uint r = local >> c_log;
         uint c = local & c_mask;
         uint v = tile[local];
