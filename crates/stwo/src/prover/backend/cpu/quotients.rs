@@ -11,9 +11,7 @@ use crate::core::fields::cm31::CM31;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::core::fields::FieldExpOps;
-use crate::core::pcs::quotients::{
-    accumulate_row_partial_numerators, denominators, quotient_constants, ColumnSampleBatch,
-};
+use crate::core::pcs::quotients::{denominators, quotient_constants, ColumnSampleBatch};
 use crate::core::poly::circle::CanonicCoset;
 use crate::core::utils::bit_reverse_index;
 use crate::prover::pcs::quotient_ops::AccumulatedNumerators;
@@ -53,14 +51,23 @@ impl QuotientOps for CpuBackend {
                     .collect_vec()
             };
 
+            // Column-outer accumulation: the row numerator is
+            // sum_i (f_i(row) * c_i - b_i) = sum_i f_i(row) * c_i - sum_i b_i, so each
+            // batch column is streamed sequentially into per-row accumulators instead of
+            // gathering across every column per row. The summands are identical to
+            // [`accumulate_row_partial_numerators`].
+            let b_sum: SecureField = coeffs.iter().map(|(_, b, _)| *b).sum();
             let process_chunk = |(start, chunk): &mut (usize, [&mut [BaseField]; 4])| {
-                let mut query_values_at_row = Vec::with_capacity(columns.len());
-                for idx in 0..chunk[0].len() {
-                    let row = *start + idx;
-                    query_values_at_row.clear();
-                    query_values_at_row.extend(columns.iter().map(|col| col[row]));
-                    let row_value =
-                        accumulate_row_partial_numerators(batch, &query_values_at_row, &coeffs);
+                let rows = chunk[0].len();
+                let mut acc = vec![-b_sum; rows];
+                for (data, (_, _, c)) in zip(&batch.cols_vals_randpows, &coeffs) {
+                    let column = columns[data.column_index];
+                    let column_chunk = &column[*start..*start + rows];
+                    for (a, &v) in acc.iter_mut().zip(column_chunk) {
+                        *a += v * *c;
+                    }
+                }
+                for (idx, row_value) in acc.into_iter().enumerate() {
                     let [v0, v1, v2, v3] = row_value.to_m31_array();
                     chunk[0][idx] = v0;
                     chunk[1][idx] = v1;
