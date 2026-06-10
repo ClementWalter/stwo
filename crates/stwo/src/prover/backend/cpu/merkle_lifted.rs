@@ -70,7 +70,7 @@ impl<H: MerkleHasherLifted + Send + Sync + 'static> MerkleOpsLifted<H> for CpuBa
         assert!(columns[0].len() >= 2, "A column must be of length >= 2.");
         let mut prev_layer: Vec<H> = vec![hasher; 2];
         let mut prev_layer_log_size: u32 = 1;
-        for (log_size, group) in columns.iter().group_by(|c| c.len().ilog2()).into_iter() {
+        for (log_size, group) in columns.iter().chunk_by(|c| c.len().ilog2()).into_iter() {
             let log_ratio = log_size - prev_layer_log_size;
             prev_layer = parallel_iter!(0..1 << log_size)
                 // We only clone when starting a column chunk of different size.
