@@ -109,8 +109,9 @@ impl PolyOps for CpuBackend {
             );
         }
 
-        // One packed twiddle tree per commitment, shared by all of its columns.
-        let simd_twiddles = SimdBackend::precompute_twiddles(twiddles.root_coset);
+        // One cached packed twiddle tree per root coset, shared by all columns of every
+        // commitment over that coset.
+        let simd_twiddles = cached_simd_twiddles(twiddles.root_coset);
 
         let process = |column: EvalsOrCoeffs<Self>| {
             let simd_coeffs = match column {

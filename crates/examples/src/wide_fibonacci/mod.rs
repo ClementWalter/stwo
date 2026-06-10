@@ -162,6 +162,8 @@ impl<const N: usize> FrameworkEval for WideFibonacciEval<N> {
 mod tests {
     use itertools::Itertools;
     use num_traits::{One, Zero};
+    #[cfg(feature = "parallel")]
+    use rayon::prelude::*;
     use stwo::core::air::Component;
     use stwo::core::channel::Blake2sM31Channel;
     #[cfg(not(target_arch = "wasm32"))]
@@ -191,6 +193,15 @@ mod tests {
     const FIB_SEQUENCE_LENGTH: usize = 100;
 
     fn generate_test_inputs(log_n_instances: u32) -> Vec<FibInput> {
+        #[cfg(feature = "parallel")]
+        return (0..1u32 << log_n_instances)
+            .into_par_iter()
+            .map(|i| FibInput {
+                a: BaseField::one(),
+                b: BaseField::from_u32_unchecked(i),
+            })
+            .collect();
+        #[cfg(not(feature = "parallel"))]
         (0..1 << log_n_instances)
             .map(|i| FibInput {
                 a: BaseField::one(),
