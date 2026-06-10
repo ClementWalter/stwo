@@ -333,7 +333,7 @@ fn accumulate_pointwise_cpu<E: FrameworkEval + Sync>(
     // a disjoint range of every coordinate column), and within a chunk evaluate BATCH
     // consecutive rows at a time: lanes break the per-row dependency chains of deep
     // constraint expressions.
-    const BATCH: usize = 8;
+    const BATCH: usize = 32;
     let chunk_size = 1 << 12;
     let trace_cols = &trace_cols;
     let denom_inv = &denom_inv;
