@@ -82,7 +82,26 @@ pub fn generate_trace_cpu_parallel<const N: usize>(
         .collect_vec();
 
     let process_chunk = |(start, cols): &mut (usize, Vec<&mut [BaseField]>)| {
-        for idx in 0..cols[0].len() {
+        use stwo::prover::backend::simd::m31::{PackedBaseField, N_LANES};
+        let len = cols[0].len();
+        // Rows are independent: each SIMD lane carries one instance, so every column
+        // write lands as one contiguous cache line instead of 16 scattered scalars.
+        let mut idx = 0;
+        while idx + N_LANES <= len {
+            let mut a =
+                PackedBaseField::from_array(std::array::from_fn(|k| inputs[*start + idx + k].a));
+            let mut b =
+                PackedBaseField::from_array(std::array::from_fn(|k| inputs[*start + idx + k].b));
+            cols[0][idx..idx + N_LANES].copy_from_slice(&a.to_array());
+            cols[1][idx..idx + N_LANES].copy_from_slice(&b.to_array());
+            for col in cols.iter_mut().skip(2) {
+                (a, b) = (b, a * a + b * b);
+                col[idx..idx + N_LANES].copy_from_slice(&b.to_array());
+            }
+            idx += N_LANES;
+        }
+        // Scalar tail for traces smaller than one SIMD vector.
+        for idx in idx..len {
             let input = &inputs[*start + idx];
             let mut a = input.a;
             let mut b = input.b;
@@ -510,11 +529,13 @@ mod tests {
             .unwrap_or(8);
         let config = PcsConfig::default();
         // Precompute twiddles.
+        let t = std::time::Instant::now();
         let twiddles = CpuBackend::precompute_twiddles(
             CanonicCoset::new(log_n_instances + 1 + config.fri_config.log_blowup_factor)
                 .circle_domain()
                 .half_coset,
         );
+        tracing::info!("twiddle precompute: {:?}", t.elapsed());
 
         // Setup protocol.
         let prover_channel = &mut Blake2sM31Channel::default();
@@ -527,12 +548,17 @@ mod tests {
         tree_builder.commit(prover_channel);
 
         // Trace.
-        let trace = generate_trace_cpu_parallel::<FIB_SEQUENCE_LENGTH>(&generate_test_inputs(
-            log_n_instances,
-        ));
+        let t = std::time::Instant::now();
+        let inputs = generate_test_inputs(log_n_instances);
+        tracing::info!("input gen: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let trace = generate_trace_cpu_parallel::<FIB_SEQUENCE_LENGTH>(&inputs);
+        tracing::info!("trace gen: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
         let mut tree_builder = commitment_scheme.tree_builder();
         tree_builder.extend_evals(trace);
         tree_builder.commit(prover_channel);
+        tracing::info!("trace commit: {:?}", t.elapsed());
 
         // Generate component.
         let component = WideFibonacciComponent::new(
@@ -544,14 +570,17 @@ mod tests {
         );
 
         // Prove.
+        let t = std::time::Instant::now();
         let proof = prove::<CpuBackend, Blake2sM31MerkleChannel>(
             &[&component],
             prover_channel,
             commitment_scheme,
         )
         .unwrap();
+        tracing::info!("prove: {:?}", t.elapsed());
 
         // Verify.
+        let t = std::time::Instant::now();
         let verifier_channel = &mut Blake2sM31Channel::default();
         let commitment_scheme =
             &mut CommitmentSchemeVerifier::<Blake2sM31MerkleChannel>::new(config);
@@ -559,6 +588,7 @@ mod tests {
         commitment_scheme.commit(proof.commitments[0], &sizes[0], verifier_channel);
         commitment_scheme.commit(proof.commitments[1], &sizes[1], verifier_channel);
         verify(&[&component], verifier_channel, commitment_scheme, proof).unwrap();
+        tracing::info!("verify: {:?}", t.elapsed());
     }
 
     #[test]
