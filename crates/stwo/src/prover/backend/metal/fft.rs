@@ -330,6 +330,116 @@ fn bind_zero_copy(device: &Device, data: &[BaseField]) -> Option<Buffer> {
     })
 }
 
+/// Batched in-place GPU inverse circle FFTs: every column's passes encoded into one
+/// command buffer, one synchronization. Returns the evaluations on `Err` when the GPU
+/// path can't take them.
+#[allow(clippy::type_complexity)]
+pub(crate) fn ifft_batch_metal(
+    columns: Vec<
+        crate::prover::poly::circle::CircleEvaluation<
+            CpuBackend,
+            BaseField,
+            crate::prover::poly::BitReversedOrder,
+        >,
+    >,
+    twiddles: &TwiddleTree<CpuBackend>,
+) -> Result<
+    Vec<crate::prover::poly::circle::CircleCoefficients<CpuBackend>>,
+    Vec<
+        crate::prover::poly::circle::CircleEvaluation<
+            CpuBackend,
+            BaseField,
+            crate::prover::poly::BitReversedOrder,
+        >,
+    >,
+> {
+    if columns
+        .iter()
+        .any(|eval| eval.domain.log_size() < MIN_METAL_FFT_LOG_SIZE)
+    {
+        return Err(columns);
+    }
+    let Some(ctx) = context() else {
+        return Err(columns);
+    };
+    let mut ctx = ctx.lock().unwrap();
+
+    let mut work: Vec<(Vec<BaseField>, CircleDomain)> = columns
+        .into_iter()
+        .map(|eval| (eval.values, eval.domain))
+        .collect();
+    let mut bindings = Vec::with_capacity(work.len());
+    for (values, _) in &work {
+        let Some(buffer) = bind_zero_copy(&ctx.device, values) else {
+            return Err(repack_evals(work));
+        };
+        bindings.push(buffer);
+    }
+    let domains: Vec<CircleDomain> = work.iter().map(|w| w.1).collect();
+    for &domain in &domains {
+        pack_twiddles(
+            &mut ctx,
+            domain,
+            twiddles.root_coset,
+            &twiddles.itwiddles,
+            true,
+        );
+    }
+
+    let command_buffer = ctx.queue.new_command_buffer();
+    for ((_, domain), buffer) in work.iter().zip(&bindings) {
+        let n_log = domain.log_size();
+        let key = (
+            twiddles.root_coset.initial_index.0 as u32,
+            twiddles.root_coset.log_size,
+            n_log,
+            true,
+        );
+        let tw = &ctx.twiddle_cache[&key];
+        let n_inv = BaseField::from_u32_unchecked(domain.size() as u32)
+            .inverse()
+            .0;
+        let passes = pass_split(n_log);
+        let last = passes.len() - 1;
+        for (idx, &pass) in passes.iter().enumerate() {
+            let scale = if idx == last { n_inv } else { 1 };
+            encode_pass(
+                &ctx,
+                command_buffer,
+                buffer,
+                tw,
+                n_log,
+                pass,
+                true,
+                false,
+                scale,
+                None,
+            );
+        }
+    }
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    Ok(work
+        .drain(..)
+        .map(|(values, _)| crate::prover::poly::circle::CircleCoefficients::new(values))
+        .collect())
+}
+
+fn repack_evals(
+    work: Vec<(Vec<BaseField>, CircleDomain)>,
+) -> Vec<
+    crate::prover::poly::circle::CircleEvaluation<
+        CpuBackend,
+        BaseField,
+        crate::prover::poly::BitReversedOrder,
+    >,
+> {
+    work.into_iter()
+        .map(|(values, domain)| crate::prover::poly::circle::CircleEvaluation::new(domain, values))
+        .collect()
+}
+
 /// In-place GPU inverse circle FFT over `values` (bit-reversed circle-domain order),
 /// leaving natural-order FFT-basis coefficients scaled by `1/N` — exactly
 /// [`interpolate_scalar`]'s output. Returns `false` (values untouched) when no usable

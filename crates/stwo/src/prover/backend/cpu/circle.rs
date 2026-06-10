@@ -75,6 +75,26 @@ impl PolyOps for CpuBackend {
         interpolate_scalar(eval, twiddles)
     }
 
+    fn interpolate_columns(
+        columns: Vec<CircleEvaluation<Self, BaseField, BitReversedOrder>>,
+        twiddles: &TwiddleTree<Self>,
+    ) -> Vec<CircleCoefficients<Self>> {
+        // Apple-GPU path: every column's transform in one submission.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        let columns = match crate::prover::backend::metal::fft::ifft_batch_metal(columns, twiddles)
+        {
+            Ok(polys) => return polys,
+            Err(columns) => columns,
+        };
+
+        #[cfg(feature = "parallel")]
+        let iter = columns.into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let iter = columns.into_iter();
+        iter.map(|eval| eval.interpolate_with_twiddles(twiddles))
+            .collect()
+    }
+
     fn eval_at_point(
         poly: &CircleCoefficients<Self>,
         point: CirclePoint<SecureField>,
