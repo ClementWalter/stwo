@@ -613,6 +613,14 @@ impl PolyOps for CpuBackend {
     }
 
     fn precompute_twiddles(coset: Coset) -> TwiddleTree<Self> {
+        // Apple-GPU path; bit-identical values (unique inverses, exact group ops).
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(tree) =
+            crate::prover::backend::metal::twiddles::precompute_twiddles_metal(coset)
+        {
+            return tree;
+        }
+
         const CHUNK_LOG_SIZE: usize = 12;
         const CHUNK_SIZE: usize = 1 << CHUNK_LOG_SIZE;
 
