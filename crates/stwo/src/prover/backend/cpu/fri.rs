@@ -16,14 +16,48 @@ use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::secure_column::SecureColumnByCoords;
 
+/// Size from which CPU folds dispatch to the shared SIMD kernels.
+const SIMD_FOLD_DISPATCH_LOG_SIZE: u32 = 12;
+
+fn secure_column_to_simd(
+    values: &SecureColumnByCoords<CpuBackend>,
+) -> SecureColumnByCoords<crate::prover::backend::simd::SimdBackend> {
+    use crate::prover::backend::simd::column::BaseColumn;
+    SecureColumnByCoords {
+        columns: std::array::from_fn(|i| BaseColumn::from_cpu(&values.columns[i])),
+    }
+}
+
+fn secure_column_to_cpu(
+    values: SecureColumnByCoords<crate::prover::backend::simd::SimdBackend>,
+) -> SecureColumnByCoords<CpuBackend> {
+    SecureColumnByCoords {
+        columns: values.columns.map(|column| column.into_cpu_vec()),
+    }
+}
+
 impl FriOps for CpuBackend {
     fn fold_line(
         eval: &LineEvaluation<Self>,
         alphas: &[SecureField],
-        _twiddles: &TwiddleTree<Self>,
+        twiddles: &TwiddleTree<Self>,
     ) -> LineEvaluation<Self> {
         let fold_step = alphas.len();
         assert!(fold_step >= 1);
+
+        // Large folds dispatch to the shared SIMD kernels (cached packed twiddles); the
+        // scalar folds below remain the reference, pinned equal by the fri tests.
+        if eval.len().ilog2() >= SIMD_FOLD_DISPATCH_LOG_SIZE {
+            use crate::prover::backend::simd::SimdBackend;
+            let simd_twiddles = super::circle::cached_simd_twiddles(twiddles.root_coset);
+            let simd_eval = LineEvaluation::<SimdBackend>::new(
+                eval.domain(),
+                secure_column_to_simd(&eval.values),
+            );
+            let folded = SimdBackend::fold_line(&simd_eval, alphas, &simd_twiddles);
+            let domain = folded.domain();
+            return LineEvaluation::new(domain, secure_column_to_cpu(folded.values));
+        }
 
         let mut res = fold_line_cpu(eval, alphas[0]);
         for &alpha in &alphas[1..] {
@@ -35,8 +69,21 @@ impl FriOps for CpuBackend {
     fn fold_circle_into_line(
         src: &SecureEvaluation<Self, BitReversedOrder>,
         alpha: SecureField,
-        _twiddles: &TwiddleTree<Self>,
+        twiddles: &TwiddleTree<Self>,
     ) -> LineEvaluation<Self> {
+        // Large folds dispatch to the shared SIMD kernels; see [`FriOps::fold_line`].
+        if src.len().ilog2() >= SIMD_FOLD_DISPATCH_LOG_SIZE {
+            use crate::prover::backend::simd::SimdBackend;
+            let simd_twiddles = super::circle::cached_simd_twiddles(twiddles.root_coset);
+            let simd_src = SecureEvaluation::<SimdBackend, BitReversedOrder>::new(
+                src.domain,
+                secure_column_to_simd(&src.values),
+            );
+            let folded = SimdBackend::fold_circle_into_line(&simd_src, alpha, &simd_twiddles);
+            let domain = folded.domain();
+            return LineEvaluation::new(domain, secure_column_to_cpu(folded.values));
+        }
+
         fold_circle_into_line_cpu(src, alpha)
     }
 

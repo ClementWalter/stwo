@@ -388,7 +388,7 @@ impl PolyOps for CpuBackend {
 /// Returns a cached SIMD twiddle tree for `root_coset`, building it on first use. The
 /// proof's transforms reuse one or two distinct root cosets, so the cache stays tiny.
 #[allow(clippy::type_complexity)]
-fn cached_simd_twiddles(
+pub(crate) fn cached_simd_twiddles(
     root_coset: Coset,
 ) -> std::sync::Arc<TwiddleTree<crate::prover::backend::simd::SimdBackend>> {
     use std::collections::HashMap;
