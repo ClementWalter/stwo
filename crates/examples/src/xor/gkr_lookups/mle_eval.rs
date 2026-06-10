@@ -4,7 +4,9 @@
 
 use std::iter::zip;
 
-use itertools::{chain, zip_eq, Itertools};
+#[cfg(not(feature = "parallel"))]
+use itertools::zip_eq;
+use itertools::{chain, Itertools};
 use num_traits::{One, Zero};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -628,8 +630,23 @@ pub fn build_trace(
     let shift = claim / BaseField::from(mle.len());
     let packed_shift_coords = PackedSecureField::broadcast(shift).into_packed_m31s();
     let mut shifted_mle_terms_cols = mle_terms_cols;
-    zip(&mut shifted_mle_terms_cols, packed_shift_coords)
-        .for_each(|(col, shift_coord)| col.data.iter_mut().for_each(|v| *v -= shift_coord));
+    zip(&mut shifted_mle_terms_cols, packed_shift_coords).for_each(|(col, shift_coord)| {
+        #[cfg(feature = "parallel")]
+        col.data.par_iter_mut().for_each(|v| *v -= shift_coord);
+        #[cfg(not(feature = "parallel"))]
+        col.data.iter_mut().for_each(|v| *v -= shift_coord);
+    });
+    // The four coordinate prefix sums are independent; run them concurrently.
+    #[cfg(feature = "parallel")]
+    let shifted_prefix_sum_cols = {
+        let [c0, c1, c2, c3] = shifted_mle_terms_cols;
+        let ((p0, p1), (p2, p3)) = rayon::join(
+            || rayon::join(|| inclusive_prefix_sum(c0), || inclusive_prefix_sum(c1)),
+            || rayon::join(|| inclusive_prefix_sum(c2), || inclusive_prefix_sum(c3)),
+        );
+        [p0, p1, p2, p3]
+    };
+    #[cfg(not(feature = "parallel"))]
     let shifted_prefix_sum_cols = shifted_mle_terms_cols.map(inclusive_prefix_sum);
 
     let log_trace_domain_size = mle.n_variables() as u32;
@@ -800,8 +817,15 @@ fn hadamard_product(
     b: &Col<SimdBackend, SecureField>,
 ) -> Col<SimdBackend, SecureField> {
     assert_eq!(a.len(), b.len());
+    #[cfg(feature = "parallel")]
+    let data = (a.data.par_iter())
+        .zip(b.data.par_iter())
+        .map(|(&a, &b)| a * b)
+        .collect();
+    #[cfg(not(feature = "parallel"))]
+    let data = zip_eq(&a.data, &b.data).map(|(&a, &b)| a * b).collect();
     SecureColumn {
-        data: zip_eq(&a.data, &b.data).map(|(&a, &b)| a * b).collect(),
+        data,
         length: a.len(),
     }
 }

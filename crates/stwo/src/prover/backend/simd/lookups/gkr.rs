@@ -1,6 +1,8 @@
 use std::iter::zip;
 
 use num_traits::Zero;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
@@ -40,14 +42,25 @@ impl GkrOps for SimdBackend {
             let packed_y_j = PackedSecureField::broadcast(y_j);
 
             let (lhs_evals, rhs_evals) = data.split_at_mut(1 << i);
+            let rhs_evals = &mut rhs_evals[..1 << i];
 
-            for (lhs, rhs) in zip(lhs_evals, rhs_evals) {
-                // Equivalent to:
-                // `rhs = eq(1, y_j) * lhs`,
-                // `lhs = eq(0, y_j) * lhs`
+            // Equivalent to:
+            // `rhs = eq(1, y_j) * lhs`,
+            // `lhs = eq(0, y_j) * lhs`
+            let step = |(lhs, rhs): (&mut PackedSecureField, &mut PackedSecureField)| {
                 *rhs = *lhs * packed_y_j;
                 *lhs -= *rhs;
+            };
+
+            #[cfg(feature = "parallel")]
+            if lhs_evals.len() >= 1 << 13 {
+                lhs_evals
+                    .par_iter_mut()
+                    .zip(rhs_evals.par_iter_mut())
+                    .for_each(step);
+                continue;
             }
+            zip(lhs_evals, rhs_evals.iter_mut()).for_each(step);
         }
 
         let length = packed_len * N_LANES;
