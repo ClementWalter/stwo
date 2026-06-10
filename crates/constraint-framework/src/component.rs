@@ -172,6 +172,7 @@ impl<E: FrameworkEval> FrameworkComponent<E> {
     }
 
     /// Distinct non-zero mask offsets used by this component, across all interactions.
+    #[cfg(feature = "prover")]
     pub(crate) fn nonzero_mask_offsets(&self) -> Vec<isize> {
         let mut offsets: Vec<isize> = self
             .info
