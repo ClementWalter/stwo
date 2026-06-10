@@ -58,7 +58,35 @@ impl QuotientOps for CpuBackend {
             // [`accumulate_row_partial_numerators`].
             let b_sum: SecureField = coeffs.iter().map(|(_, b, _)| *b).sum();
             let process_chunk = |(start, chunk): &mut (usize, [&mut [BaseField]; 4])| {
+                use crate::prover::backend::simd::m31::{PackedM31, N_LANES};
                 let rows = chunk[0].len();
+                if rows.is_multiple_of(N_LANES) {
+                    // Packed path: per-coordinate accumulators over the chunk; each
+                    // column streams once with one packed load and four broadcast
+                    // multiply-accumulates per 16 rows.
+                    let n_groups = rows / N_LANES;
+                    let neg_coords = (-b_sum).to_m31_array();
+                    let mut acc: [Vec<PackedM31>; 4] =
+                        neg_coords.map(|coord| vec![PackedM31::broadcast(coord); n_groups]);
+                    for (data, (_, _, c)) in zip(&batch.cols_vals_randpows, &coeffs) {
+                        let column = columns[data.column_index];
+                        let column_chunk = &column[*start..*start + rows];
+                        let c_coords = c.to_m31_array().map(PackedM31::broadcast);
+                        for (g, group) in column_chunk.chunks_exact(N_LANES).enumerate() {
+                            let v = PackedM31::from_array(group.try_into().unwrap());
+                            for k in 0..4 {
+                                acc[k][g] += v * c_coords[k];
+                            }
+                        }
+                    }
+                    for k in 0..4 {
+                        for (g, packed) in acc[k].iter().enumerate() {
+                            chunk[k][g * N_LANES..(g + 1) * N_LANES]
+                                .copy_from_slice(&packed.to_array());
+                        }
+                    }
+                    return;
+                }
                 let mut acc = vec![-b_sum; rows];
                 for (data, (_, _, c)) in zip(&batch.cols_vals_randpows, &coeffs) {
                     let column = columns[data.column_index];
