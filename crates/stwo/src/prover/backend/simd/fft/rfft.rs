@@ -582,7 +582,8 @@ mod tests {
     use crate::prover::backend::simd::column::BaseColumn;
     use crate::prover::backend::simd::fft::{transpose_vecs, CACHED_FFT_LOG_SIZE};
     use crate::prover::backend::simd::m31::{PackedBaseField, LOG_N_LANES, N_LANES};
-    use crate::prover::backend::Column;
+    use crate::prover::backend::{Column, CpuBackend};
+    use crate::prover::poly::circle::PolyOps;
 
     #[test]
     fn test_butterfly() {
@@ -740,7 +741,12 @@ mod tests {
     }
 
     fn ground_truth_fft(domain: CircleDomain, values: &[BaseField]) -> Vec<BaseField> {
+        // Use the scalar transform explicitly: the CPU backend's trait method dispatches
+        // large sizes to the SIMD kernel under test.
         let poly = CpuCirclePoly::new(values.to_vec());
-        poly.evaluate(domain).values
+        let twiddles = <CpuBackend as PolyOps>::precompute_twiddles(domain.half_coset);
+        let buffer = vec![BaseField::from(0u32); domain.size()];
+        crate::prover::backend::cpu::circle::evaluate_into_scalar(&poly, domain, &twiddles, buffer)
+            .values
     }
 }
