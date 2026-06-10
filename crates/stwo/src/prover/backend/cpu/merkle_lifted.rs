@@ -14,7 +14,7 @@ use crate::parallel_iter;
 use crate::prover::backend::simd::blake2s_lifted::{
     build_leaves_from_flat_columns, build_next_layer_simd,
 };
-use crate::prover::backend::{Col, Column, CpuBackend};
+use crate::prover::backend::{Col, CpuBackend};
 use crate::prover::vcs_lifted::ops::{MerkleOpsLifted, PackLeavesOps};
 
 impl<H: MerkleHasherLifted + Send + Sync + 'static> MerkleOpsLifted<H> for CpuBackend {
@@ -164,17 +164,15 @@ impl PackLeavesOps for CpuBackend {
         assert!(values.iter().all(|c| c.len() == len_m31));
         assert!(len_m31.is_multiple_of(PACKED_LEAF_SIZE));
         let packed_len = len_m31 / PACKED_LEAF_SIZE;
-        let cpu_columns: [Vec<BaseField>; SECURE_EXTENSION_DEGREE] =
-            core::array::from_fn(|coord| values[coord].to_cpu());
         // Each output slot is a pure function of (packed_row, offset, coord); fill the
-        // packed columns in parallel.
+        // packed columns in parallel, reading the borrowed inputs directly.
         let mut packed_cpu: [Vec<BaseField>; SECURE_EXTENSION_DEGREE * PACKED_LEAF_SIZE] =
             core::array::from_fn(|_| vec![BaseField::default(); packed_len]);
 
         let fill = |column_idx: usize, column: &mut Vec<BaseField>| {
             let coord = column_idx % SECURE_EXTENSION_DEGREE;
             let offset = column_idx / SECURE_EXTENSION_DEGREE;
-            let src = &cpu_columns[coord];
+            let src: &[BaseField] = values[coord];
             for (packed_row, slot) in column.iter_mut().enumerate() {
                 *slot = src[packed_row * PACKED_LEAF_SIZE + offset];
             }
