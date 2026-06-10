@@ -60,10 +60,39 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
                 lifting_log_size,
             );
         }
+        // A packed column's data is a flat power-of-two run of u32 field representatives.
+        let flat_columns = columns
+            .iter()
+            .map(|column| unsafe {
+                std::slice::from_raw_parts(
+                    column.data.as_ptr() as *const u32,
+                    column.data.len() * N_LANES,
+                )
+            })
+            .collect_vec();
+        build_leaves_from_flat_columns::<IS_M31_OUTPUT>(&flat_columns, lifting_log_size)
+    }
+
+    #[allow(clippy::uninit_vec)]
+    fn build_next_layer(prev_layer: &Vec<Blake2sHash>) -> Vec<Blake2sHash> {
+        build_next_layer_simd::<IS_M31_OUTPUT>(prev_layer)
+    }
+}
+
+/// Computes the lifted-tree leaves for blake2s over flat `u32` field-representative
+/// columns (each a power-of-two length, sorted increasingly, all >= [`N_LANES`]),
+/// hashing 16 rows per SIMD state. Shared by the SIMD backend and the CPU backend's
+/// blake2s fast path; the output is identical to the generic row-by-row absorption.
+#[allow(clippy::uninit_vec)]
+pub(crate) fn build_leaves_from_flat_columns<const IS_M31_OUTPUT: bool>(
+    columns: &[&[u32]],
+    lifting_log_size: u32,
+) -> Vec<Blake2sHash> {
+    {
         // Note that, in this function, all variables that track log sizes
         // refer to the "size" in terms of PackedM31 (e.g. the log size of a column
         // of 4 PackedM31 elements is 2).
-        let max_log_size: u32 = columns.last().unwrap().data.len().ilog2();
+        let max_log_size: u32 = (columns.last().unwrap().len() / N_LANES).ilog2();
 
         // Initialize the vector of Blake2s states. The state is of type `[u32x16; 8]`.
         //
@@ -90,14 +119,14 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         let last_chunk_index =
             (columns.len() - 1) / N_FELTS_IN_BLAKE_MESSAGE * N_FELTS_IN_BLAKE_MESSAGE;
         let lifting_indices =
-            get_lifting_indices(columns.iter().map(|c| c.data.len()), last_chunk_index);
+            get_lifting_indices(columns.iter().map(|c| c.len() / N_LANES), last_chunk_index);
         let mut byte_count = 0_u64;
 
         // The actual log size of `prev_layer_states` is equal to `max_log_size`, but only the first
         // two entries are accessed for the computation of the first iteration.
         let mut prev_chunk_max_log_size = 0;
         for (start, end) in lifting_indices.into_iter().tuple_windows() {
-            let chunk_max_log_size: u32 = columns[end - 1].data.len().ilog2();
+            let chunk_max_log_size: u32 = (columns[end - 1].len() / N_LANES).ilog2();
             let next_layer_state_slice = &mut next_layer_states[0..1 << chunk_max_log_size];
             let log_ratio = chunk_max_log_size - prev_chunk_max_log_size;
             // Compute the new states of the current layer.
@@ -115,9 +144,14 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
                 });
                 let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = std::array::from_fn(|j| {
                     let column = columns[start + j];
-                    let log_size = column.data.len().ilog2();
+                    let log_size = (column.len() / N_LANES).ilog2();
                     let log_ratio = chunk_max_log_size - log_size;
-                    to_lifted_simd(column.data[i >> log_ratio].into_simd(), log_ratio, i)
+                    let idx = i >> log_ratio;
+                    to_lifted_simd(
+                        u32x16::from_slice(&column[idx * N_LANES..(idx + 1) * N_LANES]),
+                        log_ratio,
+                        i,
+                    )
                 });
 
                 *state = compress_unfinalized(prev_state, msgs, local_byte_count);
@@ -128,8 +162,9 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
                 // lifting is required).
                 for chunk_columns in &mut columns[start + 16..end].chunks(N_FELTS_IN_BLAKE_MESSAGE)
                 {
-                    let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] =
-                        std::array::from_fn(|j| chunk_columns[j].data[i].into_simd());
+                    let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = std::array::from_fn(|j| {
+                        u32x16::from_slice(&chunk_columns[j][i * N_LANES..(i + 1) * N_LANES])
+                    });
                     local_byte_count += N_BYTES_IN_BLAKE_MESSAGE;
                     *state = compress_unfinalized(*state, msgs, local_byte_count);
                 }
@@ -158,9 +193,14 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
             });
             let mut msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = unsafe { std::mem::zeroed() };
             for (j, column) in columns[last_chunk_index..].iter().enumerate() {
-                let log_size = column.data.len().ilog2();
+                let log_size = (column.len() / N_LANES).ilog2();
                 let log_ratio = chunk_max_log_size - log_size;
-                msgs[j] = to_lifted_simd(column.data[i >> log_ratio].into_simd(), log_ratio, i);
+                let idx = i >> log_ratio;
+                msgs[j] = to_lifted_simd(
+                    u32x16::from_slice(&column[idx * N_LANES..(idx + 1) * N_LANES]),
+                    log_ratio,
+                    i,
+                );
             }
             *state = compress_finalize(prev_state, msgs, byte_count);
         });
@@ -221,9 +261,15 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
 
         res
     }
+}
 
-    #[allow(clippy::uninit_vec)]
-    fn build_next_layer(prev_layer: &Vec<Blake2sHash>) -> Vec<Blake2sHash> {
+/// Computes one Merkle layer from the previous one, 16 child-pairs per SIMD compression.
+/// Shared by the SIMD backend and the CPU backend's blake2s fast path.
+#[allow(clippy::uninit_vec)]
+pub(crate) fn build_next_layer_simd<const IS_M31_OUTPUT: bool>(
+    prev_layer: &[Blake2sHash],
+) -> Vec<Blake2sHash> {
+    {
         // The log size of the current layer that needs to be built.
         let log_size: u32 = prev_layer.len().ilog2() - 1;
         if log_size < LOG_N_LANES {
