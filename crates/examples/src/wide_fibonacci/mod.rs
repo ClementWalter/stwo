@@ -126,6 +126,182 @@ pub fn generate_trace_cpu_parallel<const N: usize>(
         .collect_vec()
 }
 
+/// GPU trace generator: one thread per instance computes the whole Fibonacci row and
+/// writes each column value into its column buffer (coalesced across threads). Values
+/// are bit-identical to [`generate_trace_cpu_parallel`]; returns `None` without a
+/// usable device.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub fn generate_trace_cpu_metal<const N: usize>(
+    inputs: &[FibInput],
+) -> Option<ColumnVec<CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>> {
+    use std::sync::OnceLock;
+
+    use metal::{
+        Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions, MTLResourceUsage,
+        MTLSize,
+    };
+
+    const KERNEL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+constant uint P = 0x7FFFFFFFu;
+inline uint m31_add(uint a, uint b) { uint s = a + b; return (s >= P) ? s - P : s; }
+inline uint m31_mul(uint a, uint b) {
+    ulong p = (ulong)a * (ulong)b;
+    uint s = (uint)(p & P) + (uint)(p >> 31);
+    s = (s & P) + (s >> 31);
+    return (s >= P) ? s - P : s;
+}
+struct ColPtr { device uint* data; };
+kernel void fib_trace(
+    device const ColPtr* cols [[buffer(0)]],
+    device const uint* a_in [[buffer(1)]],
+    device const uint* b_in [[buffer(2)]],
+    constant uint& n_rows [[buffer(3)]],
+    constant uint& n_cols [[buffer(4)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n_rows) { return; }
+    uint a = a_in[i];
+    uint b = b_in[i];
+    cols[0].data[i] = a;
+    cols[1].data[i] = b;
+    for (uint j = 2; j < n_cols; j++) {
+        uint c = m31_add(m31_mul(a, a), m31_mul(b, b));
+        cols[j].data[i] = c;
+        a = b;
+        b = c;
+    }
+}
+"#;
+
+    struct Ctx {
+        device: Device,
+        queue: CommandQueue,
+        pipeline: ComputePipelineState,
+    }
+    // Metal objects are reference-counted Objective-C handles; uses are serialized by
+    // the single-threaded call site.
+    unsafe impl Send for Ctx {}
+    unsafe impl Sync for Ctx {}
+
+    static CTX: OnceLock<Option<Ctx>> = OnceLock::new();
+    let ctx = CTX
+        .get_or_init(|| {
+            let device = Device::system_default()?;
+            if !device.has_unified_memory() {
+                return None;
+            }
+            let library = device
+                .new_library_with_source(KERNEL, &metal::CompileOptions::new())
+                .ok()?;
+            let function = library.get_function("fib_trace", None).ok()?;
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&function)
+                .ok()?;
+            let queue = device.new_command_queue();
+            Some(Ctx {
+                device,
+                queue,
+                pipeline,
+            })
+        })
+        .as_ref()?;
+
+    let n_rows = inputs.len();
+    let log_size = n_rows.ilog2();
+    if n_rows < (1 << 16) {
+        return None;
+    }
+    let (a_in, b_in): (Vec<u32>, Vec<u32>) =
+        inputs.iter().map(|input| (input.a.0, input.b.0)).unzip();
+
+    // Safety: the kernel writes every element of every column before anything reads it.
+    #[allow(clippy::uninit_vec)]
+    let mut trace: Vec<Vec<BaseField>> = (0..N)
+        .map(|_| {
+            let mut column = Vec::with_capacity(n_rows);
+            unsafe { column.set_len(n_rows) };
+            column
+        })
+        .collect_vec();
+    // Fault the fresh pages in on the CPU (parallel) so the kernel doesn't stall.
+    #[cfg(feature = "parallel")]
+    trace.par_iter_mut().for_each(|column| {
+        for slot in column.iter_mut().step_by(16384 / 4) {
+            *slot = BaseField::from_u32_unchecked(0);
+        }
+    });
+
+    let bind = |data: &[u32]| -> Buffer {
+        let bytes = std::mem::size_of_val(data);
+        if (data.as_ptr() as usize).is_multiple_of(16384) && bytes.is_multiple_of(16384) {
+            ctx.device.new_buffer_with_bytes_no_copy(
+                data.as_ptr() as *const std::ffi::c_void,
+                bytes as u64,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            )
+        } else {
+            ctx.device.new_buffer_with_data(
+                data.as_ptr() as *const std::ffi::c_void,
+                bytes as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+    };
+
+    let col_buffers: Vec<Buffer> = trace
+        .iter()
+        .map(|column| {
+            // BaseField is a transparent u32 wrapper.
+            let words =
+                unsafe { std::slice::from_raw_parts(column.as_ptr() as *const u32, n_rows) };
+            bind(words)
+        })
+        .collect();
+    // Columns written zero-copy only: a copied buffer would not land in `trace`.
+    if col_buffers.iter().zip(&trace).any(|(buffer, column)| {
+        !std::ptr::eq(buffer.contents() as *const BaseField, column.as_ptr())
+    }) {
+        return None;
+    }
+    let addresses: Vec<u64> = col_buffers.iter().map(|b| b.gpu_address()).collect();
+    let addr_buffer = ctx.device.new_buffer_with_data(
+        addresses.as_ptr() as *const std::ffi::c_void,
+        (addresses.len() * 8) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let a_buffer = bind(&a_in);
+    let b_buffer = bind(&b_in);
+
+    let command_buffer = ctx.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&ctx.pipeline);
+    encoder.set_buffer(0, Some(&addr_buffer), 0);
+    encoder.set_buffer(1, Some(&a_buffer), 0);
+    encoder.set_buffer(2, Some(&b_buffer), 0);
+    let rows = n_rows as u32;
+    encoder.set_bytes(3, 4, &rows as *const _ as *const std::ffi::c_void);
+    let cols = N as u32;
+    encoder.set_bytes(4, 4, &cols as *const _ as *const std::ffi::c_void);
+    for buffer in &col_buffers {
+        encoder.use_resource(buffer, MTLResourceUsage::Write);
+    }
+    encoder.dispatch_threads(MTLSize::new(n_rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    let domain = CanonicCoset::new(log_size).circle_domain();
+    Some(
+        trace
+            .into_iter()
+            .map(|eval| CircleEvaluation::<CpuBackend, _, BitReversedOrder>::new(domain, eval))
+            .collect_vec(),
+    )
+}
+
 /// Same as [`generate_trace`] but optimized for simd.
 pub fn generate_trace_simd<const N: usize>(
     log_size: u32,
@@ -558,9 +734,13 @@ mod tests {
                 )
             },
             || {
-                generate_trace_cpu_parallel::<FIB_SEQUENCE_LENGTH>(&generate_test_inputs(
-                    log_n_instances,
-                ))
+                let inputs = generate_test_inputs(log_n_instances);
+                #[cfg(all(feature = "metal", target_os = "macos"))]
+                if let Some(trace) = super::generate_trace_cpu_metal::<FIB_SEQUENCE_LENGTH>(&inputs)
+                {
+                    return trace;
+                }
+                generate_trace_cpu_parallel::<FIB_SEQUENCE_LENGTH>(&inputs)
             },
         );
         tracing::info!("twiddles + trace gen: {:?}", t.elapsed());
