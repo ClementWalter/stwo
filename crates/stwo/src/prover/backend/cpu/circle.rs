@@ -282,6 +282,111 @@ impl PolyOps for CpuBackend {
         sum
     }
 
+    /// Column-blocked shared-basis evaluation: the QM31 basis is deinterleaved once into
+    /// its four M31 coordinate columns, and each row band streams the basis through cache
+    /// while multiply-accumulating every polynomial's coefficients against it with packed
+    /// 16-lane M31 ops. Summation order differs from the sequential fold only by
+    /// associativity, so values are exactly equal.
+    fn eval_many_at_point_with_basis(
+        polys: &[&CircleCoefficients<Self>],
+        basis: &Vec<SecureField>,
+    ) -> Vec<SecureField> {
+        use crate::prover::backend::simd::m31::{PackedBaseField, N_LANES};
+        let n = basis.len();
+        if polys.len() < 2 || n < (1 << 12) || !n.is_multiple_of(N_LANES) {
+            return polys
+                .iter()
+                .map(|poly| Self::eval_at_point_with_basis(poly, basis))
+                .collect();
+        }
+        polys
+            .iter()
+            .for_each(|poly| assert_eq!(poly.coeffs.len(), n));
+
+        // Deinterleave the shared basis into coordinate columns (one pass, reused by
+        // every polynomial).
+        const BAND: usize = 1 << 14;
+        let mut coords: [Vec<BaseField>; 4] = std::array::from_fn(|_| vec![BaseField::zero(); n]);
+        {
+            type FillItem<'a> = (
+                (
+                    (
+                        (&'a mut [BaseField], &'a mut [BaseField]),
+                        &'a mut [BaseField],
+                    ),
+                    &'a mut [BaseField],
+                ),
+                &'a [SecureField],
+            );
+            let [c0, c1, c2, c3] = &mut coords;
+            let fill = |((((c0, c1), c2), c3), src): FillItem<'_>| {
+                for (i, b) in src.iter().enumerate() {
+                    [c0[i], c1[i], c2[i], c3[i]] = b.to_m31_array();
+                }
+            };
+            #[cfg(feature = "parallel")]
+            c0.par_chunks_mut(BAND)
+                .zip(c1.par_chunks_mut(BAND))
+                .zip(c2.par_chunks_mut(BAND))
+                .zip(c3.par_chunks_mut(BAND))
+                .zip(basis.par_chunks(BAND))
+                .for_each(fill);
+            #[cfg(not(feature = "parallel"))]
+            c0.chunks_mut(BAND)
+                .zip(c1.chunks_mut(BAND))
+                .zip(c2.chunks_mut(BAND))
+                .zip(c3.chunks_mut(BAND))
+                .zip(basis.chunks(BAND))
+                .for_each(fill);
+        }
+        let bands: Vec<usize> = (0..n).step_by(BAND).collect();
+        let accumulate_band = |&start: &usize| {
+            let end = (start + BAND).min(n);
+            // Polynomial-outer: each polynomial's band streams contiguously against the
+            // cache-resident basis band, with the four coordinate accumulators held in
+            // registers.
+            polys
+                .iter()
+                .map(|poly| {
+                    let mut acc = [PackedBaseField::zero(); 4];
+                    let mut idx = start;
+                    while idx < end {
+                        let c = PackedBaseField::from_array(
+                            poly.coeffs[idx..idx + N_LANES].try_into().unwrap(),
+                        );
+                        for k in 0..4 {
+                            let b = PackedBaseField::from_array(
+                                coords[k][idx..idx + N_LANES].try_into().unwrap(),
+                            );
+                            acc[k] += b * c;
+                        }
+                        idx += N_LANES;
+                    }
+                    acc
+                })
+                .collect_vec()
+        };
+
+        #[cfg(feature = "parallel")]
+        let partials: Vec<Vec<[PackedBaseField; 4]>> =
+            bands.par_iter().map(accumulate_band).collect();
+        #[cfg(not(feature = "parallel"))]
+        let partials: Vec<Vec<[PackedBaseField; 4]>> = bands.iter().map(accumulate_band).collect();
+
+        (0..polys.len())
+            .map(|p| {
+                let coords: [BaseField; 4] = std::array::from_fn(|k| {
+                    partials
+                        .iter()
+                        .map(|band| band[p][k])
+                        .fold(PackedBaseField::zero(), |a, b| a + b)
+                        .pointwise_sum()
+                });
+                SecureField::from_m31_array(coords)
+            })
+            .collect()
+    }
+
     fn barycentric_weights(
         coset: CanonicCoset,
         p: CirclePoint<SecureField>,

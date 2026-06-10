@@ -72,6 +72,19 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         basis: &Col<Self, SecureField>,
     ) -> SecureField;
 
+    /// Evaluates many same-size polynomials at one sampled point through its shared FFT
+    /// basis column, equal element-wise to mapping [`Self::eval_at_point_with_basis`].
+    /// Backends can override to make the shared basis pass column-blocked.
+    fn eval_many_at_point_with_basis(
+        polys: &[&CircleCoefficients<Self>],
+        basis: &Col<Self, SecureField>,
+    ) -> Vec<SecureField> {
+        polys
+            .iter()
+            .map(|poly| Self::eval_at_point_with_basis(poly, basis))
+            .collect()
+    }
+
     /// Computes the weights for Barycentric Lagrange interpolation for point `p` on `coset`.
     /// `p` must not be in the domain.
     /// Used by the [`CircleEvaluation::barycentric_weights()`] function.
