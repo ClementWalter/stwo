@@ -111,6 +111,33 @@ impl<H: MerkleHasherLifted + Send + Sync + 'static> MerkleOpsLifted<H> for CpuBa
         prev_layer.into_iter().map(|x| x.finalize()).collect()
     }
 
+    fn build_packed_tree(
+        columns: &[&Vec<BaseField>; SECURE_EXTENSION_DEGREE],
+        _n_layers: u32,
+    ) -> Option<Vec<Vec<H::Hash>>> {
+        // Blake2s fast path: leaf kernel reads the coordinate columns in packed order
+        // directly (no packing pass), then the layer chain — one GPU submission.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let is_m31 = TypeId::of::<H>() == TypeId::of::<Blake2sMerkleHasherGeneric<true>>();
+            let is_bytes = TypeId::of::<H>() == TypeId::of::<Blake2sMerkleHasherGeneric<false>>();
+            if is_m31 || is_bytes {
+                let coords: [&[BaseField]; SECURE_EXTENSION_DEGREE] =
+                    std::array::from_fn(|i| columns[i].as_slice());
+                if let Some(layers) =
+                    crate::prover::backend::metal::blake2s::build_packed_tree_metal(coords, is_m31)
+                {
+                    // Safety: TypeId equality makes this an identity conversion.
+                    return Some(unsafe {
+                        std::mem::transmute::<Vec<Vec<Blake2sHash>>, Vec<Vec<H::Hash>>>(layers)
+                    });
+                }
+            }
+        }
+        let _ = columns;
+        None
+    }
+
     fn build_layers(leaves: Vec<H::Hash>, n_layers: u32) -> Vec<Vec<H::Hash>> {
         // Blake2s fast path: chain every large layer in one GPU submission.
         #[cfg(all(feature = "metal", target_os = "macos"))]

@@ -18,6 +18,16 @@ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
     /// of adjacent elements of the input, as in a standard Merkle tree.
     fn build_next_layer(prev_layer: &Col<Self, H::Hash>) -> Col<Self, H::Hash>;
 
+    /// Builds the whole packed-leaf tree (four secure-coordinate columns, four rows
+    /// per leaf) in one batch, layers leaves-first. `None` (the default) keeps the
+    /// separate pack + leaves + layers path.
+    fn build_packed_tree(
+        _columns: &[&Col<Self, BaseField>; SECURE_EXTENSION_DEGREE],
+        _n_layers: u32,
+    ) -> Option<Vec<Col<Self, H::Hash>>> {
+        None
+    }
+
     /// Builds all `n_layers` tree layers above `leaves` (leaves first). Backends can
     /// override to batch the whole chain (e.g. one GPU submission).
     fn build_layers(leaves: Col<Self, H::Hash>, n_layers: u32) -> Vec<Col<Self, H::Hash>> {

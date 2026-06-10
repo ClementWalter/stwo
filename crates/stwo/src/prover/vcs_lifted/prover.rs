@@ -54,6 +54,13 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
             );
             let columns: [&Col<B, BaseField>; SECURE_EXTENSION_DEGREE] =
                 columns.try_into().unwrap();
+            if let Some(mut layers) = B::build_packed_tree(&columns, lifting_log_size) {
+                while (layers.len() as u32) < lifting_log_size + 1 {
+                    layers.push(B::build_next_layer(layers.last().unwrap()));
+                }
+                layers.reverse();
+                return Self { layers };
+            }
             let packed_columns = B::pack_leaves_input(&columns);
             let max_log_size = packed_columns[0].len().ilog2();
             assert!(lifting_log_size >= max_log_size);

@@ -144,6 +144,37 @@ kernel void absorb_chunk(
     }
 }
 
+// One packed leaf = 16 M31 values = one blake block: leaf i absorbs
+// coords[c % 4][4i + c / 4] for c in 0..16 (the packed-leaf layout).
+kernel void packed_leaves(
+    device const uint* c0 [[buffer(0)]],
+    device const uint* c1 [[buffer(1)]],
+    device const uint* c2 [[buffer(2)]],
+    device const uint* c3 [[buffer(3)]],
+    device uint* out [[buffer(4)]],
+    constant uint& n_leaves [[buffer(5)]],
+    constant uint& is_m31_output [[buffer(6)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n_leaves) { return; }
+    device const uint* coords[4] = {c0, c1, c2, c3};
+    uint h[8];
+    for (uint k = 0; k < 8; k++) { h[k] = IV[k]; }
+    h[0] ^= 0x01010020u;
+    uint m[16];
+    for (uint c = 0; c < 16u; c++) { m[c] = coords[c & 3u][(i << 2u) + (c >> 2u)]; }
+    compress(h, m, 64u, true);
+    for (uint k = 0; k < 8; k++) {
+        uint v = h[k];
+        if (is_m31_output != 0u) {
+            uint r = (v & M31_P) + (v >> 31);
+            if (r >= M31_P) { r -= M31_P; }
+            v = r;
+        }
+        out[i * 8 + k] = v;
+    }
+}
+
 kernel void hash_children(
     device const uint* prev [[buffer(0)]],
     device uint* out [[buffer(1)]],
@@ -175,6 +206,7 @@ struct MetalContext {
     queue: CommandQueue,
     absorb_pipeline: ComputePipelineState,
     children_pipeline: ComputePipelineState,
+    packed_leaves_pipeline: ComputePipelineState,
     /// Reused running-state buffer (n_rows x 8 u32), grown on demand.
     state_buffer: Option<Buffer>,
 }
@@ -199,11 +231,15 @@ fn context() -> Option<&'static Mutex<MetalContext>> {
                 .ok()?;
             let absorb = library.get_function("absorb_chunk", None).ok()?;
             let children = library.get_function("hash_children", None).ok()?;
+            let packed = library.get_function("packed_leaves", None).ok()?;
             let absorb_pipeline = device
                 .new_compute_pipeline_state_with_function(&absorb)
                 .ok()?;
             let children_pipeline = device
                 .new_compute_pipeline_state_with_function(&children)
+                .ok()?;
+            let packed_leaves_pipeline = device
+                .new_compute_pipeline_state_with_function(&packed)
                 .ok()?;
             let queue = shared.queue.clone();
             Some(Mutex::new(MetalContext {
@@ -211,6 +247,7 @@ fn context() -> Option<&'static Mutex<MetalContext>> {
                 queue,
                 absorb_pipeline,
                 children_pipeline,
+                packed_leaves_pipeline,
                 state_buffer: None,
             }))
         })
@@ -627,6 +664,111 @@ pub(crate) fn encode_tree(
         levels,
         copy_outs,
     })
+}
+
+/// Builds the whole packed-leaf Merkle tree (FRI layer shape: four secure-coordinate
+/// columns, four rows per leaf) in one submission: the leaf kernel reads the
+/// coordinate columns directly in packed order — no packing pass — and the layer
+/// chain follows. Returns layers leaves-first; `None` without a usable device.
+pub(crate) fn build_packed_tree_metal(
+    coords: [&[crate::core::fields::m31::BaseField]; 4],
+    is_m31_output: bool,
+) -> Option<Vec<Vec<Blake2sHash>>> {
+    let n_leaves = coords[0].len() / 4;
+    if n_leaves < (1 << MIN_METAL_LOG_SIZE) {
+        return None;
+    }
+    let ctx = context()?;
+    let ctx = ctx.lock().unwrap();
+
+    let coord_buffers: Vec<Buffer> = coords
+        .iter()
+        .map(|c| {
+            // BaseField is a transparent u32 wrapper.
+            let words = unsafe { std::slice::from_raw_parts(c.as_ptr() as *const u32, c.len()) };
+            input_buffer(&ctx.device, words)
+        })
+        .collect();
+
+    let mut leaves: Vec<Blake2sHash> = unsafe { uninit_vec(n_leaves) };
+    prefault(&mut leaves);
+    let (leaves_buffer, leaves_zero_copy) = output_buffer(&ctx.device, &mut leaves);
+
+    let command_buffer = ctx.queue.new_command_buffer();
+    {
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&ctx.packed_leaves_pipeline);
+        for (k, buffer) in coord_buffers.iter().enumerate() {
+            encoder.set_buffer(k as u64, Some(buffer), 0);
+        }
+        encoder.set_buffer(4, Some(&leaves_buffer), 0);
+        let n = n_leaves as u32;
+        encoder.set_bytes(5, 4, &n as *const _ as *const std::ffi::c_void);
+        let m31 = u32::from(is_m31_output);
+        encoder.set_bytes(6, 4, &m31 as *const _ as *const std::ffi::c_void);
+        encoder.dispatch_threads(MTLSize::new(n_leaves as u64, 1, 1), MTLSize::new(256, 1, 1));
+        encoder.end_encoding();
+    }
+
+    // Layer chain over the leaves, as in build_layers_metal.
+    let mut sizes = vec![];
+    let mut n = n_leaves / 2;
+    while n >= (1 << MIN_METAL_LOG_SIZE) {
+        sizes.push(n);
+        n /= 2;
+    }
+    let mut levels: Vec<Vec<Blake2sHash>> =
+        sizes.iter().map(|&n| unsafe { uninit_vec(n) }).collect();
+    levels.iter_mut().for_each(|level| prefault(level));
+    let leaves_src = leaves_buffer.clone();
+    let mut prev_buffer = leaves_buffer;
+    let mut copy_outs = vec![];
+    for level in levels.iter_mut() {
+        let (out_buffer, zero_copy) = output_buffer(&ctx.device, level);
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&ctx.children_pipeline);
+        encoder.set_buffer(0, Some(&prev_buffer), 0);
+        encoder.set_buffer(1, Some(&out_buffer), 0);
+        let n = level.len() as u32;
+        encoder.set_bytes(2, 4, &n as *const _ as *const std::ffi::c_void);
+        let m31 = u32::from(is_m31_output);
+        encoder.set_bytes(3, 4, &m31 as *const _ as *const std::ffi::c_void);
+        encoder.dispatch_threads(
+            MTLSize::new(level.len() as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        encoder.end_encoding();
+        copy_outs.push((out_buffer.clone(), if zero_copy { 0 } else { level.len() }));
+        prev_buffer = out_buffer;
+    }
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+
+    if !leaves_zero_copy {
+        // Safety: the kernel wrote all leaves into the shared buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                leaves_src.contents() as *const Blake2sHash,
+                leaves.as_mut_ptr(),
+                n_leaves,
+            );
+        }
+    }
+    for ((buffer, copy_len), level) in copy_outs.iter().zip(levels.iter_mut()) {
+        if *copy_len > 0 {
+            // Safety: the kernel wrote all entries into the shared buffer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buffer.contents() as *const Blake2sHash,
+                    level.as_mut_ptr(),
+                    *copy_len,
+                );
+            }
+        }
+    }
+    let mut layers = vec![leaves];
+    layers.extend(levels);
+    Some(layers)
 }
 
 #[cfg(test)]
