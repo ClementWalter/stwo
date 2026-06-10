@@ -45,6 +45,12 @@ impl PolyOps for CpuBackend {
             let domain = eval.domain;
             let mut values = eval.values;
 
+            // Apple-GPU path: in-place transform leaving natural-order coefficients.
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            if crate::prover::backend::metal::fft::ifft_metal(&mut values, domain, twiddles) {
+                return CircleCoefficients::new(values);
+            }
+
             // In-place transform on the CPU-owned allocation when it is SIMD-aligned;
             // no packing copy and no intermediate allocation.
             if let Some(ptr) = simd_aligned_ptr(&mut values) {
@@ -123,6 +129,21 @@ impl PolyOps for CpuBackend {
             );
         }
 
+        // Apple-GPU path: all columns' transforms encoded into one command buffer
+        // (single synchronization), natural-order coefficients throughout.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        let columns = {
+            match crate::prover::backend::metal::fft::fused_transform_metal(
+                columns,
+                log_blowup_factor,
+                twiddles,
+                store_polynomials_coefficients,
+            ) {
+                Ok(polys) => return polys,
+                Err(columns) => columns,
+            }
+        };
+
         // One cached packed twiddle tree per root coset, shared by all columns of every
         // commitment over that coset.
         let simd_twiddles = cached_simd_twiddles(twiddles.root_coset);
@@ -184,6 +205,7 @@ impl PolyOps for CpuBackend {
             };
             let ext_domain =
                 CanonicCoset::new(domain.log_size() + log_blowup_factor).circle_domain();
+
             let mut out: Vec<BaseField> = Vec::with_capacity(ext_domain.size());
             let aligned = simd_aligned_ptr(&mut values)
                 .filter(|_| (out.as_mut_ptr() as usize).is_multiple_of(64));
@@ -506,6 +528,21 @@ impl PolyOps for CpuBackend {
             use crate::prover::backend::simd::SimdBackend;
             let simd_twiddles = cached_simd_twiddles(twiddles.root_coset);
             let fft_log_size = poly.coeffs.len().ilog2();
+
+            // Apple-GPU path: transform straight from the stored natural-order
+            // coefficients into a fresh output vector.
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            {
+                let mut out = vec![BaseField::zero(); domain.size()];
+                if crate::prover::backend::metal::fft::rfft_metal(
+                    &poly.coeffs,
+                    domain,
+                    twiddles,
+                    &mut out,
+                ) {
+                    return CircleEvaluation::new(domain, out);
+                }
+            }
 
             // Raw path: run the rfft straight from the CPU coefficient buffer into a
             // fresh output vector — no packing copies. Above the cached-fft size the
@@ -866,7 +903,7 @@ fn fft_full_layer(
 /// Computes the circle twiddles layer (layer 0) from the first line twiddles layer (layer 1).
 ///
 /// Only works for line twiddles generated from a domain with size `>4`.
-fn circle_twiddles_from_line_twiddles(
+pub(crate) fn circle_twiddles_from_line_twiddles(
     first_line_twiddles: &[BaseField],
 ) -> impl Iterator<Item = BaseField> + '_ {
     // The twiddles for layer 0 can be computed from the twiddles for layer 1.
