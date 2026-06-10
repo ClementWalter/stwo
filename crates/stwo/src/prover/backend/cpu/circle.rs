@@ -356,13 +356,29 @@ pub fn slow_precompute_twiddles(mut coset: Coset) -> Vec<BaseField> {
     let mut twiddles = Vec::with_capacity(coset.size());
     for _ in 0..coset.log_size() {
         let i0 = twiddles.len();
-        twiddles.extend(
-            coset
-                .iter()
-                .take(coset.size() / 2)
-                .map(|p| p.x)
-                .collect::<Vec<_>>(),
-        );
+        let half = coset.size() / 2;
+        // Each chunk derives its starting point by index and steps from there, so the
+        // layer's points are computed in parallel.
+        const CHUNK: usize = 1 << 12;
+        let mut layer = vec![BaseField::zero(); half];
+        let fill = |(chunk_idx, chunk): (usize, &mut [BaseField])| {
+            let mut point = coset.at(chunk_idx * CHUNK);
+            for slot in chunk.iter_mut() {
+                *slot = point.x;
+                point = point + coset.step;
+            }
+        };
+        #[cfg(feature = "parallel")]
+        layer
+            .par_chunks_mut(CHUNK)
+            .enumerate()
+            .for_each(|(i, chunk)| fill((i, chunk)));
+        #[cfg(not(feature = "parallel"))]
+        layer
+            .chunks_mut(CHUNK)
+            .enumerate()
+            .for_each(|(i, chunk)| fill((i, chunk)));
+        twiddles.extend(layer);
         bit_reverse(&mut twiddles[i0..]);
         coset = coset.double();
     }
