@@ -1,8 +1,12 @@
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use super::CpuBackend;
 use crate::core::circle::Coset;
 use crate::core::fft::ibutterfly;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
+use crate::core::fields::FieldExpOps;
 use crate::core::poly::line::LineDomain;
 use crate::core::utils::bit_reverse_index;
 use crate::prover::fri::FriOps;
@@ -70,23 +74,51 @@ pub fn fold_line_cpu(
     assert!(n >= 2, "Evaluation too small");
 
     let domain = eval.domain();
+    let half_n = n / 2;
+    let folded_values = unsafe { SecureColumnByCoords::<CpuBackend>::uninitialized(half_n) };
+    let mut folded_values = LineEvaluation::new(domain.double(), folded_values);
 
-    let folded_values = eval
-        .values
-        .into_iter()
-        .array_chunks()
-        .enumerate()
-        .map(|(i, [f_x, f_neg_x])| {
-            // TODO(andrew): Inefficient. Update when domain twiddles get stored in a buffer.
-            let x = domain.at(bit_reverse_index(i << 1, domain.log_size()));
+    // Pairs are independent; fold disjoint chunks concurrently, batching each chunk's
+    // domain-point inversions into a single field inversion.
+    let chunk_size = 1 << 10;
+    let mut chunk_views = {
+        let [c0, c1, c2, c3]: &mut [Vec<BaseField>; 4] = &mut folded_values.values.columns;
+        (c0.chunks_mut(chunk_size))
+            .zip(c1.chunks_mut(chunk_size))
+            .zip(c2.chunks_mut(chunk_size))
+            .zip(c3.chunks_mut(chunk_size))
+            .enumerate()
+            .map(|(i, (((d0, d1), d2), d3))| (i * chunk_size, [d0, d1, d2, d3]))
+            .collect::<Vec<_>>()
+    };
 
+    let process_chunk = |(start, chunk): &mut (usize, [&mut [BaseField]; 4])| {
+        let start = *start;
+        let rows = chunk[0].len();
+        let xs: Vec<BaseField> = (0..rows)
+            .map(|idx| domain.at(bit_reverse_index((start + idx) << 1, domain.log_size())))
+            .collect();
+        let x_invs = BaseField::batch_inverse(&xs);
+        for (idx, x_inv) in x_invs.into_iter().enumerate() {
+            let i = start + idx;
+            let f_x = eval.values.at(i << 1);
+            let f_neg_x = eval.values.at((i << 1) + 1);
             let (mut f0, mut f1) = (f_x, f_neg_x);
-            ibutterfly(&mut f0, &mut f1, x.inverse());
-            f0 + alpha * f1
-        })
-        .collect();
+            ibutterfly(&mut f0, &mut f1, x_inv);
+            let [v0, v1, v2, v3] = (f0 + alpha * f1).to_m31_array();
+            chunk[0][idx] = v0;
+            chunk[1][idx] = v1;
+            chunk[2][idx] = v2;
+            chunk[3][idx] = v3;
+        }
+    };
 
-    LineEvaluation::new(domain.double(), folded_values)
+    #[cfg(feature = "parallel")]
+    chunk_views.par_iter_mut().for_each(process_chunk);
+    #[cfg(not(feature = "parallel"))]
+    chunk_views.iter_mut().for_each(process_chunk);
+
+    folded_values
 }
 
 /// TODO: Almost duplicate code of [`crate::core::fri::fold_circle_into_line`]. Consider refactor.
@@ -100,21 +132,52 @@ pub fn fold_circle_into_line_cpu(
     let values = unsafe { SecureColumnByCoords::uninitialized(1 << line_log_size) };
     let mut dst = LineEvaluation::new(dst_domain, values);
 
-    src.values
-        .into_iter()
-        .array_chunks()
-        .enumerate()
-        .for_each(|(i, [f_p, f_neg_p])| {
-            // TODO(andrew): Inefficient. Update when domain twiddles get stored in a buffer.
-            let p = domain.at(bit_reverse_index(i << 1, domain.log_size()));
+    // Pairs are independent; fold disjoint chunks concurrently, batching each chunk's
+    // domain-point inversions into a single field inversion.
+    let chunk_size = 1 << 10;
+    let mut chunk_views = {
+        let [c0, c1, c2, c3]: &mut [Vec<BaseField>; 4] = &mut dst.values.columns;
+        (c0.chunks_mut(chunk_size))
+            .zip(c1.chunks_mut(chunk_size))
+            .zip(c2.chunks_mut(chunk_size))
+            .zip(c3.chunks_mut(chunk_size))
+            .enumerate()
+            .map(|(i, (((d0, d1), d2), d3))| (i * chunk_size, [d0, d1, d2, d3]))
+            .collect::<Vec<_>>()
+    };
 
+    let process_chunk = |(start, chunk): &mut (usize, [&mut [BaseField]; 4])| {
+        let start = *start;
+        let rows = chunk[0].len();
+        let ys: Vec<BaseField> = (0..rows)
+            .map(|idx| {
+                domain
+                    .at(bit_reverse_index((start + idx) << 1, domain.log_size()))
+                    .y
+            })
+            .collect();
+        let y_invs = BaseField::batch_inverse(&ys);
+        for (idx, y_inv) in y_invs.into_iter().enumerate() {
+            let i = start + idx;
+            let f_p = src.values.at(i << 1);
+            let f_neg_p = src.values.at((i << 1) + 1);
             // Calculate `f0(px)` and `f1(px)` such that `2f(p) = f0(px) + py * f1(px)`.
             let (mut f0_px, mut f1_px) = (f_p, f_neg_p);
-            ibutterfly(&mut f0_px, &mut f1_px, p.y.inverse());
+            ibutterfly(&mut f0_px, &mut f1_px, y_inv);
             let f_prime = alpha * f1_px + f0_px;
+            let [v0, v1, v2, v3] = f_prime.to_m31_array();
+            chunk[0][idx] = v0;
+            chunk[1][idx] = v1;
+            chunk[2][idx] = v2;
+            chunk[3][idx] = v3;
+        }
+    };
 
-            dst.values.set(i, f_prime)
-        });
+    #[cfg(feature = "parallel")]
+    chunk_views.par_iter_mut().for_each(process_chunk);
+    #[cfg(not(feature = "parallel"))]
+    chunk_views.iter_mut().for_each(process_chunk);
+
     dst
 }
 
