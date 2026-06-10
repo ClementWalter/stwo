@@ -4,6 +4,7 @@
 //! fallbacks (no device, unsupported shape) and as reference-test ground truths.
 
 pub(crate) mod blake2s;
+pub mod constraints;
 pub(crate) mod fft;
 pub(crate) mod quotients;
 

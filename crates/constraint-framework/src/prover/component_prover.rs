@@ -327,6 +327,31 @@ fn accumulate_pointwise_cpu<E: FrameworkEval + Sync>(
     random_coeff_powers: &[SecureField],
     accum: &SecureColumnByCoords<CpuBackend>,
 ) -> SecureColumnByCoords<CpuBackend> {
+    // Apple-GPU path for AIRs that supply an MSL constraint body; bit-identical to the
+    // CPU evaluator below, which remains the reference.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    if eval_log_size >= stwo::prover::backend::metal::constraints::MIN_METAL_CONSTRAINT_LOG_SIZE {
+        if let Some(body) = component_eval.metal_constraint_body() {
+            let columns: Vec<Vec<&[BaseField]>> = trace_cols
+                .iter()
+                .map(|cols| cols.iter().map(|c| c.values.as_slice()).collect())
+                .collect();
+            if let Some(res) =
+                stwo::prover::backend::metal::constraints::accumulate_constraints_metal(
+                    &columns,
+                    random_coeff_powers,
+                    &denom_inv,
+                    accum,
+                    1 << eval_log_size,
+                    trace_log_size,
+                    &body,
+                )
+            {
+                return res;
+            }
+        }
+    }
+
     let mut res = SecureColumnByCoords::zeros(1 << eval_log_size);
 
     // Rows are independent; evaluate disjoint row chunks concurrently (each chunk owns

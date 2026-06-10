@@ -108,6 +108,22 @@ pub trait FrameworkEval {
     fn max_constraint_log_degree_bound(&self) -> u32;
 
     fn evaluate<E: EvalAtRow>(&self, eval: E) -> E;
+
+    /// Optional Metal Shading Language body evaluating this AIR's constraints at one
+    /// row, used by GPU-accelerated builds to run constraint-quotient accumulation on
+    /// the GPU. The body is written against two macros:
+    ///
+    /// - `TRACE_AT(interaction, col)` — the `col`-th mask column of `interaction` at the current
+    ///   row (offset-0 mask reads only),
+    /// - `ADD_CONSTRAINT(v)` — accumulates `alpha^k * v`; constraints MUST be added in exactly the
+    ///   order [`Self::evaluate`] adds them.
+    ///
+    /// M31 helpers `m31_add` / `m31_sub` / `m31_mul` are in scope. Results must match
+    /// [`Self::evaluate`] bit for bit; the CPU evaluator remains the reference.
+    /// Returning `None` (the default) keeps constraint evaluation on the CPU.
+    fn metal_constraint_body(&self) -> Option<String> {
+        None
+    }
 }
 
 pub struct FrameworkComponent<C: FrameworkEval> {
