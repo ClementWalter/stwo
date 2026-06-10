@@ -581,6 +581,14 @@ mod tests {
             commitment_scheme,
         )
         .unwrap();
+        if std::env::var("CPU_FIB_PROOF_HASH").is_ok() {
+            use std::hash::{Hash, Hasher};
+            let repr = format!("{proof:?}");
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            repr.hash(&mut h);
+            std::println!("PROOF_HASH={:016x} len={}", h.finish(), repr.len());
+        }
+
         tracing::info!("prove: {:?}", t.elapsed());
 
         // Verify.
