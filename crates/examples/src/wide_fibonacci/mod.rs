@@ -528,14 +528,23 @@ mod tests {
             .map(|s| s.parse().unwrap())
             .unwrap_or(8);
         let config = PcsConfig::default();
-        // Precompute twiddles.
+        // Twiddle precompute and trace generation are independent; run them in parallel.
         let t = std::time::Instant::now();
-        let twiddles = CpuBackend::precompute_twiddles(
-            CanonicCoset::new(log_n_instances + 1 + config.fri_config.log_blowup_factor)
-                .circle_domain()
-                .half_coset,
+        let (twiddles, trace) = rayon::join(
+            || {
+                CpuBackend::precompute_twiddles(
+                    CanonicCoset::new(log_n_instances + 1 + config.fri_config.log_blowup_factor)
+                        .circle_domain()
+                        .half_coset,
+                )
+            },
+            || {
+                generate_trace_cpu_parallel::<FIB_SEQUENCE_LENGTH>(&generate_test_inputs(
+                    log_n_instances,
+                ))
+            },
         );
-        tracing::info!("twiddle precompute: {:?}", t.elapsed());
+        tracing::info!("twiddles + trace gen: {:?}", t.elapsed());
 
         // Setup protocol.
         let prover_channel = &mut Blake2sM31Channel::default();
@@ -546,14 +555,6 @@ mod tests {
         let mut tree_builder = commitment_scheme.tree_builder();
         tree_builder.extend_evals(vec![]);
         tree_builder.commit(prover_channel);
-
-        // Trace.
-        let t = std::time::Instant::now();
-        let inputs = generate_test_inputs(log_n_instances);
-        tracing::info!("input gen: {:?}", t.elapsed());
-        let t = std::time::Instant::now();
-        let trace = generate_trace_cpu_parallel::<FIB_SEQUENCE_LENGTH>(&inputs);
-        tracing::info!("trace gen: {:?}", t.elapsed());
         let t = std::time::Instant::now();
         let mut tree_builder = commitment_scheme.tree_builder();
         tree_builder.extend_evals(trace);
