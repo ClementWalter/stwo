@@ -141,7 +141,21 @@ impl PolyOps for CpuBackend {
         basis: &Vec<SecureField>,
     ) -> SecureField {
         assert_eq!(poly.coeffs.len(), basis.len());
-        zip(&poly.coeffs, basis).fold(SecureField::zero(), |acc, (&c, &b)| acc + b * c)
+        // Four independent partial sums fill the multiplier pipeline; field addition is
+        // associative, so the result equals the sequential fold.
+        let mut acc = [SecureField::zero(); 4];
+        let (coeff_chunks, coeff_rem) = poly.coeffs.as_chunks::<4>();
+        let (basis_chunks, basis_rem) = basis.as_chunks::<4>();
+        for (cs, bs) in zip(coeff_chunks, basis_chunks) {
+            for k in 0..4 {
+                acc[k] += bs[k] * cs[k];
+            }
+        }
+        let mut sum = acc[0] + acc[1] + acc[2] + acc[3];
+        for (&c, &b) in zip(coeff_rem, basis_rem) {
+            sum += b * c;
+        }
+        sum
     }
 
     fn barycentric_weights(
