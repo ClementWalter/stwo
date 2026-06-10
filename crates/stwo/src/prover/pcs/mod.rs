@@ -213,6 +213,70 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         basis_map
     }
 
+    /// Evaluates every committed polynomial at its sampled points from stored
+    /// coefficients, grouping all same-size columns sampled at one folded point so the
+    /// backend streams their shared FFT-basis column once per group.
+    fn batched_coefficient_samples(
+        &self,
+        sampled_points: &TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
+        basis_map: &WeightsHashMap<B>,
+        lifting_log_size: u32,
+    ) -> TreeVec<Vec<Vec<PointSample>>> {
+        use num_traits::Zero;
+
+        // (tree index, column index, point index) entries grouped per shared basis.
+        type SampleGroups = HashMap<(u32, CirclePoint<SecureField>), Vec<(usize, usize, usize)>>;
+
+        let polys = self.polynomials();
+        let mut groups: SampleGroups = HashMap::new();
+        for (t, (cols, pts_cols)) in polys.iter().zip(sampled_points.iter()).enumerate() {
+            for (c, (poly, points)) in cols.iter().zip(pts_cols.iter()).enumerate() {
+                let coeffs = poly.coeffs.as_ref().expect("coefficients stored");
+                for (pi, &point) in points.iter().enumerate() {
+                    let folded =
+                        point.repeated_double(lifting_log_size - poly.evals.domain.log_size());
+                    groups
+                        .entry((coeffs.log_size(), folded))
+                        .or_default()
+                        .push((t, c, pi));
+                }
+            }
+        }
+
+        let mut samples: TreeVec<Vec<Vec<PointSample>>> =
+            sampled_points.as_cols_ref().map_cols(|points| {
+                points
+                    .iter()
+                    .map(|&point| PointSample {
+                        point,
+                        value: SecureField::zero(),
+                    })
+                    .collect_vec()
+            });
+        // Groups are few (one per (size, folded point)); each backend call parallelizes
+        // internally over rows.
+        for ((log_size, folded), entries) in groups {
+            let group_start = std::time::Instant::now();
+            let group_polys = entries
+                .iter()
+                .map(|&(t, c, _)| polys[t][c].coeffs.as_ref().unwrap())
+                .collect_vec();
+            let basis = basis_map
+                .get(&(log_size, folded))
+                .expect("basis built for all sampled points");
+            let values = B::eval_many_at_point_with_basis(&group_polys, &basis);
+            for (&(t, c, pi), value) in entries.iter().zip(values) {
+                samples[t][c][pi].value = value;
+            }
+            tracing::info!(
+                "OOD group: log_size={log_size} cols={} in {:?}",
+                entries.len(),
+                group_start.elapsed()
+            );
+        }
+        samples
+    }
+
     pub fn prove_values(
         mut self,
         sampled_points: TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
@@ -227,6 +291,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         .entered();
 
         let lifting_log_size = self.trees.last().unwrap().commitment.layers.len() as u32 - 1;
+        let basis_span = span!(Level::INFO, "OOD basis", class = "OodBasis").entered();
         let weights_hash_map = if self.store_polynomials_coefficients {
             // With stored coefficients, share one FFT-basis column per
             // (coefficient size, folded point) across all polynomials sampled there.
@@ -234,6 +299,7 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         } else {
             Some(self.build_weights_hash_map(&sampled_points, lifting_log_size))
         };
+        basis_span.exit();
 
         // Lambda that evaluates a polynomial on a collection of circle points and returns a vector
         // of point samples.
@@ -250,16 +316,29 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 .collect_vec()
         };
 
-        #[cfg(not(feature = "parallel"))]
-        let samples: TreeVec<Vec<Vec<PointSample>>> = self
-            .polynomials()
-            .zip_cols(&sampled_points)
-            .map_cols(eval_at_points);
-        #[cfg(feature = "parallel")]
-        let samples: TreeVec<Vec<Vec<PointSample>>> = self
-            .polynomials()
-            .zip_cols(&sampled_points)
-            .par_map_cols(eval_at_points);
+        let samples: TreeVec<Vec<Vec<PointSample>>> = if self.store_polynomials_coefficients {
+            // All same-size columns sampled at one (folded) point share an FFT-basis
+            // column; grouping them lets the backend stream that basis once for the
+            // whole group instead of once per column.
+            self.batched_coefficient_samples(
+                &sampled_points,
+                weights_hash_map.as_ref().unwrap(),
+                lifting_log_size,
+            )
+        } else {
+            #[cfg(not(feature = "parallel"))]
+            {
+                self.polynomials()
+                    .zip_cols(&sampled_points)
+                    .map_cols(eval_at_points)
+            }
+            #[cfg(feature = "parallel")]
+            {
+                self.polynomials()
+                    .zip_cols(&sampled_points)
+                    .par_map_cols(eval_at_points)
+            }
+        };
 
         span.exit();
         let sampled_values = samples
