@@ -25,6 +25,12 @@ prover = ["std", "tracing/attributes"]
 parallel = ["rayon", "indexmap/rayon"]
 slow-tests = []
 tracing = []
+# Zero-knowledge support. Compiles in hiding (salted) Merkle commitments and the
+# zk config surface. Off by default: with the feature off, proofs and proof bytes
+# are identical to non-zk stwo (ethproofs are unaffected). Implies `prover` + std
+# because salt generation needs a CSPRNG; verifying zk proofs in a pure no_std
+# build is not supported yet. See `docs/zk.md`.
+zk = ["prover", "rand/std", "rand/std_rng"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

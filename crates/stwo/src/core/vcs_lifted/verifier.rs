@@ -20,12 +20,19 @@ pub struct MerkleDecommitmentLifted<H: MerkleHasherLifted> {
     /// Hash values that the verifier needs but cannot deduce from previous computations, in the
     /// order they are needed.
     pub hash_witness: Vec<H::Hash>,
+    /// Secret per-leaf salts for the (deduplicated) opened positions, in the order the verifier
+    /// rebuilds leaves. Empty for non-hiding commitments. Present only under the `zk` feature; see
+    /// `docs/zk.md`.
+    #[cfg(feature = "zk")]
+    pub salts: Vec<H::Hash>,
 }
 
 impl<H: MerkleHasherLifted> MerkleDecommitmentLifted<H> {
     pub const fn empty() -> Self {
         Self {
             hash_witness: Vec::new(),
+            #[cfg(feature = "zk")]
+            salts: Vec::new(),
         }
     }
 }
@@ -136,6 +143,12 @@ impl<H: MerkleHasherLifted> MerkleVerifierLifted<H> {
             .collect_vec();
 
         // Build the leaves.
+        // Hiding: when salts are present, each leaf is committed as
+        // `hash_children(leaf, salt)`; fold the provided salt in the same order
+        // the prover derived them (deduplicated opened positions). See
+        // `docs/zk.md`.
+        #[cfg(feature = "zk")]
+        let mut salt_index = 0usize;
         let mut prev_layer_hashes: Vec<(usize, H::Hash)> = vec![];
         for pos in query_positions.iter().dedup() {
             let row: Vec<_> = sorted_queries_iter
@@ -144,7 +157,23 @@ impl<H: MerkleHasherLifted> MerkleVerifierLifted<H> {
                 .collect();
             let mut hasher = H::default();
             hasher.update_leaf(&row);
-            prev_layer_hashes.push((*pos, hasher.finalize()));
+            #[allow(unused_mut)]
+            let mut leaf = hasher.finalize();
+            #[cfg(feature = "zk")]
+            if !decommitment.salts.is_empty() {
+                let salt = *decommitment
+                    .salts
+                    .get(salt_index)
+                    .ok_or(MerkleVerificationError::WitnessTooShort)?;
+                salt_index += 1;
+                leaf = H::hash_children((leaf, salt));
+            }
+            prev_layer_hashes.push((*pos, leaf));
+        }
+        // All provided salts must be consumed by the opened leaves.
+        #[cfg(feature = "zk")]
+        if salt_index != decommitment.salts.len() {
+            return Err(MerkleVerificationError::WitnessTooLong);
         }
 
         // Check that all queried values have been consumed.
@@ -314,5 +343,114 @@ mod tests {
         verifier
             .verify(&queries, values, decommitment.decommitment)
             .unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "zk"))]
+mod zk_tests {
+    use crate::core::fields::m31::{BaseField, M31};
+    use crate::core::vcs::blake2_hash::Blake2sHash;
+    use crate::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher;
+    use crate::core::vcs_lifted::verifier::{MerkleVerificationError, MerkleVerifierLifted};
+    use crate::prover::backend::CpuBackend;
+    use crate::prover::vcs_lifted::prover::MerkleProverLifted;
+    use crate::prover::vcs_lifted::zk::{SaltSeed, ZK_SALT_SEED_LEN};
+
+    const LIFTING_LOG_SIZE: u32 = 4;
+
+    fn seed() -> SaltSeed {
+        SaltSeed(core::array::from_fn(|i| {
+            M31::from_u32_unchecked(i as u32 + 1)
+        }))
+    }
+
+    fn columns() -> Vec<Vec<BaseField>> {
+        (2..=LIFTING_LOG_SIZE)
+            .map(|log_size| (0..1u32 << log_size).map(M31::from_u32_unchecked).collect())
+            .collect()
+    }
+
+    fn column_log_sizes() -> Vec<u32> {
+        (2..=LIFTING_LOG_SIZE).collect()
+    }
+
+    type Prover = MerkleProverLifted<CpuBackend, Blake2sMerkleHasher>;
+
+    #[test]
+    fn salted_decommitment_verifies() {
+        let cols = columns();
+        let seed = seed();
+        let merkle = Prover::commit_salted(cols.iter().collect(), LIFTING_LOG_SIZE, 0, &seed);
+        let queries = vec![1usize, 5, 11];
+        let (values, decommitment) = merkle.decommit_salted(&queries, cols.iter().collect(), &seed);
+        let verifier = MerkleVerifierLifted::new(merkle.root(), column_log_sizes(), None);
+
+        verifier
+            .verify(&queries, values, decommitment.decommitment)
+            .unwrap();
+    }
+
+    #[test]
+    fn salting_changes_the_root() {
+        let cols = columns();
+        let unsalted = Prover::commit(cols.iter().collect(), LIFTING_LOG_SIZE, 0);
+        let salted = Prover::commit_salted(cols.iter().collect(), LIFTING_LOG_SIZE, 0, &seed());
+
+        assert_ne!(unsalted.root(), salted.root());
+    }
+
+    #[test]
+    fn tampered_salt_is_rejected() {
+        let cols = columns();
+        let seed = seed();
+        let merkle = Prover::commit_salted(cols.iter().collect(), LIFTING_LOG_SIZE, 0, &seed);
+        let queries = vec![1usize, 5, 11];
+        let (values, mut decommitment) =
+            merkle.decommit_salted(&queries, cols.iter().collect(), &seed);
+        decommitment.decommitment.salts[0] = Blake2sHash::default();
+        let verifier = MerkleVerifierLifted::new(merkle.root(), column_log_sizes(), None);
+
+        assert_eq!(
+            verifier
+                .verify(&queries, values, decommitment.decommitment)
+                .unwrap_err(),
+            MerkleVerificationError::RootMismatch
+        );
+    }
+
+    #[test]
+    fn unsalted_decommitment_is_rejected_against_a_salted_root() {
+        let cols = columns();
+        let salted = Prover::commit_salted(cols.iter().collect(), LIFTING_LOG_SIZE, 0, &seed());
+        let queries = vec![1usize, 5, 11];
+        // Decommit without salts (as a non-hiding prover would): the verifier rebuilds unsalted
+        // leaves, which cannot match the salted root.
+        let (values, decommitment) = salted.decommit(&queries, cols.iter().collect());
+        let verifier = MerkleVerifierLifted::new(salted.root(), column_log_sizes(), None);
+
+        assert_eq!(
+            verifier
+                .verify(&queries, values, decommitment.decommitment)
+                .unwrap_err(),
+            MerkleVerificationError::RootMismatch
+        );
+    }
+
+    #[test]
+    fn distinct_seeds_give_distinct_roots() {
+        let cols = columns();
+        let root_a = Prover::commit_salted(cols.iter().collect(), LIFTING_LOG_SIZE, 0, &seed());
+        let other = SaltSeed(core::array::from_fn(|i| {
+            M31::from_u32_unchecked(i as u32 + 100)
+        }));
+        let root_b = Prover::commit_salted(cols.iter().collect(), LIFTING_LOG_SIZE, 0, &other);
+
+        assert_ne!(root_a.root(), root_b.root());
+    }
+
+    #[test]
+    fn salt_seed_has_target_entropy() {
+        // 8 base-field limbs ≈ 248 bits, above the 128-bit hiding target.
+        assert!(ZK_SALT_SEED_LEN * 31 >= 128);
     }
 }

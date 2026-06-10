@@ -17,6 +17,8 @@ use crate::core::poly::circle::CanonicCoset;
 use crate::core::utils::MaybeOwned;
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::ExtendedMerkleDecommitmentLifted;
+#[cfg(feature = "zk")]
+use crate::core::verifier::PREPROCESSED_TRACE_IDX;
 use crate::core::ColumnVec;
 use crate::prover::air::component_prover::{Poly, Trace, WeightsHashMap};
 use crate::prover::backend::{BackendForChannel, Col};
@@ -27,6 +29,9 @@ use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation};
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::vcs_lifted::prover::MerkleProverLifted;
+use crate::prover::vcs_lifted::zk::SaltSeed;
+#[cfg(feature = "zk")]
+use crate::prover::vcs_lifted::zk::ZkRng;
 
 pub mod quotient_ops;
 
@@ -38,6 +43,10 @@ pub struct CommitmentSchemeProver<'a, B: BackendForChannel<MC>, MC: MerkleChanne
     pub store_polynomials_coefficients: bool,
     /// Pre-allocated base field column pool for polynomial evaluation during commit.
     pub base_column_pool: MaybeOwned<'a, BaseColumnPool<B>>,
+    /// Secret CSPRNG for zero-knowledge salts. `Some` iff `config.zk`. Used to draw a fresh salt
+    /// seed for each witness-bearing (non-preprocessed) commitment tree. See `docs/zk.md`.
+    #[cfg(feature = "zk")]
+    zk_rng: Option<ZkRng>,
 }
 impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a, B, MC> {
     /// Creates a new empty commitment scheme prover with the given configuration and twiddles. The
@@ -49,6 +58,8 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             twiddles,
             store_polynomials_coefficients: false,
             base_column_pool: MaybeOwned::Owned(BaseColumnPool::new()),
+            #[cfg(feature = "zk")]
+            zk_rng: config.zk.then(ZkRng::from_os),
         }
     }
 
@@ -63,7 +74,24 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             twiddles,
             store_polynomials_coefficients: false,
             base_column_pool: MaybeOwned::Borrowed(base_column_pool),
+            #[cfg(feature = "zk")]
+            zk_rng: config.zk.then(ZkRng::from_os),
         }
+    }
+
+    /// Draws a fresh secret salt seed for the next commitment tree, or `None` when zk is disabled
+    /// or the tree is the preprocessed tree (index 0, which is public and never salted).
+    #[cfg_attr(not(feature = "zk"), allow(unused_variables))]
+    fn draw_tree_salt_seed(&mut self, tree_index: usize) -> Option<SaltSeed> {
+        #[cfg(feature = "zk")]
+        {
+            if tree_index != PREPROCESSED_TRACE_IDX {
+                if let Some(rng) = self.zk_rng.as_mut() {
+                    return Some(rng.draw_salt_seed());
+                }
+            }
+        }
+        None
     }
 
     /// Sets the commitment scheme to store the polynomials coefficients starting from the next
@@ -76,13 +104,15 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
     /// the channel, and appends the resulting tree to the scheme.
     fn commit(&mut self, polynomials: ColumnVec<CircleCoefficients<B>>, channel: &mut MC::C) {
         let _span = span!(Level::INFO, "Commitment").entered();
-        let tree = CommitmentTreeProver::new(
+        let salt_seed = self.draw_tree_salt_seed(self.trees.len());
+        let tree = CommitmentTreeProver::new_impl(
             polynomials,
             self.config.fri_config.log_blowup_factor,
             self.twiddles,
             self.store_polynomials_coefficients,
             self.config.lifting_log_size,
             &self.base_column_pool,
+            salt_seed,
         );
         MC::mix_root(channel, tree.commitment.root());
         self.trees.push(MaybeOwned::Owned(tree));
@@ -354,6 +384,9 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> TreeBuilder<'_, '_, B, MC> {
 pub struct CommitmentTreeProver<B: BackendForChannel<MC>, MC: MerkleChannel> {
     pub polynomials: ColumnVec<Poly<B>>,
     pub commitment: MerkleProverLifted<B, MC::H>,
+    /// Secret salt seed used to commit this tree's leaves; `Some` iff the tree is hiding. Retained
+    /// so [`Self::decommit`] can reveal the salts for opened positions. See `docs/zk.md`.
+    pub salt_seed: Option<SaltSeed>,
 }
 
 impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
@@ -364,6 +397,27 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         store_polynomials_coefficients: bool,
         lifting_log_size: Option<u32>,
         base_column_pool: &BaseColumnPool<B>,
+    ) -> Self {
+        Self::new_impl(
+            polynomials,
+            log_blowup_factor,
+            twiddles,
+            store_polynomials_coefficients,
+            lifting_log_size,
+            base_column_pool,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_impl(
+        polynomials: ColumnVec<CircleCoefficients<B>>,
+        log_blowup_factor: u32,
+        twiddles: &TwiddleTree<B>,
+        store_polynomials_coefficients: bool,
+        lifting_log_size: Option<u32>,
+        base_column_pool: &BaseColumnPool<B>,
+        salt_seed: Option<SaltSeed>,
     ) -> Self {
         let span = span!(Level::INFO, "Extension").entered();
         let polynomials = B::evaluate_polynomials(
@@ -382,18 +436,20 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .max()
             .unwrap_or_default();
         let lifting_log_size = lifting_log_size.unwrap_or(max_log_domain_size);
-        let tree = MerkleProverLifted::commit(
-            polynomials
-                .iter()
-                .map(|poly: &Poly<B>| &poly.evals.values)
-                .collect(),
-            lifting_log_size,
-            0,
-        );
+        let columns: Vec<&Col<B, BaseField>> = polynomials
+            .iter()
+            .map(|poly: &Poly<B>| &poly.evals.values)
+            .collect();
+        let tree = match &salt_seed {
+            #[cfg(feature = "zk")]
+            Some(seed) => MerkleProverLifted::commit_salted(columns, lifting_log_size, 0, seed),
+            _ => MerkleProverLifted::commit(columns, lifting_log_size, 0),
+        };
 
         CommitmentTreeProver {
             polynomials,
             commitment: tree,
+            salt_seed,
         }
     }
 
@@ -413,7 +469,11 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
             .iter()
             .map(|poly| &poly.evals.values)
             .collect_vec();
-        self.commitment.decommit(queries, eval_vec)
+        match &self.salt_seed {
+            #[cfg(feature = "zk")]
+            Some(seed) => self.commitment.decommit_salted(queries, eval_vec, seed),
+            _ => self.commitment.decommit(queries, eval_vec),
+        }
     }
 }
 

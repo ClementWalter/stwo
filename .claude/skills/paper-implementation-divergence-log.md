@@ -187,6 +187,32 @@ Risk: SOUNDNESS (for Blake example only — constraints may be under-specified)
 Status: OPEN
 Notes: Example code only, but users may copy patterns from examples.
 
+### DIVERGENCE-011: Hiding (salted) Merkle commitments under the `zk` feature
+
+Paper: Ben-Sasson, Chiesa, Spooner, *Interactive Oracle Proofs* (BCS16),
+eprint 2016/116 §3 (salted-leaf hiding); Haböck & Al-Kindi, eprint 2024/1037
+(overall zk construction). Design notes: `docs/zk.md`.
+
+Code: `crates/stwo/src/prover/vcs_lifted/prover.rs` and
+`crates/stwo/src/core/vcs_lifted/verifier.rs` — when the `zk` feature is on and
+`PcsConfig.zk` is true, each Merkle leaf is committed as
+`salted_i = hash_children(leaf_i, salt_i)` with `salt_i` a secret per-leaf hash
+derived from a CSPRNG seed; opened leaves carry `salt_i` in the decommitment.
+
+Type: Intentional deviation (adds hiding; preserves binding)
+Risk: NEUTRAL for soundness (binding reduces to collision-resistance of
+`hash_children`, the same assumption as the rest of the tree). This is
+necessary-but-not-sufficient for zero-knowledge — it does not by itself hide
+opened values (queried/OODS/FRI values), which requires the deferred witness and
+FRI-mask randomization (`docs/zk.md`, Phases 3–5).
+Status: OPEN — Phase 1 of the zk migration. Phases 3–5 (FRI mask `R`, witness
+randomization, composition randomization) touch SOUNDNESS-CRITICAL FRI/quotient
+code and are specified in `docs/zk.md` pending human approval.
+Notes: With the `zk` feature off, the code and proof bytes are identical to
+current stwo (ethproofs unaffected). With the feature on but `PcsConfig.zk`
+false (inner recursion proofs), the root and Fiat-Shamir transcript are
+byte-identical to the non-zk path; only the outermost proof enables zk.
+
 ## Resolved Divergences
 
 ### DIVERGENCE-005 (see above)

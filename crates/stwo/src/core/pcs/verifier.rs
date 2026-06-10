@@ -100,6 +100,31 @@ impl<MC: MerkleChannel> CommitmentSchemeVerifier<MC> {
                 })
                 .collect::<Vec<_>>(),
         );
+        // Fail-closed: when zk is enabled, every witness-bearing (non-preprocessed, non-empty)
+        // tree must carry per-leaf salts. A non-salted decommitment cannot pass against a salted
+        // root anyway, but this also rejects a non-hiding proof presented to a zk verifier. See
+        // `docs/zk.md`.
+        #[cfg(feature = "zk")]
+        if self.config.zk {
+            for (i, (tree, decommitment)) in self
+                .trees
+                .iter()
+                .zip(proof.decommitments.iter())
+                .enumerate()
+            {
+                if i != crate::core::verifier::PREPROCESSED_TRACE_IDX
+                    && tree.height > 0
+                    && decommitment.salts.is_empty()
+                {
+                    return Err(VerificationError::InvalidStructure(
+                        std_shims::ToString::to_string(
+                            &"zero-knowledge enabled but a witness tree carries no salts",
+                        ),
+                    ));
+                }
+            }
+        }
+
         // Verify decommitments.
         self.trees
             .as_ref()

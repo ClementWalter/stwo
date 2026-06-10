@@ -39,6 +39,12 @@ pub struct PcsConfig {
     /// (an implicit assumption here is that the largest domains are all of equal size across
     /// trees, except possibly for the preprocessed tree).
     pub lifting_log_size: Option<u32>,
+    /// Enables zero-knowledge: hiding (salted) commitments for the witness-bearing trees. Off by
+    /// default; only the outermost proof of a recursion chain needs it. When false (or when the
+    /// `zk` feature is disabled), proofs and the Fiat-Shamir transcript are byte-identical to
+    /// non-zk stwo. See `docs/zk.md`.
+    #[cfg(feature = "zk")]
+    pub zk: bool,
 }
 impl PcsConfig {
     pub const fn security_bits(&self) -> u32 {
@@ -50,6 +56,8 @@ impl PcsConfig {
             pow_bits,
             fri_config,
             lifting_log_size,
+            #[cfg(feature = "zk")]
+            zk,
         } = self;
         let FriConfig {
             log_blowup_factor,
@@ -58,6 +66,13 @@ impl PcsConfig {
             fold_step,
         } = fri_config;
 
+        // The zk flag occupies a previously-zero slot of the config commitment, so the transcript
+        // is bit-identical to non-zk stwo whenever zk is off (or the feature is disabled).
+        #[cfg(feature = "zk")]
+        let zk_marker = *zk as u32;
+        #[cfg(not(feature = "zk"))]
+        let zk_marker = 0;
+
         channel.mix_felts(&[
             SecureField::from_u32_unchecked(
                 *pow_bits,
@@ -65,7 +80,12 @@ impl PcsConfig {
                 *n_queries as u32,
                 *log_last_layer_degree_bound,
             ),
-            SecureField::from_u32_unchecked(*fold_step, lifting_log_size.unwrap_or(0), 0, 0),
+            SecureField::from_u32_unchecked(
+                *fold_step,
+                lifting_log_size.unwrap_or(0),
+                zk_marker,
+                0,
+            ),
         ]);
     }
 }
@@ -76,6 +96,8 @@ impl Default for PcsConfig {
             pow_bits: 10,
             fri_config: FriConfig::new(0, 1, 3, 1),
             lifting_log_size: None,
+            #[cfg(feature = "zk")]
+            zk: false,
         }
     }
 }
@@ -88,6 +110,7 @@ mod tests {
             pow_bits: 42,
             fri_config: super::FriConfig::new(10, 10, 70, 1),
             lifting_log_size: None,
+            ..Default::default()
         };
         assert!(config.security_bits() == 10 * 70 + 42);
     }

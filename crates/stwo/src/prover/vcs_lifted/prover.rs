@@ -3,6 +3,9 @@ use itertools::Itertools;
 use tracing::{span, Level};
 
 use super::ops::MerkleOpsLifted;
+#[cfg(feature = "zk")]
+use super::zk::salts_for_positions;
+use super::zk::{fold_salts, SaltSeed};
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SECURE_EXTENSION_DEGREE;
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
@@ -36,6 +39,34 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         lifting_log_size: u32,
         log_rows_per_leaf: u32,
     ) -> Self {
+        Self::commit_impl(columns, lifting_log_size, log_rows_per_leaf, None)
+    }
+
+    /// Same as [`Self::commit`], but commits hiding (salted) leaves: each leaf
+    /// hash `leaf_i` is replaced by `hash_children(leaf_i, salt_i)` with a secret
+    /// per-leaf salt derived from `salt_seed`. The tree height and inner-layer
+    /// structure are unchanged. See `docs/zk.md`.
+    #[cfg(feature = "zk")]
+    pub fn commit_salted(
+        columns: Vec<&Col<B, BaseField>>,
+        lifting_log_size: u32,
+        log_rows_per_leaf: u32,
+        salt_seed: &SaltSeed,
+    ) -> Self {
+        Self::commit_impl(
+            columns,
+            lifting_log_size,
+            log_rows_per_leaf,
+            Some(salt_seed),
+        )
+    }
+
+    fn commit_impl(
+        columns: Vec<&Col<B, BaseField>>,
+        lifting_log_size: u32,
+        log_rows_per_leaf: u32,
+        salt_seed: Option<&SaltSeed>,
+    ) -> Self {
         let _span = span!(Level::TRACE, "Merkle", class = "MerkleCommitment").entered();
         if columns.is_empty() {
             return Self {
@@ -68,6 +99,12 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
             layers.push(B::build_leaves(&sorted_columns, lifting_log_size));
         }
 
+        // Hiding: fold a secret per-leaf salt into the leaf layer before building
+        // the tree. Binding is preserved (collision-resistance of hash_children).
+        if let Some(seed) = salt_seed {
+            layers[0] = fold_salts::<B, H>(&layers[0], seed);
+        }
+
         (0..lifting_log_size).for_each(|_| {
             layers.push(B::build_next_layer(layers.last().unwrap()));
         });
@@ -94,6 +131,36 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
         &self,
         query_positions: &[usize],
         columns: Vec<&Col<B, BaseField>>,
+    ) -> (
+        ColumnVec<Vec<BaseField>>,
+        ExtendedMerkleDecommitmentLifted<H>,
+    ) {
+        self.decommit_impl(query_positions, columns, None)
+    }
+
+    /// Same as [`Self::decommit`], but additionally returns, in the
+    /// decommitment, the secret per-leaf salts for the (deduplicated) opened
+    /// positions, derived from `salt_seed`. Must be paired with a tree committed
+    /// via [`Self::commit_salted`] using the same seed.
+    #[cfg(feature = "zk")]
+    pub fn decommit_salted(
+        &self,
+        query_positions: &[usize],
+        columns: Vec<&Col<B, BaseField>>,
+        salt_seed: &SaltSeed,
+    ) -> (
+        ColumnVec<Vec<BaseField>>,
+        ExtendedMerkleDecommitmentLifted<H>,
+    ) {
+        self.decommit_impl(query_positions, columns, Some(salt_seed))
+    }
+
+    #[cfg_attr(not(feature = "zk"), allow(unused_variables))]
+    fn decommit_impl(
+        &self,
+        query_positions: &[usize],
+        columns: Vec<&Col<B, BaseField>>,
+        salt_seed: Option<&SaltSeed>,
     ) -> (
         ColumnVec<Vec<BaseField>>,
         ExtendedMerkleDecommitmentLifted<H>,
@@ -154,6 +221,18 @@ impl<B: MerkleOpsLifted<H>, H: MerkleHasherLifted> MerkleProverLifted<B, H> {
 
             all_node_values.push(all_node_values_for_layer);
         }
+        // Hiding: attach the salts for the opened (deduplicated) positions, in
+        // the same order the verifier rebuilds leaves.
+        #[cfg(feature = "zk")]
+        let decommitment = {
+            let mut decommitment = decommitment;
+            if let Some(seed) = salt_seed {
+                decommitment.salts =
+                    salts_for_positions::<H>(seed, query_positions.iter().copied().dedup());
+            }
+            decommitment
+        };
+
         (
             queried_values,
             ExtendedMerkleDecommitmentLifted {

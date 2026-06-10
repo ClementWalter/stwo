@@ -162,8 +162,15 @@ impl SizeEstimate for SecureField {
 
 impl<H: MerkleHasherLifted> SizeEstimate for MerkleDecommitmentLifted<H> {
     fn size_estimate(&self) -> usize {
-        let Self { hash_witness } = self;
-        hash_witness.size_estimate()
+        let Self {
+            hash_witness,
+            #[cfg(feature = "zk")]
+            salts,
+        } = self;
+        let estimate = hash_witness.size_estimate();
+        #[cfg(feature = "zk")]
+        let estimate = estimate + salts.size_estimate();
+        estimate
     }
 }
 

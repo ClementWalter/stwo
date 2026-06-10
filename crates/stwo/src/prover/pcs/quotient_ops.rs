@@ -311,6 +311,112 @@ mod tests {
         assert!(prove_and_verify_pcs::<SimdBackend, false>().is_ok());
     }
 
+    /// Builds a zk PCS proof over a preprocessed tree (index 0, unsalted) and a witness tree
+    /// (salted), returning the proof and the data needed to verify it. See `docs/zk.md`.
+    #[cfg(feature = "zk")]
+    #[allow(clippy::type_complexity)]
+    fn build_zk_pcs_proof<B: BackendForChannel<Blake2sMerkleChannel>>() -> (
+        crate::core::pcs::quotients::CommitmentSchemeProof<
+            crate::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher,
+        >,
+        Vec<u32>,
+        Vec<u32>,
+        TreeVec<Vec<Vec<crate::core::circle::CirclePoint<SecureField>>>>,
+    ) {
+        const N_COLS: usize = 6;
+        const LIFTING_LOG_SIZE: u32 = 8;
+
+        let config = PcsConfig {
+            zk: true,
+            ..Default::default()
+        };
+        let twiddles = B::precompute_twiddles(
+            CanonicCoset::new(LIFTING_LOG_SIZE + config.fri_config.log_blowup_factor).half_coset(),
+        );
+        let mut channel = Blake2sChannel::default();
+        let mut commitment_scheme =
+            CommitmentSchemeProver::<B, Blake2sMerkleChannel>::new(config, &twiddles);
+
+        // Tree 0: preprocessed (public, never salted). Tree 1: witness trace (salted under zk).
+        let polys0 = prepare_polys::<B, N_COLS, LIFTING_LOG_SIZE>();
+        let sizes0 = polys0.iter().map(|poly| poly.log_size()).collect_vec();
+        let mut tree_builder = commitment_scheme.tree_builder();
+        tree_builder.extend_polys(polys0);
+        tree_builder.commit(&mut channel);
+
+        let polys1 = prepare_polys::<B, N_COLS, LIFTING_LOG_SIZE>();
+        let sizes1 = polys1.iter().map(|poly| poly.log_size()).collect_vec();
+        let mut tree_builder = commitment_scheme.tree_builder();
+        tree_builder.extend_polys(polys1);
+        tree_builder.commit(&mut channel);
+
+        let mut rng = SmallRng::seed_from_u64(1);
+        let mut tree_points = || {
+            (0..N_COLS)
+                .map(|_| vec![SECURE_FIELD_CIRCLE_GEN.mul(rng.gen::<u128>())])
+                .collect_vec()
+        };
+        let sampled_points = TreeVec(vec![tree_points(), tree_points()]);
+
+        let proof = commitment_scheme
+            .prove_values(sampled_points.clone(), &mut channel)
+            .proof;
+        (proof, sizes0, sizes1, sampled_points)
+    }
+
+    #[cfg(feature = "zk")]
+    fn verify_zk_pcs_proof(
+        proof: crate::core::pcs::quotients::CommitmentSchemeProof<
+            crate::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasher,
+        >,
+        sizes0: &[u32],
+        sizes1: &[u32],
+        sampled_points: TreeVec<Vec<Vec<crate::core::circle::CirclePoint<SecureField>>>>,
+    ) -> Result<(), VerificationError> {
+        let config = PcsConfig {
+            zk: true,
+            ..Default::default()
+        };
+        let mut channel = Blake2sChannel::default();
+        let mut verifier = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
+        verifier.commit(proof.commitments[0], sizes0, &mut channel);
+        verifier.commit(proof.commitments[1], sizes1, &mut channel);
+        verifier.verify_values(sampled_points, proof, &mut channel)
+    }
+
+    #[cfg(feature = "zk")]
+    #[test]
+    fn test_pcs_prove_and_verify_zk_cpu() {
+        let (proof, sizes0, sizes1, sampled_points) = build_zk_pcs_proof::<CpuBackend>();
+        assert!(verify_zk_pcs_proof(proof, &sizes0, &sizes1, sampled_points).is_ok());
+    }
+
+    #[cfg(feature = "zk")]
+    #[test]
+    fn test_zk_salts_the_witness_tree_but_not_the_preprocessed_tree() {
+        let (proof, ..) = build_zk_pcs_proof::<CpuBackend>();
+        let placement = (
+            proof.decommitments[0].salts.is_empty(),
+            proof.decommitments[1].salts.is_empty(),
+        );
+
+        // Preprocessed tree unsalted (true), witness tree salted (false).
+        assert_eq!(placement, (true, false));
+    }
+
+    #[cfg(feature = "zk")]
+    #[test]
+    fn test_zk_verifier_rejects_a_witness_tree_without_salts() {
+        let (mut proof, sizes0, sizes1, sampled_points) = build_zk_pcs_proof::<CpuBackend>();
+        // A prover that drops the witness tree's salts must be rejected (fail-closed).
+        proof.decommitments[1].salts.clear();
+
+        assert!(matches!(
+            verify_zk_pcs_proof(proof, &sizes0, &sizes1, sampled_points),
+            Err(VerificationError::InvalidStructure(_))
+        ));
+    }
+
     /// Tests that SIMD quotient computation produces low-degree quotients even when the trace
     /// polynomial is very small (subdomain size < N_LANES).
     #[test]
