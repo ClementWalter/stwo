@@ -118,11 +118,9 @@ fn context() -> Option<&'static Mutex<ConstraintContext>> {
     static CONTEXT: OnceLock<Option<Mutex<ConstraintContext>>> = OnceLock::new();
     CONTEXT
         .get_or_init(|| {
-            let device = Device::system_default()?;
-            if !device.has_unified_memory() {
-                return None;
-            }
-            let queue = device.new_command_queue();
+            let shared = super::context::gpu()?;
+            let device = shared.device.clone();
+            let queue = shared.queue.clone();
             Some(Mutex::new(ConstraintContext {
                 device,
                 queue,

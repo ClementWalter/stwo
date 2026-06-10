@@ -112,10 +112,8 @@ fn context() -> Option<&'static Mutex<TwiddleGenContext>> {
     static CONTEXT: OnceLock<Option<Mutex<TwiddleGenContext>>> = OnceLock::new();
     CONTEXT
         .get_or_init(|| {
-            let device = Device::system_default()?;
-            if !device.has_unified_memory() {
-                return None;
-            }
+            let shared = super::context::gpu()?;
+            let device = shared.device.clone();
             let library = device
                 .new_library_with_source(KERNEL_SOURCE, &CompileOptions::new())
                 .ok()?;
@@ -123,7 +121,7 @@ fn context() -> Option<&'static Mutex<TwiddleGenContext>> {
             let pipeline = device
                 .new_compute_pipeline_state_with_function(&function)
                 .ok()?;
-            let queue = device.new_command_queue();
+            let queue = shared.queue.clone();
             Some(Mutex::new(TwiddleGenContext {
                 device,
                 queue,

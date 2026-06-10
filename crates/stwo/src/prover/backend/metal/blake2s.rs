@@ -192,10 +192,8 @@ fn context() -> Option<&'static Mutex<MetalContext>> {
     static CONTEXT: OnceLock<Option<Mutex<MetalContext>>> = OnceLock::new();
     CONTEXT
         .get_or_init(|| {
-            let device = Device::system_default()?;
-            if !device.has_unified_memory() {
-                return None;
-            }
+            let shared = super::context::gpu()?;
+            let device = shared.device.clone();
             let library = device
                 .new_library_with_source(KERNEL_SOURCE, &CompileOptions::new())
                 .ok()?;
@@ -207,7 +205,7 @@ fn context() -> Option<&'static Mutex<MetalContext>> {
             let children_pipeline = device
                 .new_compute_pipeline_state_with_function(&children)
                 .ok()?;
-            let queue = device.new_command_queue();
+            let queue = shared.queue.clone();
             Some(Mutex::new(MetalContext {
                 device,
                 queue,
