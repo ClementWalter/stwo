@@ -46,6 +46,25 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         point: CirclePoint<SecureField>,
     ) -> SecureField;
 
+    /// Evaluates the FFT basis polynomials of a polynomial of `log_size` coefficients at
+    /// `point`: entry `i` is the product of the folding factors selected by the bits of
+    /// `i` (most significant bit first), matching the basis under which
+    /// [`Self::eval_at_point`] interprets coefficients. A polynomial's evaluation at
+    /// `point` is then the dot product of its coefficients with this column, letting the
+    /// basis be shared by all polynomials of the same size sampled at the same point.
+    fn eval_basis_at_point(
+        log_size: u32,
+        point: CirclePoint<SecureField>,
+    ) -> Col<Self, SecureField>;
+
+    /// Evaluates the polynomial from its coefficients and a precomputed FFT basis column
+    /// for the sampled point (see [`Self::eval_basis_at_point`]). Returns the same value
+    /// as [`Self::eval_at_point`].
+    fn eval_at_point_with_basis(
+        poly: &CircleCoefficients<Self>,
+        basis: &Col<Self, SecureField>,
+    ) -> SecureField;
+
     /// Computes the weights for Barycentric Lagrange interpolation for point `p` on `coset`.
     /// `p` must not be in the domain.
     /// Used by the [`CircleEvaluation::barycentric_weights()`] function.

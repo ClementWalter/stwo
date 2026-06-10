@@ -10,6 +10,7 @@ use num_traits::{One, Zero};
 use rayon::prelude::*;
 use tracing::{span, Level};
 
+use super::column::SecureColumn;
 use super::fft::{ifft, rfft, CACHED_FFT_LOG_SIZE, MIN_FFT_LOG_SIZE};
 use super::m31::{PackedBaseField, LOG_N_LANES, N_LANES};
 use super::qm31::PackedSecureField;
@@ -230,6 +231,73 @@ impl PolyOps for SimdBackend {
         };
 
         (sum * twiddle_lows).pointwise_sum()
+    }
+
+    fn eval_basis_at_point(log_size: u32, point: CirclePoint<SecureField>) -> SecureColumn {
+        // Build the scalar prefix on the CPU, then double through the remaining factors
+        // with packed multiplications. Matches CpuBackend::eval_basis_at_point exactly.
+        if log_size <= LOG_N_LANES {
+            return CpuBackend::eval_basis_at_point(log_size, point)
+                .into_iter()
+                .collect();
+        }
+        // Folding factors in [`crate::core::poly::utils::fold`]'s order.
+        let mut mappings = vec![point.y];
+        let mut x = point.x;
+        for _ in 1..log_size {
+            mappings.push(x);
+            x = CirclePoint::double_x(x);
+        }
+        mappings.reverse();
+
+        let (high_mappings, low_mappings) =
+            mappings.split_at(mappings.len() - LOG_N_LANES as usize);
+        let prefix: Vec<SecureField> = {
+            let mut basis = Vec::with_capacity(N_LANES);
+            basis.push(SecureField::one());
+            for &m in low_mappings.iter().rev() {
+                let len = basis.len();
+                for i in 0..len {
+                    basis.push(basis[i] * m);
+                }
+            }
+            basis
+        };
+        let mut data: Vec<PackedSecureField> = Vec::with_capacity(1 << (log_size - LOG_N_LANES));
+        data.push(PackedSecureField::from_array(std::array::from_fn(|i| {
+            prefix[i]
+        })));
+        for &m in high_mappings.iter().rev() {
+            let len = data.len();
+            let packed_m = PackedSecureField::broadcast(m);
+            #[cfg(feature = "parallel")]
+            if len >= 1 << 11 {
+                let mut high: Vec<PackedSecureField> = Vec::with_capacity(len);
+                data[..len]
+                    .par_iter()
+                    .map(|&b| b * packed_m)
+                    .collect_into_vec(&mut high);
+                data.extend_from_slice(&high);
+                continue;
+            }
+            for i in 0..len {
+                data.push(data[i] * packed_m);
+            }
+        }
+        SecureColumn {
+            length: 1 << log_size,
+            data,
+        }
+    }
+
+    fn eval_at_point_with_basis(
+        poly: &CircleCoefficients<Self>,
+        basis: &SecureColumn,
+    ) -> SecureField {
+        assert_eq!(poly.coeffs.len(), basis.len());
+        let sum = zip(&poly.coeffs.data, &basis.data)
+            .fold(PackedSecureField::zero(), |acc, (&c, &b)| acc + b * c);
+        sum.pointwise_sum()
     }
 
     fn barycentric_weights(
@@ -616,6 +684,48 @@ fn slow_eval_at_point(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn eval_at_point_with_basis_matches_eval_at_point() {
+        use rand::rngs::SmallRng;
+        use rand::{Rng, SeedableRng};
+
+        use crate::prover::backend::CpuBackend;
+
+        let mut rng = SmallRng::seed_from_u64(7);
+        for log_size in 1..=10u32 {
+            let coeffs: Vec<BaseField> = (0..1 << log_size)
+                .map(|_| BaseField::from(rng.gen::<u32>() >> 1))
+                .collect();
+            let point = crate::core::circle::SECURE_FIELD_CIRCLE_GEN;
+
+            let cpu_poly =
+                crate::prover::poly::circle::CircleCoefficients::<CpuBackend>::new(coeffs.clone());
+            let cpu_basis = <CpuBackend as PolyOps>::eval_basis_at_point(log_size, point);
+            assert_eq!(
+                <CpuBackend as PolyOps>::eval_at_point_with_basis(&cpu_poly, &cpu_basis),
+                <CpuBackend as PolyOps>::eval_at_point(&cpu_poly, point),
+                "cpu log_size {log_size}"
+            );
+
+            // The SIMD slow-eval fallback assumes larger sizes; compare against the CPU
+            // value, which the CPU assertion above already ties to eval_at_point.
+            let simd_poly = crate::prover::poly::circle::CircleCoefficients::<SimdBackend>::new(
+                coeffs.into_iter().collect(),
+            );
+            let simd_basis = <SimdBackend as PolyOps>::eval_basis_at_point(log_size, point);
+            assert_eq!(
+                <SimdBackend as PolyOps>::eval_at_point_with_basis(&simd_poly, &simd_basis),
+                <CpuBackend as PolyOps>::eval_at_point(&cpu_poly, point),
+                "simd log_size {log_size}"
+            );
+            assert_eq!(
+                cpu_basis,
+                simd_basis.to_cpu(),
+                "basis mismatch log_size {log_size}"
+            );
+        }
+    }
     use itertools::Itertools;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};

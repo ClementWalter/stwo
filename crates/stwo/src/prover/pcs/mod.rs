@@ -172,6 +172,47 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         weights_dashmap
     }
 
+    /// Builds, for every distinct (coefficients log size, folded sample point) pair, the
+    /// FFT-basis column used to evaluate stored coefficients out of domain. The map has
+    /// the same shape as the barycentric weights map; which of the two a value is depends
+    /// on `store_polynomials_coefficients`.
+    pub fn build_eval_basis_map(
+        &self,
+        sampled_points: &TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
+        max_log_size: u32,
+    ) -> WeightsHashMap<B>
+    where
+        Col<B, SecureField>: Send + Sync,
+    {
+        let basis_map = WeightsHashMap::<B>::new();
+
+        self.polynomials()
+            .zip_cols(sampled_points)
+            .map_cols(|(poly, points)| {
+                let Some(coeffs) = &poly.coeffs else {
+                    return;
+                };
+                let log_size = coeffs.log_size();
+                let eval_log_size = poly.evals.domain.log_size();
+                #[cfg(not(feature = "parallel"))]
+                points.iter().for_each(|&point| {
+                    let folded = point.repeated_double(max_log_size - eval_log_size);
+                    basis_map
+                        .entry((log_size, folded))
+                        .or_insert_with(|| B::eval_basis_at_point(log_size, folded));
+                });
+                #[cfg(feature = "parallel")]
+                points.par_iter().for_each(|&point| {
+                    let folded = point.repeated_double(max_log_size - eval_log_size);
+                    basis_map
+                        .entry((log_size, folded))
+                        .or_insert_with(|| B::eval_basis_at_point(log_size, folded));
+                });
+            });
+
+        basis_map
+    }
+
     pub fn prove_values(
         mut self,
         sampled_points: TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
@@ -187,7 +228,9 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
 
         let lifting_log_size = self.trees.last().unwrap().commitment.layers.len() as u32 - 1;
         let weights_hash_map = if self.store_polynomials_coefficients {
-            None
+            // With stored coefficients, share one FFT-basis column per
+            // (coefficient size, folded point) across all polynomials sampled there.
+            Some(self.build_eval_basis_map(&sampled_points, lifting_log_size))
         } else {
             Some(self.build_weights_hash_map(&sampled_points, lifting_log_size))
         };
