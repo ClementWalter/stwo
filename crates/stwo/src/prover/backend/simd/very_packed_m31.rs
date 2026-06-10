@@ -111,6 +111,25 @@ impl From<VeryPackedM31> for VeryPackedQM31 {
     }
 }
 
+/// Broadcast conversions for scalar-lane vectors, used by the batched CPU evaluator.
+impl<const N: usize> From<M31> for Vectorized<M31, N> {
+    fn from(value: M31) -> Self {
+        Self::from_fn(|_| value)
+    }
+}
+
+impl<const N: usize> From<QM31> for Vectorized<QM31, N> {
+    fn from(value: QM31) -> Self {
+        Self::from_fn(|_| value)
+    }
+}
+
+impl<const N: usize> From<Vectorized<M31, N>> for Vectorized<QM31, N> {
+    fn from(value: Vectorized<M31, N>) -> Self {
+        Self::from_fn(|i| QM31::from(value.0[i]))
+    }
+}
+
 impl From<QM31> for VeryPackedQM31 {
     #[inline(always)]
     fn from(value: QM31) -> Self {
