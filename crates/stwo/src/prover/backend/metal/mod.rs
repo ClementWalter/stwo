@@ -5,6 +5,7 @@
 
 pub(crate) mod blake2s;
 pub(crate) mod fft;
+pub(crate) mod quotients;
 
 /// Initializes the GPU device and compiles the kernel pipelines (a one-time cost of
 /// ~100ms) so the first commitment doesn't pay it. Safe to call from any thread; a
@@ -12,4 +13,5 @@ pub(crate) mod fft;
 pub fn warmup() {
     blake2s::warmup();
     fft::warmup();
+    quotients::warmup();
 }
