@@ -1,4 +1,3 @@
-use std::iter::zip;
 use std::{array, mem};
 
 use bytemuck::allocation::cast_vec;
@@ -280,12 +279,30 @@ impl SecureColumn {
 
         let length = self.length;
         let packed_length = self.data.len();
-        let mut columns = array::from_fn(|_| Vec::with_capacity(packed_length));
+        let mut columns: [Vec<PackedBaseField>; SECURE_EXTENSION_DEGREE] =
+            array::from_fn(|_| unsafe { crate::core::utils::uninit_vec(packed_length) });
 
-        for v in self.data {
-            let packed_coords = v.into_packed_m31s();
-            zip(&mut columns, packed_coords).for_each(|(col, packed_coord)| col.push(packed_coord));
-        }
+        // Unpack coordinates in parallel chunks; every slot is written exactly once.
+        let [c0, c1, c2, c3] = &mut columns;
+        #[cfg(feature = "parallel")]
+        let iter = (self.data.par_iter())
+            .zip(c0.par_iter_mut())
+            .zip(c1.par_iter_mut())
+            .zip(c2.par_iter_mut())
+            .zip(c3.par_iter_mut());
+        #[cfg(not(feature = "parallel"))]
+        let iter = (self.data.iter())
+            .zip(c0.iter_mut())
+            .zip(c1.iter_mut())
+            .zip(c2.iter_mut())
+            .zip(c3.iter_mut());
+        iter.for_each(|((((v, d0), d1), d2), d3)| {
+            let [p0, p1, p2, p3] = v.into_packed_m31s();
+            *d0 = p0;
+            *d1 = p1;
+            *d2 = p2;
+            *d3 = p3;
+        });
 
         SecureColumnByCoords {
             columns: columns.map(|col| BaseColumn { data: col, length }),
