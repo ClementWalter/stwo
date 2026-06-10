@@ -7,10 +7,11 @@ use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::utils::uninit_vec;
 use stwo::core::ColumnVec;
+use stwo::prover::backend::simd::cm31::PackedCM31;
 use stwo::prover::backend::simd::column::SecureColumn;
 use stwo::prover::backend::simd::m31::{PackedBaseField, LOG_N_LANES, N_LANES};
 use stwo::prover::backend::simd::prefix_sum::inclusive_prefix_sum;
-use stwo::prover::backend::simd::qm31::{batch_inverse_packed_qm31, PackedSecureField};
+use stwo::prover::backend::simd::qm31::{batch_inverse_packed_qm31, PackedQM31, PackedSecureField};
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::Column;
 use stwo::prover::poly::circle::CircleEvaluation;
@@ -108,6 +109,115 @@ impl LogupTraceGenerator {
             numerator,
         }
         .finalize_col();
+    }
+
+    /// Generates `n_cols` lookup columns at once from `frac_at(col, vec_row) ->
+    /// (numerator, denominator)`.
+    ///
+    /// Parallelizes over contiguous row bands instead of per-column passes: each band
+    /// computes, for every column in order, the fractions, a band-local batch inverse,
+    /// the `numerator * denom^-1` values and the running cross-column sums. This is a
+    /// single fork-join with cache-hot chaining, instead of three parallel passes per
+    /// column. The resulting columns are identical to `n_cols` successive
+    /// `col_from_iter` calls.
+    pub fn cols_from_fn(
+        &mut self,
+        n_cols: usize,
+        frac_at: impl Fn(usize, usize) -> (PackedSecureField, PackedSecureField) + Sync,
+    ) {
+        if n_cols == 0 {
+            return;
+        }
+        let length = 1usize << self.log_size;
+        let packed_len = length >> LOG_N_LANES;
+        // Band-local batch inversion keeps one field inversion per band per column while
+        // the buffers (BAND * 64B) stay cache resident.
+        const BAND: usize = 1 << 9;
+
+        let prev_col = self.trace.last();
+
+        let mut new_cols: Vec<SecureColumnByCoords<SimdBackend>> = (0..n_cols)
+            .map(|_| unsafe { SecureColumnByCoords::<SimdBackend>::uninitialized(length) })
+            .collect();
+
+        // Split every new column into disjoint per-band coordinate slices.
+        let mut col_band_iters = new_cols
+            .iter_mut()
+            .map(|c| {
+                let [a, b, cc, d] = &mut c.columns;
+                [
+                    a.data.chunks_mut(BAND),
+                    b.data.chunks_mut(BAND),
+                    cc.data.chunks_mut(BAND),
+                    d.data.chunks_mut(BAND),
+                ]
+            })
+            .collect_vec();
+        let n_bands = packed_len.div_ceil(BAND);
+        let mut bands: Vec<(usize, Vec<[&mut [PackedBaseField]; 4]>)> = (0..n_bands)
+            .map(|band_idx| {
+                (
+                    band_idx * BAND,
+                    col_band_iters
+                        .iter_mut()
+                        .map(|its| its.each_mut().map(|it| it.next().unwrap()))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        let process_band = |(band_start, cols): &mut (usize, Vec<[&mut [PackedBaseField]; 4]>)| {
+            let band_start = *band_start;
+            let band_len = cols[0][0].len();
+            let mut denoms = vec![PackedSecureField::zero(); band_len];
+            let mut denom_invs = vec![PackedSecureField::zero(); band_len];
+            // Running cross-column sums for this band's rows, seeded from the previous
+            // existing column if any.
+            let mut acc: Vec<PackedSecureField> = match prev_col {
+                Some(col) => (0..band_len)
+                    .map(|i| unsafe { col.packed_at(band_start + i) })
+                    .collect(),
+                None => vec![PackedSecureField::zero(); band_len],
+            };
+
+            for (col_idx, col) in cols.iter_mut().enumerate() {
+                for (i, denom_slot) in denoms.iter_mut().enumerate() {
+                    let (numerator, denom) = frac_at(col_idx, band_start + i);
+                    debug_assert!(
+                        denom.to_array().iter().all(|x| *x != SecureField::zero()),
+                        "logup denominator is zero at column {col_idx}"
+                    );
+                    *denom_slot = denom;
+                    // Stash the numerator in the output slots until the inverse pass.
+                    let [c0, c1, c2, c3] = numerator.into_packed_m31s();
+                    col[0][i] = c0;
+                    col[1][i] = c1;
+                    col[2][i] = c2;
+                    col[3][i] = c3;
+                }
+                batch_inverse_packed_qm31(&denoms, &mut denom_invs);
+                for (i, inv) in denom_invs.iter().enumerate() {
+                    let numerator = PackedQM31([
+                        PackedCM31([col[0][i], col[1][i]]),
+                        PackedCM31([col[2][i], col[3][i]]),
+                    ]);
+                    let value = numerator * *inv + acc[i];
+                    acc[i] = value;
+                    let [c0, c1, c2, c3] = value.into_packed_m31s();
+                    col[0][i] = c0;
+                    col[1][i] = c1;
+                    col[2][i] = c2;
+                    col[3][i] = c3;
+                }
+            }
+        };
+
+        #[cfg(feature = "parallel")]
+        bands.par_iter_mut().for_each(process_band);
+        #[cfg(not(feature = "parallel"))]
+        bands.iter_mut().for_each(process_band);
+
+        self.trace.append(&mut new_cols);
     }
 
     /// Finalize the trace. Returns the trace and the total sum of the last column.
