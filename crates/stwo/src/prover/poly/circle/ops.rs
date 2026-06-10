@@ -14,6 +14,13 @@ use crate::prover::poly::twiddles::{TwiddleBuffer, TwiddleTree};
 use crate::prover::poly::BitReversedOrder;
 
 /// Operations on BaseField polynomials.
+/// A committed column, either as evaluations on its canonic domain (to be interpolated)
+/// or as already-interpolated coefficients.
+pub enum EvalsOrCoeffs<B: ColumnOps<BaseField>> {
+    Evals(CircleEvaluation<B, BaseField, BitReversedOrder>),
+    Coeffs(CircleCoefficients<B>),
+}
+
 pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
     // TODO(alont): Use a column instead of this type.
     /// The type for precomputed twiddles.
@@ -110,6 +117,49 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         twiddles: &TwiddleTree<Self>,
         buffer: Col<Self, BaseField>,
     ) -> CircleEvaluation<Self, BaseField, BitReversedOrder>;
+
+    /// Interpolates committed evaluations (where needed) and low-degree extends every
+    /// column to its blowup domain in a single parallel pass, keeping each column's
+    /// coefficients cache-hot between the two transforms.
+    fn interpolate_and_evaluate_polynomials(
+        columns: Vec<EvalsOrCoeffs<Self>>,
+        log_blowup_factor: u32,
+        twiddles: &TwiddleTree<Self>,
+        store_polynomials_coefficients: bool,
+        pool: &BaseColumnPool<Self>,
+    ) -> Vec<Poly<Self>>
+    where
+        Self: crate::prover::backend::Backend,
+    {
+        // Pre-take all buffers from the pool before the parallel section.
+        let buffers: Vec<_> = columns
+            .iter()
+            .map(|column| {
+                let log_eval_size = match column {
+                    EvalsOrCoeffs::Evals(evals) => evals.domain.log_size(),
+                    EvalsOrCoeffs::Coeffs(coeffs) => coeffs.log_size(),
+                } + log_blowup_factor;
+                pool.take_or_alloc(log_eval_size)
+            })
+            .collect();
+
+        #[cfg(feature = "parallel")]
+        let iter = columns.into_par_iter().zip(buffers.into_par_iter());
+        #[cfg(not(feature = "parallel"))]
+        let iter = columns.into_iter().zip(buffers);
+
+        iter.map(|(column, buffer)| {
+            let poly_coeffs = match column {
+                EvalsOrCoeffs::Evals(evals) => evals.interpolate_with_twiddles(twiddles),
+                EvalsOrCoeffs::Coeffs(coeffs) => coeffs,
+            };
+            let domain =
+                CanonicCoset::new(poly_coeffs.log_size() + log_blowup_factor).circle_domain();
+            let evals = Self::evaluate_into(&poly_coeffs, domain, twiddles, buffer);
+            Poly::new(store_polynomials_coefficients.then_some(poly_coeffs), evals)
+        })
+        .collect()
+    }
 
     fn evaluate_polynomials(
         polynomials: ColumnVec<CircleCoefficients<Self>>,
