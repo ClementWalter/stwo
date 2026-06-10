@@ -33,6 +33,35 @@ impl QuotientOps for CpuBackend {
         let quotient_constants = quotient_constants(sample_batches);
 
         for (batch, coeffs) in zip(sample_batches, quotient_constants.line_coeffs) {
+            // Apple-GPU path: the whole batch accumulated in one GPU submission.
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            if subdomain_size
+                >= 1 << crate::prover::backend::metal::quotients::MIN_METAL_QUOTIENT_LOG_SIZE
+            {
+                let col_slices: Vec<&[BaseField]> = batch
+                    .cols_vals_randpows
+                    .iter()
+                    .map(|data| columns[data.column_index].values.as_slice())
+                    .collect();
+                let coeff_cs: Vec<SecureField> = coeffs.iter().map(|(_, _, c)| *c).collect();
+                let b_sum: SecureField = coeffs.iter().map(|(_, b, _)| *b).sum();
+                if let Some(partial_numerators_acc) =
+                    crate::prover::backend::metal::quotients::accumulate_numerators_metal(
+                        &col_slices,
+                        &coeff_cs,
+                        -b_sum,
+                        subdomain_size,
+                    )
+                {
+                    let first_linear_term_acc: SecureField = coeffs.iter().map(|(a, ..)| a).sum();
+                    accumulated_numerators_vec.push(AccumulatedNumerators {
+                        sample_point: batch.point,
+                        partial_numerators_acc,
+                        first_linear_term_acc,
+                    });
+                    continue;
+                }
+            }
             let mut partial_numerators_acc =
                 unsafe { SecureColumnByCoords::uninitialized(subdomain_size) };
 
