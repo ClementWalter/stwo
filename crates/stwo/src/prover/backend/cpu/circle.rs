@@ -17,12 +17,14 @@ use crate::core::poly::utils::{domain_line_twiddles_from_tree, fold, get_folding
 use crate::core::utils::{bit_reverse, bit_reverse_index};
 use crate::prover::backend::{Col, Column};
 use crate::prover::fri::FriOps;
+use crate::prover::mempool::BaseColumnPool;
 use crate::prover::poly::circle::{
-    CircleCoefficients, CircleEvaluation, PolyOps, SecureEvaluation,
+    CircleCoefficients, CircleEvaluation, EvalsOrCoeffs, PolyOps, SecureEvaluation,
 };
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::secure_column::SecureColumnByCoords;
+use crate::prover::Poly;
 
 impl PolyOps for CpuBackend {
     type Twiddles = Vec<BaseField>;
@@ -98,6 +100,78 @@ impl PolyOps for CpuBackend {
         mappings.reverse();
 
         fold(&poly.coeffs, &mappings)
+    }
+
+    /// Interpolates and low-degree extends committed columns through the shared SIMD FFT
+    /// kernels when the columns are large enough: a column's values are copied once into
+    /// an aligned packed buffer, transformed, and handed back without further copies. The
+    /// scalar transforms remain the implementation of [`PolyOps::interpolate`] /
+    /// [`PolyOps::evaluate`] and a reference test pins both paths equal.
+    fn interpolate_and_evaluate_polynomials(
+        columns: Vec<EvalsOrCoeffs<Self>>,
+        log_blowup_factor: u32,
+        twiddles: &TwiddleTree<Self>,
+        store_polynomials_coefficients: bool,
+        pool: &BaseColumnPool<Self>,
+    ) -> Vec<Poly<Self>> {
+        use crate::prover::backend::simd::column::BaseColumn;
+        use crate::prover::backend::simd::SimdBackend;
+        use crate::prover::poly::circle::CircleEvaluation as GenericCircleEvaluation;
+
+        const MIN_SIMD_DISPATCH_LOG_SIZE: u32 = 10;
+        let all_large = columns.iter().all(|column| {
+            let log_size = match column {
+                EvalsOrCoeffs::Evals(evals) => evals.domain.log_size(),
+                EvalsOrCoeffs::Coeffs(coeffs) => coeffs.log_size(),
+            };
+            log_size >= MIN_SIMD_DISPATCH_LOG_SIZE
+        });
+        if columns.is_empty() || !all_large {
+            // Fall back to the scalar single-pass default.
+            return fallback_interpolate_and_evaluate_polynomials(
+                columns,
+                log_blowup_factor,
+                twiddles,
+                store_polynomials_coefficients,
+                pool,
+            );
+        }
+
+        // One packed twiddle tree per commitment, shared by all of its columns.
+        let simd_twiddles = SimdBackend::precompute_twiddles(twiddles.root_coset);
+
+        let process = |column: EvalsOrCoeffs<Self>| {
+            let simd_coeffs = match column {
+                EvalsOrCoeffs::Evals(evals) => {
+                    let domain = evals.domain;
+                    let packed = BaseColumn::from_cpu(&evals.values);
+                    GenericCircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
+                        domain, packed,
+                    )
+                    .interpolate_with_twiddles(&simd_twiddles)
+                }
+                EvalsOrCoeffs::Coeffs(coeffs) => {
+                    crate::prover::poly::circle::CircleCoefficients::<SimdBackend>::new(
+                        coeffs.coeffs.into_iter().collect(),
+                    )
+                }
+            };
+            let ext_domain =
+                CanonicCoset::new(simd_coeffs.log_size() + log_blowup_factor).circle_domain();
+            let evals = simd_coeffs.evaluate_with_twiddles(ext_domain, &simd_twiddles);
+            let evals = CircleEvaluation::<Self, BaseField, BitReversedOrder>::new(
+                ext_domain,
+                evals.values.into_cpu_vec(),
+            );
+            let coeffs = store_polynomials_coefficients
+                .then(|| CircleCoefficients::<Self>::new(simd_coeffs.coeffs.into_cpu_vec()));
+            Poly::new(coeffs, evals)
+        };
+
+        #[cfg(feature = "parallel")]
+        return columns.into_par_iter().map(process).collect();
+        #[cfg(not(feature = "parallel"))]
+        columns.into_iter().map(process).collect()
     }
 
     fn eval_basis_at_point(log_size: u32, point: CirclePoint<SecureField>) -> Vec<SecureField> {
@@ -690,5 +764,102 @@ mod tests {
             sampled_barycentric_values, sampled_values,
             "Barycentric evaluation should be equal to the polynomial evaluation"
         );
+    }
+}
+
+/// Scalar single-pass interpolation + extension, the default behavior of
+/// [`PolyOps::interpolate_and_evaluate_polynomials`]; used for small columns and as the
+/// reference for the SIMD-dispatched path.
+fn fallback_interpolate_and_evaluate_polynomials(
+    columns: Vec<EvalsOrCoeffs<CpuBackend>>,
+    log_blowup_factor: u32,
+    twiddles: &TwiddleTree<CpuBackend>,
+    store_polynomials_coefficients: bool,
+    pool: &BaseColumnPool<CpuBackend>,
+) -> Vec<Poly<CpuBackend>> {
+    let buffers: Vec<_> = columns
+        .iter()
+        .map(|column| {
+            let log_eval_size = match column {
+                EvalsOrCoeffs::Evals(evals) => evals.domain.log_size(),
+                EvalsOrCoeffs::Coeffs(coeffs) => coeffs.log_size(),
+            } + log_blowup_factor;
+            pool.take_or_alloc(log_eval_size)
+        })
+        .collect();
+
+    #[cfg(feature = "parallel")]
+    let iter = columns.into_par_iter().zip(buffers.into_par_iter());
+    #[cfg(not(feature = "parallel"))]
+    let iter = columns.into_iter().zip(buffers);
+
+    iter.map(|(column, buffer)| {
+        let poly_coeffs = match column {
+            EvalsOrCoeffs::Evals(evals) => evals.interpolate_with_twiddles(twiddles),
+            EvalsOrCoeffs::Coeffs(coeffs) => coeffs,
+        };
+        let domain = CanonicCoset::new(poly_coeffs.log_size() + log_blowup_factor).circle_domain();
+        let evals = <CpuBackend as PolyOps>::evaluate_into(&poly_coeffs, domain, twiddles, buffer);
+        Poly::new(store_polynomials_coefficients.then_some(poly_coeffs), evals)
+    })
+    .collect()
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use itertools::Itertools;
+
+    use super::*;
+    use crate::core::poly::circle::CanonicCoset;
+    use crate::prover::poly::circle::{CircleEvaluation, EvalsOrCoeffs, PolyOps};
+    use crate::prover::poly::BitReversedOrder;
+
+    /// The SIMD-dispatched fused interpolation+extension must produce exactly the scalar
+    /// path's coefficients and evaluations, across the dispatch size threshold.
+    #[test]
+    fn simd_dispatched_commit_matches_scalar() {
+        for log_size in [5u32, 9, 10, 12] {
+            let twiddles = CpuBackend::precompute_twiddles(
+                CanonicCoset::new(log_size + 1).circle_domain().half_coset,
+            );
+            let domain = CanonicCoset::new(log_size).circle_domain();
+            let make_columns = || {
+                (0..3usize)
+                    .map(|c| {
+                        let values = (0..1 << log_size)
+                            .map(|i| BaseField::from(((i + 1) * (c + 7)) as u32))
+                            .collect_vec();
+                        EvalsOrCoeffs::Evals(CircleEvaluation::<
+                            CpuBackend,
+                            BaseField,
+                            BitReversedOrder,
+                        >::new(domain, values))
+                    })
+                    .collect_vec()
+            };
+            let pool = BaseColumnPool::new();
+            let dispatched = <CpuBackend as PolyOps>::interpolate_and_evaluate_polynomials(
+                make_columns(),
+                1,
+                &twiddles,
+                true,
+                &pool,
+            );
+            let scalar = fallback_interpolate_and_evaluate_polynomials(
+                make_columns(),
+                1,
+                &twiddles,
+                true,
+                &pool,
+            );
+            for (d, s) in dispatched.iter().zip(scalar.iter()) {
+                assert_eq!(d.evals.values, s.evals.values, "evals log_size {log_size}");
+                assert_eq!(
+                    d.coeffs.as_ref().unwrap().coeffs,
+                    s.coeffs.as_ref().unwrap().coeffs,
+                    "coeffs log_size {log_size}"
+                );
+            }
+        }
     }
 }
