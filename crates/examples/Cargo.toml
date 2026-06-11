@@ -6,6 +6,7 @@ license.workspace = true
 description = "Example implementations using the STWO prover"
 
 [features]
+metal = ["stwo/metal", "stwo-constraint-framework/metal", "dep:metal"]
 parallel = ["dep:rayon", "stwo/parallel"]
 tracing = ["stwo/tracing"]
 slow-tests = []
@@ -38,3 +39,6 @@ test-log = { version = "0.2.15", features = ["trace"] }
 [[bench]]
 harness = false
 name = "poseidon"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.33", optional = true }

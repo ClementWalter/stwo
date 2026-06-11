@@ -23,7 +23,7 @@ use crate::prover::backend::{BackendForChannel, Col};
 use crate::prover::fri::{FriDecommitResult, FriProver};
 use crate::prover::mempool::BaseColumnPool;
 use crate::prover::pcs::quotient_ops::compute_fri_quotients;
-use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation};
+use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, EvalsOrCoeffs};
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::vcs_lifted::prover::MerkleProverLifted;
@@ -72,12 +72,12 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         self.store_polynomials_coefficients = true;
     }
 
-    /// Evaluates the given polynomials, commits them into a Merkle tree, mixes the root into
-    /// the channel, and appends the resulting tree to the scheme.
-    fn commit(&mut self, polynomials: ColumnVec<CircleCoefficients<B>>, channel: &mut MC::C) {
+    /// Interpolates and evaluates the given columns, commits them into a Merkle tree,
+    /// mixes the root into the channel, and appends the resulting tree to the scheme.
+    fn commit(&mut self, columns: ColumnVec<EvalsOrCoeffs<B>>, channel: &mut MC::C) {
         let _span = span!(Level::INFO, "Commitment").entered();
         let tree = CommitmentTreeProver::new(
-            polynomials,
+            columns,
             self.config.fri_config.log_blowup_factor,
             self.twiddles,
             self.store_polynomials_coefficients,
@@ -172,6 +172,111 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         weights_dashmap
     }
 
+    /// Builds, for every distinct (coefficients log size, folded sample point) pair, the
+    /// FFT-basis column used to evaluate stored coefficients out of domain. The map has
+    /// the same shape as the barycentric weights map; which of the two a value is depends
+    /// on `store_polynomials_coefficients`.
+    pub fn build_eval_basis_map(
+        &self,
+        sampled_points: &TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
+        max_log_size: u32,
+    ) -> WeightsHashMap<B>
+    where
+        Col<B, SecureField>: Send + Sync,
+    {
+        let basis_map = WeightsHashMap::<B>::new();
+
+        self.polynomials()
+            .zip_cols(sampled_points)
+            .map_cols(|(poly, points)| {
+                let Some(coeffs) = &poly.coeffs else {
+                    return;
+                };
+                let log_size = coeffs.log_size();
+                let eval_log_size = poly.evals.domain.log_size();
+                #[cfg(not(feature = "parallel"))]
+                points.iter().for_each(|&point| {
+                    let folded = point.repeated_double(max_log_size - eval_log_size);
+                    basis_map
+                        .entry((log_size, folded))
+                        .or_insert_with(|| B::eval_basis_at_point(log_size, folded));
+                });
+                #[cfg(feature = "parallel")]
+                points.par_iter().for_each(|&point| {
+                    let folded = point.repeated_double(max_log_size - eval_log_size);
+                    basis_map
+                        .entry((log_size, folded))
+                        .or_insert_with(|| B::eval_basis_at_point(log_size, folded));
+                });
+            });
+
+        basis_map
+    }
+
+    /// Evaluates every committed polynomial at its sampled points from stored
+    /// coefficients, grouping all same-size columns sampled at one folded point so the
+    /// backend streams their shared FFT-basis column once per group.
+    fn batched_coefficient_samples(
+        &self,
+        sampled_points: &TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
+        basis_map: &WeightsHashMap<B>,
+        lifting_log_size: u32,
+    ) -> TreeVec<Vec<Vec<PointSample>>> {
+        use num_traits::Zero;
+
+        // (tree index, column index, point index) entries grouped per shared basis.
+        type SampleGroups = HashMap<(u32, CirclePoint<SecureField>), Vec<(usize, usize, usize)>>;
+
+        let polys = self.polynomials();
+        let mut groups: SampleGroups = HashMap::new();
+        for (t, (cols, pts_cols)) in polys.iter().zip(sampled_points.iter()).enumerate() {
+            for (c, (poly, points)) in cols.iter().zip(pts_cols.iter()).enumerate() {
+                let coeffs = poly.coeffs.as_ref().expect("coefficients stored");
+                for (pi, &point) in points.iter().enumerate() {
+                    let folded =
+                        point.repeated_double(lifting_log_size - poly.evals.domain.log_size());
+                    groups
+                        .entry((coeffs.log_size(), folded))
+                        .or_default()
+                        .push((t, c, pi));
+                }
+            }
+        }
+
+        let mut samples: TreeVec<Vec<Vec<PointSample>>> =
+            sampled_points.as_cols_ref().map_cols(|points| {
+                points
+                    .iter()
+                    .map(|&point| PointSample {
+                        point,
+                        value: SecureField::zero(),
+                    })
+                    .collect_vec()
+            });
+        // Groups are few (one per (size, folded point)); each backend call parallelizes
+        // internally over rows.
+        for ((log_size, folded), entries) in groups {
+            let group_start = std::time::Instant::now();
+            let group_polys = entries
+                .iter()
+                .map(|&(t, c, _)| polys[t][c].coeffs.as_ref().unwrap())
+                .collect_vec();
+            let basis = basis_map
+                .get(&(log_size, folded))
+                .expect("basis built for all sampled points");
+            let values = B::eval_many_at_point_with_basis(&group_polys, &basis);
+            for (&(t, c, pi), value) in entries.iter().zip(values) {
+                samples[t][c][pi].value = value;
+            }
+            tracing::info!(
+                "OOD group: log_size={log_size} cols={} in {:?}",
+                entries.len(),
+                group_start.elapsed()
+            );
+        }
+        samples
+    }
+
     pub fn prove_values(
         mut self,
         sampled_points: TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
@@ -186,11 +291,15 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         .entered();
 
         let lifting_log_size = self.trees.last().unwrap().commitment.layers.len() as u32 - 1;
+        let basis_span = span!(Level::INFO, "OOD basis", class = "OodBasis").entered();
         let weights_hash_map = if self.store_polynomials_coefficients {
-            None
+            // With stored coefficients, share one FFT-basis column per
+            // (coefficient size, folded point) across all polynomials sampled there.
+            Some(self.build_eval_basis_map(&sampled_points, lifting_log_size))
         } else {
             Some(self.build_weights_hash_map(&sampled_points, lifting_log_size))
         };
+        basis_span.exit();
 
         // Lambda that evaluates a polynomial on a collection of circle points and returns a vector
         // of point samples.
@@ -207,16 +316,29 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 .collect_vec()
         };
 
-        #[cfg(not(feature = "parallel"))]
-        let samples: TreeVec<Vec<Vec<PointSample>>> = self
-            .polynomials()
-            .zip_cols(&sampled_points)
-            .map_cols(eval_at_points);
-        #[cfg(feature = "parallel")]
-        let samples: TreeVec<Vec<Vec<PointSample>>> = self
-            .polynomials()
-            .zip_cols(&sampled_points)
-            .par_map_cols(eval_at_points);
+        let samples: TreeVec<Vec<Vec<PointSample>>> = if self.store_polynomials_coefficients {
+            // All same-size columns sampled at one (folded) point share an FFT-basis
+            // column; grouping them lets the backend stream that basis once for the
+            // whole group instead of once per column.
+            self.batched_coefficient_samples(
+                &sampled_points,
+                weights_hash_map.as_ref().unwrap(),
+                lifting_log_size,
+            )
+        } else {
+            #[cfg(not(feature = "parallel"))]
+            {
+                self.polynomials()
+                    .zip_cols(&sampled_points)
+                    .map_cols(eval_at_points)
+            }
+            #[cfg(feature = "parallel")]
+            {
+                self.polynomials()
+                    .zip_cols(&sampled_points)
+                    .par_map_cols(eval_at_points)
+            }
+        };
 
         span.exit();
         let sampled_values = samples
@@ -315,18 +437,24 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
 pub struct TreeBuilder<'a, 'b, B: BackendForChannel<MC>, MC: MerkleChannel> {
     tree_index: usize,
     commitment_scheme: &'a mut CommitmentSchemeProver<'b, B, MC>,
-    polys: ColumnVec<CircleCoefficients<B>>,
+    polys: ColumnVec<EvalsOrCoeffs<B>>,
 }
 impl<B: BackendForChannel<MC>, MC: MerkleChannel> TreeBuilder<'_, '_, B, MC> {
+    /// Registers evaluations for commitment. Interpolation happens fused with the
+    /// low-degree extension when the tree is committed.
     pub fn extend_evals(
         &mut self,
         columns: Vec<CircleEvaluation<B, BaseField, BitReversedOrder>>,
     ) -> TreeSubspan {
-        let span = span!(Level::INFO, "Interpolation for commitment").entered();
-        let polys = B::interpolate_columns(columns, self.commitment_scheme.twiddles);
-        span.exit();
-
-        self.extend_polys(polys)
+        let col_start = self.polys.len();
+        self.polys
+            .extend(columns.into_iter().map(EvalsOrCoeffs::Evals));
+        let col_end = self.polys.len();
+        TreeSubspan {
+            tree_index: self.tree_index,
+            col_start,
+            col_end,
+        }
     }
 
     pub fn extend_polys(
@@ -334,7 +462,8 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> TreeBuilder<'_, '_, B, MC> {
         columns: impl IntoIterator<Item = CircleCoefficients<B>>,
     ) -> TreeSubspan {
         let col_start = self.polys.len();
-        self.polys.extend(columns);
+        self.polys
+            .extend(columns.into_iter().map(EvalsOrCoeffs::Coeffs));
         let col_end = self.polys.len();
         TreeSubspan {
             tree_index: self.tree_index,
@@ -358,16 +487,81 @@ pub struct CommitmentTreeProver<B: BackendForChannel<MC>, MC: MerkleChannel> {
 
 impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
     pub fn new(
-        polynomials: ColumnVec<CircleCoefficients<B>>,
+        columns: ColumnVec<EvalsOrCoeffs<B>>,
         log_blowup_factor: u32,
         twiddles: &TwiddleTree<B>,
         store_polynomials_coefficients: bool,
         lifting_log_size: Option<u32>,
         base_column_pool: &BaseColumnPool<B>,
     ) -> Self {
+        // Apple-GPU chained commitment: interpolation, extension, Merkle leaves and
+        // tree layers in one submission with one wait (CpuBackend + blake2s only).
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        let columns = {
+            use std::any::TypeId;
+
+            use crate::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasherGeneric;
+            let is_cpu = TypeId::of::<B>() == TypeId::of::<crate::prover::backend::CpuBackend>();
+            let is_m31 = TypeId::of::<MC::H>() == TypeId::of::<Blake2sMerkleHasherGeneric<true>>();
+            let is_bytes =
+                TypeId::of::<MC::H>() == TypeId::of::<Blake2sMerkleHasherGeneric<false>>();
+            if is_cpu && (is_m31 || is_bytes) {
+                // Safety: TypeId equality makes these transmutes identity conversions.
+                type CpuCols = Vec<EvalsOrCoeffs<crate::prover::backend::CpuBackend>>;
+                let cpu_columns: CpuCols = unsafe { std::mem::transmute_copy(&columns) };
+                std::mem::forget(columns);
+                let cpu_twiddles: &TwiddleTree<crate::prover::backend::CpuBackend> =
+                    unsafe { std::mem::transmute(twiddles) };
+                let span = span!(Level::INFO, "Extension").entered();
+                let result = crate::prover::backend::metal::commit::commit_polynomials_metal(
+                    cpu_columns,
+                    log_blowup_factor,
+                    cpu_twiddles,
+                    store_polynomials_coefficients,
+                    lifting_log_size,
+                    is_m31,
+                );
+                span.exit();
+                match result {
+                    Ok((cpu_polys, Some(mut cpu_layers))) => {
+                        let _span = span!(Level::INFO, "Merkle").entered();
+                        cpu_layers.reverse();
+                        // Safety: identity conversions under the TypeId checks above.
+                        let polynomials: ColumnVec<Poly<B>> =
+                            unsafe { std::mem::transmute_copy(&cpu_polys) };
+                        std::mem::forget(cpu_polys);
+                        let layers: Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>> =
+                            unsafe { std::mem::transmute_copy(&cpu_layers) };
+                        std::mem::forget(cpu_layers);
+                        return CommitmentTreeProver {
+                            polynomials,
+                            commitment: crate::prover::vcs_lifted::prover::MerkleProverLifted {
+                                layers,
+                            },
+                        };
+                    }
+                    Ok((cpu_polys, None)) => {
+                        // Transforms ran; only the tree fell back. Build it normally.
+                        let polynomials: ColumnVec<Poly<B>> =
+                            unsafe { std::mem::transmute_copy(&cpu_polys) };
+                        std::mem::forget(cpu_polys);
+                        return Self::commit_polynomials(polynomials, lifting_log_size);
+                    }
+                    Err(cpu_columns) => {
+                        let columns: ColumnVec<EvalsOrCoeffs<B>> =
+                            unsafe { std::mem::transmute_copy(&cpu_columns) };
+                        std::mem::forget(cpu_columns);
+                        columns
+                    }
+                }
+            } else {
+                columns
+            }
+        };
+
         let span = span!(Level::INFO, "Extension").entered();
-        let polynomials = B::evaluate_polynomials(
-            polynomials,
+        let polynomials = B::interpolate_and_evaluate_polynomials(
+            columns,
             log_blowup_factor,
             twiddles,
             store_polynomials_coefficients,
@@ -375,6 +569,11 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         );
         span.exit();
 
+        Self::commit_polynomials(polynomials, lifting_log_size)
+    }
+
+    /// Builds the Merkle commitment over already-extended polynomials.
+    fn commit_polynomials(polynomials: ColumnVec<Poly<B>>, lifting_log_size: Option<u32>) -> Self {
         let _span = span!(Level::INFO, "Merkle").entered();
         let max_log_domain_size = polynomials
             .iter()

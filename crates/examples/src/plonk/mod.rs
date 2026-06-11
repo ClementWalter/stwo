@@ -262,6 +262,7 @@ pub fn prove_fibonacci_plonk(
     );
 
     let proof = prove(&[&component], channel, commitment_scheme).unwrap();
+    crate::maybe_dump_proof_hash("simd_plonk", &proof);
 
     (component, proof)
 }

@@ -250,28 +250,35 @@ pub fn column_line_coeffs(
 /// For each sample point P, computes the equation of a line passing through P = (pₓ, pᵧ) ∈
 /// QM31 x QM31 and its conjugate P̄ = (p̄ₓ, p̄ᵧ), where the conjugate of an element of QM31 is with
 /// respect to CM31. Then evaluates the line equation at `domain_point`.
-pub fn denominator_inverses(
+/// Computes, for each sample point P, the line-equation expression whose inverse appears
+/// in the quotient denominator, evaluated at `domain_point`.
+///
+/// To find the equation of the line through P and P̄: a point Q = (qₓ, qᵧ) is on the line iff P -
+/// Q is parallel to P - P̄ = (pₓ - p̄ₓ, pᵧ - p̄ᵧ), which is a multiple of (Im(pₓ), Im(pᵧ)).
+/// We have P - Q  = ((Re(pₓ) - qₓ) + u * Im(pₓ), (Re(pᵧ) - qᵧ) + u * Im(pᵧ)). The parallelism
+/// check reduces to
+///      (Re(pₓ) - qₓ) * Im(pᵧ) - (Re(pᵧ) - qᵧ) * Im(pₓ) = 0.
+/// Note that this expression, evaluated at an arbitrary Q with M31 coordinates, is an element of
+/// CM31.
+pub fn denominators(
     sample_points: &[CirclePoint<SecureField>],
     domain_point: CirclePoint<M31>,
-) -> Vec<CM31> {
-    let mut denominators = Vec::new();
-
-    // To find the equation of the line through P and P̄: a point Q = (qₓ, qᵧ) is on the line iff P -
-    // Q is parallel to P - P̄ = (pₓ - p̄ₓ, pᵧ - p̄ᵧ), which is a multiple of (Im(pₓ), Im(pᵧ)).
-    // We have P - Q  = ((Re(pₓ) - qₓ) + u * Im(pₓ), (Re(pᵧ) - qᵧ) + u * Im(pᵧ)). The parallelism
-    // check reduces to
-    //      (Re(pₓ) - qₓ) * Im(pᵧ) - (Re(pᵧ) - qᵧ) * Im(pₓ) = 0.
-    // Note that this expression, evaluated at an arbitrary Q with M31 coordinates, is an element of
-    // CM31.
-    for sample_point in sample_points {
+) -> impl Iterator<Item = CM31> + '_ {
+    sample_points.iter().map(move |sample_point| {
         // Extract Re(pₓ), Re(pᵧ), Im(pₓ), Im(pᵧ).
         let prx = sample_point.x.0;
         let pry = sample_point.y.0;
         let pix = sample_point.x.1;
         let piy = sample_point.y.1;
-        denominators.push((prx - domain_point.x) * piy - (pry - domain_point.y) * pix);
-    }
+        (prx - domain_point.x) * piy - (pry - domain_point.y) * pix
+    })
+}
 
+pub fn denominator_inverses(
+    sample_points: &[CirclePoint<SecureField>],
+    domain_point: CirclePoint<M31>,
+) -> Vec<CM31> {
+    let denominators: Vec<CM31> = denominators(sample_points, domain_point).collect();
     CM31::batch_inverse(&denominators)
 }
 

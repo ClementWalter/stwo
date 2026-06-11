@@ -69,8 +69,15 @@ impl EvalAtRow for CpuDomainEvaluator<'_> {
         offsets.map(|off| {
             // If the offset is 0, we can just return the value directly from this row.
             if off == 0 {
-                let col = &self.trace_eval[interaction][col_index];
-                return col[self.row];
+                // Safety: `interaction`, `col_index` and `row` are within their
+                // respective bounds by construction (mirrors the SIMD evaluator).
+                unsafe {
+                    let col = self
+                        .trace_eval
+                        .get_unchecked(interaction)
+                        .get_unchecked(col_index);
+                    return *col.values.get_unchecked(self.row);
+                }
             }
             // Otherwise, we need to look up the value at the offset.
             // Since the domain is bit-reversed circle domain ordered, we need to look up the value

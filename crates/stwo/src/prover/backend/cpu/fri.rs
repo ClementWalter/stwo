@@ -1,8 +1,12 @@
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 use super::CpuBackend;
 use crate::core::circle::Coset;
 use crate::core::fft::ibutterfly;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
+use crate::core::fields::FieldExpOps;
 use crate::core::poly::line::LineDomain;
 use crate::core::utils::bit_reverse_index;
 use crate::prover::fri::FriOps;
@@ -12,14 +16,79 @@ use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::secure_column::SecureColumnByCoords;
 
+/// Size from which CPU folds dispatch to the shared SIMD kernels.
+const SIMD_FOLD_DISPATCH_LOG_SIZE: u32 = 12;
+
+fn secure_column_to_simd(
+    values: &SecureColumnByCoords<CpuBackend>,
+) -> SecureColumnByCoords<crate::prover::backend::simd::SimdBackend> {
+    use crate::prover::backend::simd::column::BaseColumn;
+    SecureColumnByCoords {
+        columns: std::array::from_fn(|i| BaseColumn::from_cpu(&values.columns[i])),
+    }
+}
+
+fn secure_column_to_cpu(
+    values: SecureColumnByCoords<crate::prover::backend::simd::SimdBackend>,
+) -> SecureColumnByCoords<CpuBackend> {
+    SecureColumnByCoords {
+        columns: values.columns.map(|column| column.into_cpu_vec()),
+    }
+}
+
 impl FriOps for CpuBackend {
     fn fold_line(
         eval: &LineEvaluation<Self>,
         alphas: &[SecureField],
-        _twiddles: &TwiddleTree<Self>,
+        twiddles: &TwiddleTree<Self>,
     ) -> LineEvaluation<Self> {
         let fold_step = alphas.len();
         assert!(fold_step >= 1);
+
+        // Apple-GPU path: one kernel per fold step; bit-identical to the scalar fold.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if eval.len() / 2 >= 1 << crate::prover::backend::metal::fri::MIN_METAL_FOLD_LOG_SIZE {
+            let mut domain = eval.domain();
+            let mut values = None;
+            let mut ok = true;
+            for &alpha in alphas {
+                let src = values.as_ref().unwrap_or(&eval.values);
+                match crate::prover::backend::metal::fri::fold_metal(
+                    src,
+                    domain.coset(),
+                    false,
+                    alpha,
+                ) {
+                    Some(folded) => {
+                        values = Some(folded);
+                        domain = domain.double();
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                if let Some(values) = values {
+                    return LineEvaluation::new(domain, values);
+                }
+            }
+        }
+
+        // Large folds dispatch to the shared SIMD kernels (cached packed twiddles); the
+        // scalar folds below remain the reference, pinned equal by the fri tests.
+        if eval.len().ilog2() >= SIMD_FOLD_DISPATCH_LOG_SIZE {
+            use crate::prover::backend::simd::SimdBackend;
+            let simd_twiddles = super::circle::cached_simd_twiddles(twiddles.root_coset);
+            let simd_eval = LineEvaluation::<SimdBackend>::new(
+                eval.domain(),
+                secure_column_to_simd(&eval.values),
+            );
+            let folded = SimdBackend::fold_line(&simd_eval, alphas, &simd_twiddles);
+            let domain = folded.domain();
+            return LineEvaluation::new(domain, secure_column_to_cpu(folded.values));
+        }
 
         let mut res = fold_line_cpu(eval, alphas[0]);
         for &alpha in &alphas[1..] {
@@ -31,8 +100,38 @@ impl FriOps for CpuBackend {
     fn fold_circle_into_line(
         src: &SecureEvaluation<Self, BitReversedOrder>,
         alpha: SecureField,
-        _twiddles: &TwiddleTree<Self>,
+        twiddles: &TwiddleTree<Self>,
     ) -> LineEvaluation<Self> {
+        // Apple-GPU path; bit-identical to the scalar fold.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if src.len() / 2 >= 1 << crate::prover::backend::metal::fri::MIN_METAL_FOLD_LOG_SIZE {
+            if let Some(values) = crate::prover::backend::metal::fri::fold_metal(
+                &src.values,
+                src.domain.half_coset,
+                true,
+                alpha,
+            ) {
+                let line_log_size = src.domain.log_size() - 1;
+                return LineEvaluation::new(
+                    LineDomain::new(Coset::half_odds(line_log_size)),
+                    values,
+                );
+            }
+        }
+
+        // Large folds dispatch to the shared SIMD kernels; see [`FriOps::fold_line`].
+        if src.len().ilog2() >= SIMD_FOLD_DISPATCH_LOG_SIZE {
+            use crate::prover::backend::simd::SimdBackend;
+            let simd_twiddles = super::circle::cached_simd_twiddles(twiddles.root_coset);
+            let simd_src = SecureEvaluation::<SimdBackend, BitReversedOrder>::new(
+                src.domain,
+                secure_column_to_simd(&src.values),
+            );
+            let folded = SimdBackend::fold_circle_into_line(&simd_src, alpha, &simd_twiddles);
+            let domain = folded.domain();
+            return LineEvaluation::new(domain, secure_column_to_cpu(folded.values));
+        }
+
         fold_circle_into_line_cpu(src, alpha)
     }
 
@@ -70,23 +169,51 @@ pub fn fold_line_cpu(
     assert!(n >= 2, "Evaluation too small");
 
     let domain = eval.domain();
+    let half_n = n / 2;
+    let folded_values = unsafe { SecureColumnByCoords::<CpuBackend>::uninitialized(half_n) };
+    let mut folded_values = LineEvaluation::new(domain.double(), folded_values);
 
-    let folded_values = eval
-        .values
-        .into_iter()
-        .array_chunks()
-        .enumerate()
-        .map(|(i, [f_x, f_neg_x])| {
-            // TODO(andrew): Inefficient. Update when domain twiddles get stored in a buffer.
-            let x = domain.at(bit_reverse_index(i << 1, domain.log_size()));
+    // Pairs are independent; fold disjoint chunks concurrently, batching each chunk's
+    // domain-point inversions into a single field inversion.
+    let chunk_size = 1 << 10;
+    let mut chunk_views = {
+        let [c0, c1, c2, c3]: &mut [Vec<BaseField>; 4] = &mut folded_values.values.columns;
+        (c0.chunks_mut(chunk_size))
+            .zip(c1.chunks_mut(chunk_size))
+            .zip(c2.chunks_mut(chunk_size))
+            .zip(c3.chunks_mut(chunk_size))
+            .enumerate()
+            .map(|(i, (((d0, d1), d2), d3))| (i * chunk_size, [d0, d1, d2, d3]))
+            .collect::<Vec<_>>()
+    };
 
+    let process_chunk = |(start, chunk): &mut (usize, [&mut [BaseField]; 4])| {
+        let start = *start;
+        let rows = chunk[0].len();
+        let xs: Vec<BaseField> = (0..rows)
+            .map(|idx| domain.at(bit_reverse_index((start + idx) << 1, domain.log_size())))
+            .collect();
+        let x_invs = BaseField::batch_inverse(&xs);
+        for (idx, x_inv) in x_invs.into_iter().enumerate() {
+            let i = start + idx;
+            let f_x = eval.values.at(i << 1);
+            let f_neg_x = eval.values.at((i << 1) + 1);
             let (mut f0, mut f1) = (f_x, f_neg_x);
-            ibutterfly(&mut f0, &mut f1, x.inverse());
-            f0 + alpha * f1
-        })
-        .collect();
+            ibutterfly(&mut f0, &mut f1, x_inv);
+            let [v0, v1, v2, v3] = (f0 + alpha * f1).to_m31_array();
+            chunk[0][idx] = v0;
+            chunk[1][idx] = v1;
+            chunk[2][idx] = v2;
+            chunk[3][idx] = v3;
+        }
+    };
 
-    LineEvaluation::new(domain.double(), folded_values)
+    #[cfg(feature = "parallel")]
+    chunk_views.par_iter_mut().for_each(process_chunk);
+    #[cfg(not(feature = "parallel"))]
+    chunk_views.iter_mut().for_each(process_chunk);
+
+    folded_values
 }
 
 /// TODO: Almost duplicate code of [`crate::core::fri::fold_circle_into_line`]. Consider refactor.
@@ -100,21 +227,52 @@ pub fn fold_circle_into_line_cpu(
     let values = unsafe { SecureColumnByCoords::uninitialized(1 << line_log_size) };
     let mut dst = LineEvaluation::new(dst_domain, values);
 
-    src.values
-        .into_iter()
-        .array_chunks()
-        .enumerate()
-        .for_each(|(i, [f_p, f_neg_p])| {
-            // TODO(andrew): Inefficient. Update when domain twiddles get stored in a buffer.
-            let p = domain.at(bit_reverse_index(i << 1, domain.log_size()));
+    // Pairs are independent; fold disjoint chunks concurrently, batching each chunk's
+    // domain-point inversions into a single field inversion.
+    let chunk_size = 1 << 10;
+    let mut chunk_views = {
+        let [c0, c1, c2, c3]: &mut [Vec<BaseField>; 4] = &mut dst.values.columns;
+        (c0.chunks_mut(chunk_size))
+            .zip(c1.chunks_mut(chunk_size))
+            .zip(c2.chunks_mut(chunk_size))
+            .zip(c3.chunks_mut(chunk_size))
+            .enumerate()
+            .map(|(i, (((d0, d1), d2), d3))| (i * chunk_size, [d0, d1, d2, d3]))
+            .collect::<Vec<_>>()
+    };
 
+    let process_chunk = |(start, chunk): &mut (usize, [&mut [BaseField]; 4])| {
+        let start = *start;
+        let rows = chunk[0].len();
+        let ys: Vec<BaseField> = (0..rows)
+            .map(|idx| {
+                domain
+                    .at(bit_reverse_index((start + idx) << 1, domain.log_size()))
+                    .y
+            })
+            .collect();
+        let y_invs = BaseField::batch_inverse(&ys);
+        for (idx, y_inv) in y_invs.into_iter().enumerate() {
+            let i = start + idx;
+            let f_p = src.values.at(i << 1);
+            let f_neg_p = src.values.at((i << 1) + 1);
             // Calculate `f0(px)` and `f1(px)` such that `2f(p) = f0(px) + py * f1(px)`.
             let (mut f0_px, mut f1_px) = (f_p, f_neg_p);
-            ibutterfly(&mut f0_px, &mut f1_px, p.y.inverse());
+            ibutterfly(&mut f0_px, &mut f1_px, y_inv);
             let f_prime = alpha * f1_px + f0_px;
+            let [v0, v1, v2, v3] = f_prime.to_m31_array();
+            chunk[0][idx] = v0;
+            chunk[1][idx] = v1;
+            chunk[2][idx] = v2;
+            chunk[3][idx] = v3;
+        }
+    };
 
-            dst.values.set(i, f_prime)
-        });
+    #[cfg(feature = "parallel")]
+    chunk_views.par_iter_mut().for_each(process_chunk);
+    #[cfg(not(feature = "parallel"))]
+    chunk_views.iter_mut().for_each(process_chunk);
+
     dst
 }
 

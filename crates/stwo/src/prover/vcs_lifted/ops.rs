@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::core::fields::m31::BaseField;
-use crate::core::fields::qm31::SECURE_EXTENSION_DEGREE;
+use crate::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
 use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::core::vcs_lifted::verifier::PACKED_LEAF_SIZE;
 use crate::prover::backend::{Col, ColumnOps};
+use crate::prover::line::LineEvaluation;
+use crate::prover::poly::twiddles::TwiddleTree;
 
 /// Trait for performing Merkle operations on a commitment scheme.
 pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
@@ -17,6 +19,43 @@ pub trait MerkleOpsLifted<H: MerkleHasherLifted>:
     /// Given a layer of hashes as input, computes a new layer by hashing pairs
     /// of adjacent elements of the input, as in a standard Merkle tree.
     fn build_next_layer(prev_layer: &Col<Self, H::Hash>) -> Col<Self, H::Hash>;
+
+    /// Folds a line evaluation through all `alphas` steps and builds the packed-leaf
+    /// tree of the folded result in one batch (FRI inner-layer shape; the channel only
+    /// needs the tree root, so the whole unit can run between two channel
+    /// interactions). Returns the folded evaluation and the COMPLETE tree layers,
+    /// root-first. `None` (the default) keeps the separate fold + commit path.
+    #[allow(clippy::type_complexity)]
+    fn fold_line_and_packed_tree(
+        _eval: &LineEvaluation<Self>,
+        _alphas: &[SecureField],
+        _twiddles: &TwiddleTree<Self>,
+    ) -> Option<(LineEvaluation<Self>, Vec<Col<Self, H::Hash>>)>
+    where
+        Self: crate::prover::fri::FriOps,
+    {
+        None
+    }
+
+    /// Builds the whole packed-leaf tree (four secure-coordinate columns, four rows
+    /// per leaf) in one batch, layers leaves-first. `None` (the default) keeps the
+    /// separate pack + leaves + layers path.
+    fn build_packed_tree(
+        _columns: &[&Col<Self, BaseField>; SECURE_EXTENSION_DEGREE],
+        _n_layers: u32,
+    ) -> Option<Vec<Col<Self, H::Hash>>> {
+        None
+    }
+
+    /// Builds all `n_layers` tree layers above `leaves` (leaves first). Backends can
+    /// override to batch the whole chain (e.g. one GPU submission).
+    fn build_layers(leaves: Col<Self, H::Hash>, n_layers: u32) -> Vec<Col<Self, H::Hash>> {
+        let mut layers = vec![leaves];
+        (0..n_layers).for_each(|_| {
+            layers.push(Self::build_next_layer(layers.last().unwrap()));
+        });
+        layers
+    }
 }
 
 pub trait PackLeavesOps: ColumnOps<BaseField> {

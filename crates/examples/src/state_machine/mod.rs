@@ -128,6 +128,7 @@ pub fn prove_state_machine(
     };
 
     let stark_proof = prove(&components.component_provers(), channel, commitment_scheme).unwrap();
+    crate::maybe_dump_proof_hash("state_machine", &stark_proof);
     let proof = StateMachineProof {
         public_input: [initial_state, final_state],
         stmt0,

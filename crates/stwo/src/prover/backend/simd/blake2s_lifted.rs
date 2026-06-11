@@ -60,10 +60,95 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
                 lifting_log_size,
             );
         }
+        // A packed column's data is a flat power-of-two run of u32 field representatives.
+        let flat_columns = columns
+            .iter()
+            .map(|column| unsafe {
+                std::slice::from_raw_parts(
+                    column.data.as_ptr() as *const u32,
+                    column.data.len() * N_LANES,
+                )
+            })
+            .collect_vec();
+        build_leaves_from_flat_columns::<IS_M31_OUTPUT>(&flat_columns, lifting_log_size)
+    }
+
+    #[allow(clippy::uninit_vec)]
+    fn build_next_layer(prev_layer: &Vec<Blake2sHash>) -> Vec<Blake2sHash> {
+        build_next_layer_simd::<IS_M31_OUTPUT>(prev_layer)
+    }
+}
+
+/// Single-pass leaf builder for the common case where every column has the same length,
+/// equal to the lifting size. The Blake state stays in registers across all absorb
+/// blocks of a row group, instead of streaming 512B of intermediate state per 16 rows
+/// through memory once per 16-column chunk as the general mixed-size path does.
+#[allow(clippy::uninit_vec)]
+fn build_leaves_uniform<const IS_M31_OUTPUT: bool>(columns: &[&[u32]]) -> Vec<Blake2sHash> {
+    let n_groups = columns[0].len() / N_LANES;
+    let last_chunk_index =
+        (columns.len() - 1) / N_FELTS_IN_BLAKE_MESSAGE * N_FELTS_IN_BLAKE_MESSAGE;
+
+    // Safety: every entry is written exactly once below.
+    let mut res: Vec<Blake2sHash> = unsafe { uninit_vec(n_groups << LOG_N_HASHES_PER_SIMD_STATE) };
+
+    let hash_group = |(i, dst): (usize, &mut [Blake2sHash])| {
+        let mut state = INITIAL_STATE;
+        let mut byte_count = 0_u64;
+        for chunk in columns[..last_chunk_index].chunks(N_FELTS_IN_BLAKE_MESSAGE) {
+            byte_count += N_BYTES_IN_BLAKE_MESSAGE;
+            let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = std::array::from_fn(|j| {
+                u32x16::from_slice(&chunk[j][i * N_LANES..(i + 1) * N_LANES])
+            });
+            state = compress_unfinalized(state, msgs, byte_count);
+        }
+        byte_count += ((columns.len() - last_chunk_index) * N_BYTES_FELT) as u64;
+        let mut msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = unsafe { std::mem::zeroed() };
+        for (j, column) in columns[last_chunk_index..].iter().enumerate() {
+            msgs[j] = u32x16::from_slice(&column[i * N_LANES..(i + 1) * N_LANES]);
+        }
+        let state = compress_finalize(state, msgs, byte_count);
+        let untransposed = if IS_M31_OUTPUT {
+            let tmp = untranspose_states(state);
+            std::array::from_fn(|k| reduce_to_m31_simd(tmp[k]))
+        } else {
+            untranspose_states(state)
+        };
+        let dst: &mut [Blake2sHash; 16] = dst.try_into().unwrap();
+        *dst = unsafe { transmute::<[u32x16; 8], [Blake2sHash; 16]>(untransposed) };
+    };
+
+    #[cfg(feature = "parallel")]
+    res.par_chunks_exact_mut(1 << LOG_N_HASHES_PER_SIMD_STATE)
+        .enumerate()
+        .for_each(hash_group);
+    #[cfg(not(feature = "parallel"))]
+    res.chunks_exact_mut(1 << LOG_N_HASHES_PER_SIMD_STATE)
+        .enumerate()
+        .for_each(hash_group);
+
+    res
+}
+
+/// Computes the lifted-tree leaves for blake2s over flat `u32` field-representative
+/// columns (each a power-of-two length, sorted increasingly, all >= [`N_LANES`]),
+/// hashing 16 rows per SIMD state. Shared by the SIMD backend and the CPU backend's
+/// blake2s fast path; the output is identical to the generic row-by-row absorption.
+#[allow(clippy::uninit_vec)]
+pub(crate) fn build_leaves_from_flat_columns<const IS_M31_OUTPUT: bool>(
+    columns: &[&[u32]],
+    lifting_log_size: u32,
+) -> Vec<Blake2sHash> {
+    {
+        if columns.iter().all(|c| c.len() == columns[0].len())
+            && columns[0].len() / N_LANES == 1 << (lifting_log_size - LOG_N_LANES)
+        {
+            return build_leaves_uniform::<IS_M31_OUTPUT>(columns);
+        }
         // Note that, in this function, all variables that track log sizes
         // refer to the "size" in terms of PackedM31 (e.g. the log size of a column
         // of 4 PackedM31 elements is 2).
-        let max_log_size: u32 = columns.last().unwrap().data.len().ilog2();
+        let max_log_size: u32 = (columns.last().unwrap().len() / N_LANES).ilog2();
 
         // Initialize the vector of Blake2s states. The state is of type `[u32x16; 8]`.
         //
@@ -90,14 +175,14 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
         let last_chunk_index =
             (columns.len() - 1) / N_FELTS_IN_BLAKE_MESSAGE * N_FELTS_IN_BLAKE_MESSAGE;
         let lifting_indices =
-            get_lifting_indices(columns.iter().map(|c| c.data.len()), last_chunk_index);
+            get_lifting_indices(columns.iter().map(|c| c.len() / N_LANES), last_chunk_index);
         let mut byte_count = 0_u64;
 
         // The actual log size of `prev_layer_states` is equal to `max_log_size`, but only the first
         // two entries are accessed for the computation of the first iteration.
         let mut prev_chunk_max_log_size = 0;
         for (start, end) in lifting_indices.into_iter().tuple_windows() {
-            let chunk_max_log_size: u32 = columns[end - 1].data.len().ilog2();
+            let chunk_max_log_size: u32 = (columns[end - 1].len() / N_LANES).ilog2();
             let next_layer_state_slice = &mut next_layer_states[0..1 << chunk_max_log_size];
             let log_ratio = chunk_max_log_size - prev_chunk_max_log_size;
             // Compute the new states of the current layer.
@@ -106,34 +191,54 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
             #[cfg(feature = "parallel")]
             let iter_states = next_layer_state_slice.par_iter_mut();
 
+            // First chunk: lift the previous states and `columns[start..start + 16]`.
             iter_states.enumerate().for_each(|(i, state)| {
-                let mut local_byte_count = byte_count + N_BYTES_IN_BLAKE_MESSAGE;
-                // Lift `prev_layer_states` and the first chunk `columns[start..start + 16]`.
                 let prev_state = std::array::from_fn(|j| {
                     let prev_state_limb = prev_layer_states[i >> log_ratio][j];
                     to_lifted_simd(prev_state_limb, log_ratio, i)
                 });
                 let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = std::array::from_fn(|j| {
                     let column = columns[start + j];
-                    let log_size = column.data.len().ilog2();
+                    let log_size = (column.len() / N_LANES).ilog2();
                     let log_ratio = chunk_max_log_size - log_size;
-                    to_lifted_simd(column.data[i >> log_ratio].into_simd(), log_ratio, i)
+                    let idx = i >> log_ratio;
+                    to_lifted_simd(
+                        u32x16::from_slice(&column[idx * N_LANES..(idx + 1) * N_LANES]),
+                        log_ratio,
+                        i,
+                    )
                 });
-
-                *state = compress_unfinalized(prev_state, msgs, local_byte_count);
-                // Deal with the subsequent chunks in columns[start + 16..end]`. Note that since
-                // `start < end` and both are multiples of 16, we have `start + 16 <= end`,
-                // therefore the indexing range below doesn't panic. All columns in
-                // `columns[start + 16..end]` are guaranteed to be of the same size (hence no
-                // lifting is required).
-                for chunk_columns in &mut columns[start + 16..end].chunks(N_FELTS_IN_BLAKE_MESSAGE)
-                {
-                    let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] =
-                        std::array::from_fn(|j| chunk_columns[j].data[i].into_simd());
-                    local_byte_count += N_BYTES_IN_BLAKE_MESSAGE;
-                    *state = compress_unfinalized(*state, msgs, local_byte_count);
-                }
+                *state =
+                    compress_unfinalized(prev_state, msgs, byte_count + N_BYTES_IN_BLAKE_MESSAGE);
             });
+
+            // Deal with the subsequent chunks in `columns[start + 16..end]`. Note that since
+            // `start < end` and both are multiples of 16, we have `start + 16 <= end`,
+            // therefore the indexing range below doesn't panic. All columns in
+            // `columns[start + 16..end]` are guaranteed to be of the same size (hence no
+            // lifting is required). Chunks are absorbed one full state pass at a time, so
+            // each pass touches only 16 column streams (prefetcher friendly); the per-state
+            // compression chain order is unchanged.
+            let mut local_byte_count = byte_count + N_BYTES_IN_BLAKE_MESSAGE;
+            for chunk_columns in &mut columns[start + 16..end].chunks(N_FELTS_IN_BLAKE_MESSAGE) {
+                local_byte_count += N_BYTES_IN_BLAKE_MESSAGE;
+                let absorb = |(i, state): (usize, &mut [u32x16; N_FELTS_IN_BLAKE_STATE])| {
+                    let msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = std::array::from_fn(|j| {
+                        u32x16::from_slice(&chunk_columns[j][i * N_LANES..(i + 1) * N_LANES])
+                    });
+                    *state = compress_unfinalized(*state, msgs, local_byte_count);
+                };
+                #[cfg(not(feature = "parallel"))]
+                next_layer_states[0..1 << chunk_max_log_size]
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(absorb);
+                #[cfg(feature = "parallel")]
+                next_layer_states[0..1 << chunk_max_log_size]
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(absorb);
+            }
             // We hashed `((end - start) / N_FELTS_IN_BLAKE_MESSAGE) * N_BYTES_IN_BLAKE_MESSAGE = 4
             // * (end - start)` bytes.
             byte_count += 4 * (end - start) as u64;
@@ -158,9 +263,14 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
             });
             let mut msgs: [u32x16; N_FELTS_IN_BLAKE_MESSAGE] = unsafe { std::mem::zeroed() };
             for (j, column) in columns[last_chunk_index..].iter().enumerate() {
-                let log_size = column.data.len().ilog2();
+                let log_size = (column.len() / N_LANES).ilog2();
                 let log_ratio = chunk_max_log_size - log_size;
-                msgs[j] = to_lifted_simd(column.data[i >> log_ratio].into_simd(), log_ratio, i);
+                let idx = i >> log_ratio;
+                msgs[j] = to_lifted_simd(
+                    u32x16::from_slice(&column[idx * N_LANES..(idx + 1) * N_LANES]),
+                    log_ratio,
+                    i,
+                );
             }
             *state = compress_finalize(prev_state, msgs, byte_count);
         });
@@ -221,9 +331,15 @@ impl<const IS_M31_OUTPUT: bool> MerkleOpsLifted<Blake2sMerkleHasherGeneric<IS_M3
 
         res
     }
+}
 
-    #[allow(clippy::uninit_vec)]
-    fn build_next_layer(prev_layer: &Vec<Blake2sHash>) -> Vec<Blake2sHash> {
+/// Computes one Merkle layer from the previous one, 16 child-pairs per SIMD compression.
+/// Shared by the SIMD backend and the CPU backend's blake2s fast path.
+#[allow(clippy::uninit_vec)]
+pub(crate) fn build_next_layer_simd<const IS_M31_OUTPUT: bool>(
+    prev_layer: &[Blake2sHash],
+) -> Vec<Blake2sHash> {
+    {
         // The log size of the current layer that needs to be built.
         let log_size: u32 = prev_layer.len().ilog2() - 1;
         if log_size < LOG_N_LANES {

@@ -10,6 +10,7 @@ use num_traits::{One, Zero};
 use rayon::prelude::*;
 use tracing::{span, Level};
 
+use super::column::SecureColumn;
 use super::fft::{ifft, rfft, CACHED_FFT_LOG_SIZE, MIN_FFT_LOG_SIZE};
 use super::m31::{PackedBaseField, LOG_N_LANES, N_LANES};
 use super::qm31::PackedSecureField;
@@ -127,6 +128,70 @@ impl SimdBackend {
     }
 }
 
+/// Runs the inverse circle FFT in place over `2^domain.log_size()` M31 values in
+/// bit-reversed circle-domain order, leaving FFT-basis coefficients scaled by `1/N`
+/// (in the kernel's large-transform layout above `CACHED_FFT_LOG_SIZE`).
+///
+/// # Safety
+///
+/// `values` must be 64-byte aligned and valid for reads and writes of `domain.size()`
+/// u32 elements. `domain.log_size()` must be at least [`MIN_FFT_LOG_SIZE`].
+pub(crate) unsafe fn ifft_in_place_raw(
+    values: *mut u32,
+    domain: CircleDomain,
+    twiddles: &TwiddleTree<SimdBackend>,
+) {
+    let log_size = domain.log_size();
+    let line_twiddles = domain_line_twiddles_from_tree(domain, &twiddles.itwiddles);
+    ifft::ifft(values, &line_twiddles, log_size as usize);
+
+    let inv = PackedBaseField::broadcast(BaseField::from(domain.size()).inverse());
+    let packed = std::slice::from_raw_parts_mut(
+        values as *mut PackedBaseField,
+        1 << (log_size - LOG_N_LANES),
+    );
+    packed.iter_mut().for_each(|x| *x *= inv);
+}
+
+/// Runs the circle FFT from `2^fft_log_size` coefficients at `src` (in the layout
+/// [`ifft_in_place_raw`] produces) onto `domain`, writing `domain.size()` evaluations to
+/// `dst`. Domains larger than the polynomial are covered subdomain by subdomain.
+///
+/// # Safety
+///
+/// `src`/`dst` must be 64-byte aligned, non-overlapping, and valid for reads of
+/// `2^fft_log_size` / writes of `domain.size()` u32 elements respectively.
+/// `fft_log_size` must be at least [`MIN_FFT_LOG_SIZE`] and at most `domain.log_size()`.
+pub(crate) unsafe fn rfft_raw(
+    src: *const u32,
+    dst: *mut u32,
+    fft_log_size: u32,
+    domain: CircleDomain,
+    twiddles: &TwiddleTree<SimdBackend>,
+) {
+    let log_size = domain.log_size();
+    let twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
+
+    // Evaluate on big domains by evaluating on several subdomains.
+    let log_subdomains = log_size - fft_log_size;
+    for i in 0..(1usize << log_subdomains) {
+        // The subdomain twiddles are a slice of the large domain twiddles.
+        let subdomain_twiddles = (0..(fft_log_size - 1))
+            .map(|layer_i| {
+                &twiddles[layer_i as usize]
+                    [i << (fft_log_size - 2 - layer_i)..(i + 1) << (fft_log_size - 2 - layer_i)]
+            })
+            .collect::<Vec<_>>();
+
+        rfft::fft(
+            src,
+            dst.add(i << fft_log_size),
+            &subdomain_twiddles,
+            fft_log_size as usize,
+        );
+    }
+}
+
 // TODO(shahars): Everything is returned in redundant representation, where values can also be P.
 // Decide if and when it's ok and what to do if it's not.
 impl PolyOps for SimdBackend {
@@ -147,20 +212,14 @@ impl PolyOps for SimdBackend {
         }
 
         let mut values = eval.values;
-        let twiddles = domain_line_twiddles_from_tree(eval.domain, &twiddles.itwiddles);
-
         // Safe because [PackedBaseField] is aligned on 64 bytes.
         unsafe {
-            ifft::ifft(
+            ifft_in_place_raw(
                 transmute::<*mut PackedBaseField, *mut u32>(values.data.as_mut_ptr()),
-                &twiddles,
-                log_size as usize,
+                eval.domain,
+                twiddles,
             );
         }
-
-        // TODO(alont): Cache this inversion.
-        let inv = PackedBaseField::broadcast(BaseField::from(eval.domain.size()).inverse());
-        values.data.iter_mut().for_each(|x| *x *= inv);
 
         CircleCoefficients::new(values)
     }
@@ -230,6 +289,87 @@ impl PolyOps for SimdBackend {
         };
 
         (sum * twiddle_lows).pointwise_sum()
+    }
+
+    fn eval_basis_at_point(log_size: u32, point: CirclePoint<SecureField>) -> SecureColumn {
+        // Build the scalar prefix on the CPU, then double through the remaining factors
+        // with packed multiplications. Matches CpuBackend::eval_basis_at_point exactly.
+        if log_size <= LOG_N_LANES {
+            return CpuBackend::eval_basis_at_point(log_size, point)
+                .into_iter()
+                .collect();
+        }
+        // Folding factors in [`crate::core::poly::utils::fold`]'s order.
+        let mut mappings = vec![point.y];
+        let mut x = point.x;
+        for _ in 1..log_size {
+            mappings.push(x);
+            x = CirclePoint::double_x(x);
+        }
+        // Above the cached-fft size, SIMD coefficient vectors are stored
+        // vec-transposed; permute the mappings the same way
+        // [`Self::generate_evaluation_mappings`] does so the basis pairs with the
+        // stored coefficient order.
+        if log_size > CACHED_FFT_LOG_SIZE {
+            mappings.reverse();
+            let n = mappings.len();
+            let n0 = (n - LOG_N_LANES as usize) / 2;
+            let n1 = (n - LOG_N_LANES as usize).div_ceil(2);
+            let (ab, c) = mappings.split_at_mut(n1);
+            let (a, _b) = ab.split_at_mut(n0);
+            a.swap_with_slice(&mut c[0..n0]);
+            mappings.reverse();
+        }
+        mappings.reverse();
+
+        let (high_mappings, low_mappings) =
+            mappings.split_at(mappings.len() - LOG_N_LANES as usize);
+        let prefix: Vec<SecureField> = {
+            let mut basis = Vec::with_capacity(N_LANES);
+            basis.push(SecureField::one());
+            for &m in low_mappings.iter().rev() {
+                let len = basis.len();
+                for i in 0..len {
+                    basis.push(basis[i] * m);
+                }
+            }
+            basis
+        };
+        let mut data: Vec<PackedSecureField> = Vec::with_capacity(1 << (log_size - LOG_N_LANES));
+        data.push(PackedSecureField::from_array(std::array::from_fn(|i| {
+            prefix[i]
+        })));
+        for &m in high_mappings.iter().rev() {
+            let len = data.len();
+            let packed_m = PackedSecureField::broadcast(m);
+            #[cfg(feature = "parallel")]
+            if len >= 1 << 11 {
+                let mut high: Vec<PackedSecureField> = Vec::with_capacity(len);
+                data[..len]
+                    .par_iter()
+                    .map(|&b| b * packed_m)
+                    .collect_into_vec(&mut high);
+                data.extend_from_slice(&high);
+                continue;
+            }
+            for i in 0..len {
+                data.push(data[i] * packed_m);
+            }
+        }
+        SecureColumn {
+            length: 1 << log_size,
+            data,
+        }
+    }
+
+    fn eval_at_point_with_basis(
+        poly: &CircleCoefficients<Self>,
+        basis: &SecureColumn,
+    ) -> SecureField {
+        assert_eq!(poly.coeffs.len(), basis.len());
+        let sum = zip(&poly.coeffs.data, &basis.data)
+            .fold(PackedSecureField::zero(), |acc, (&c, &b)| acc + b * c);
+        sum.pointwise_sum()
     }
 
     fn barycentric_weights(
@@ -405,33 +545,16 @@ impl PolyOps for SimdBackend {
             );
         }
 
-        let twiddles = domain_line_twiddles_from_tree(domain, &twiddles.twiddles);
-
-        // Evaluate on big domains by evaluating on several subdomains.
-        let log_subdomains = log_size - fft_log_size;
-
-        for i in 0..(1 << log_subdomains) {
-            // The subdomain twiddles are a slice of the large domain twiddles.
-            let subdomain_twiddles = (0..(fft_log_size - 1))
-                .map(|layer_i| {
-                    &twiddles[layer_i as usize]
-                        [i << (fft_log_size - 2 - layer_i)..(i + 1) << (fft_log_size - 2 - layer_i)]
-                })
-                .collect::<Vec<_>>();
-
-            // FFT from the coefficients buffer directly into the provided buffer.
-            unsafe {
-                rfft::fft(
-                    transmute::<*const PackedBaseField, *const u32>(poly.coeffs.data.as_ptr()),
-                    transmute::<*mut PackedBaseField, *mut u32>(
-                        buffer.data[i << (fft_log_size - LOG_N_LANES)
-                            ..(i + 1) << (fft_log_size - LOG_N_LANES)]
-                            .as_mut_ptr(),
-                    ),
-                    &subdomain_twiddles,
-                    fft_log_size as usize,
-                );
-            }
+        // Safe because [PackedBaseField] is aligned on 64 bytes and the buffer has
+        // `domain.size()` writable elements.
+        unsafe {
+            rfft_raw(
+                transmute::<*const PackedBaseField, *const u32>(poly.coeffs.data.as_ptr()),
+                transmute::<*mut PackedBaseField, *mut u32>(buffer.data.as_mut_ptr()),
+                fft_log_size,
+                domain,
+                twiddles,
+            );
         }
 
         CircleEvaluation::new(domain, buffer)
@@ -616,6 +739,64 @@ fn slow_eval_at_point(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn eval_at_point_with_basis_matches_eval_at_point() {
+        use rand::rngs::SmallRng;
+        use rand::{Rng, SeedableRng};
+
+        use crate::prover::backend::CpuBackend;
+
+        let mut rng = SmallRng::seed_from_u64(7);
+        // Sizes span CACHED_FFT_LOG_SIZE: above it the SIMD coefficient layout is
+        // vec-transposed and the basis must pair with that order.
+        for log_size in (1..=10u32).chain(15..=18) {
+            let coeffs: Vec<BaseField> = (0..1 << log_size)
+                .map(|_| BaseField::from(rng.gen::<u32>() >> 1))
+                .collect();
+            let point = crate::core::circle::SECURE_FIELD_CIRCLE_GEN;
+
+            let cpu_poly =
+                crate::prover::poly::circle::CircleCoefficients::<CpuBackend>::new(coeffs.clone());
+            let cpu_basis = <CpuBackend as PolyOps>::eval_basis_at_point(log_size, point);
+            assert_eq!(
+                <CpuBackend as PolyOps>::eval_at_point_with_basis(&cpu_poly, &cpu_basis),
+                <CpuBackend as PolyOps>::eval_at_point(&cpu_poly, point),
+                "cpu log_size {log_size}"
+            );
+
+            // The SIMD slow-eval fallback assumes larger sizes; compare against the CPU
+            // value, which the CPU assertion above already ties to eval_at_point.
+            // Above the cached-fft size the SIMD layout is vec-transposed; convert the
+            // natural coefficients into the stored order first.
+            let mut simd_coeffs: BaseColumn = coeffs.into_iter().collect();
+            crate::prover::backend::cpu::circle::convert_simd_coeff_order(&mut simd_coeffs);
+            let simd_poly =
+                crate::prover::poly::circle::CircleCoefficients::<SimdBackend>::new(simd_coeffs);
+            if log_size > LOG_N_LANES {
+                assert_eq!(
+                    <SimdBackend as PolyOps>::eval_at_point(&simd_poly, point),
+                    <CpuBackend as PolyOps>::eval_at_point(&cpu_poly, point),
+                    "simd eval_at_point log_size {log_size}"
+                );
+            }
+            let simd_basis = <SimdBackend as PolyOps>::eval_basis_at_point(log_size, point);
+            assert_eq!(
+                <SimdBackend as PolyOps>::eval_at_point_with_basis(&simd_poly, &simd_basis),
+                <CpuBackend as PolyOps>::eval_at_point(&cpu_poly, point),
+                "simd log_size {log_size}"
+            );
+            // Above the cached-fft size the SIMD basis is deliberately permuted to the
+            // vec-transposed coefficient order, so it differs from the CPU basis.
+            if log_size <= CACHED_FFT_LOG_SIZE {
+                assert_eq!(
+                    cpu_basis,
+                    simd_basis.to_cpu(),
+                    "basis mismatch log_size {log_size}"
+                );
+            }
+        }
+    }
     use itertools::Itertools;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};

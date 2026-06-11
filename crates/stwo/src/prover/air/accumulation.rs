@@ -184,10 +184,15 @@ impl<B: Backend> DomainEvaluationAccumulator<B> {
             };
             let twiddles_ref = owned_twiddles.as_ref().unwrap_or(twiddles);
 
-            SecureCirclePoly(eval.columns.map(|c| {
-                CircleEvaluation::<B, BaseField, BitReversedOrder>::new(domain, c)
-                    .interpolate_with_twiddles(twiddles_ref)
-            }))
+            // One batched call so backends can run all four coordinate transforms in
+            // a single submission.
+            let evals = eval
+                .columns
+                .into_iter()
+                .map(|c| CircleEvaluation::<B, BaseField, BitReversedOrder>::new(domain, c))
+                .collect();
+            let mut polys = B::interpolate_columns(evals, twiddles_ref).into_iter();
+            SecureCirclePoly(std::array::from_fn(|_| polys.next().unwrap()))
         } else {
             SecureCirclePoly(std::array::from_fn(|_| {
                 CircleCoefficients::new(Col::<B, BaseField>::zeros(1 << log_size))

@@ -1,4 +1,3 @@
-use std::iter::zip;
 use std::{array, mem};
 
 use bytemuck::allocation::cast_vec;
@@ -134,18 +133,18 @@ impl Column<BaseField> for BaseColumn {
 
 impl FromIterator<BaseField> for BaseColumn {
     fn from_iter<I: IntoIterator<Item = BaseField>>(iter: I) -> Self {
-        let mut chunks = iter.into_iter().array_chunks();
-        let mut data = (&mut chunks).map(PackedBaseField::from_array).collect_vec();
-        let mut length = data.len() * N_LANES;
+        let values = iter.into_iter().collect_vec();
+        let length = values.len();
+        let (full_chunks, remainder) = values.as_chunks::<N_LANES>();
+        let mut data = full_chunks
+            .iter()
+            .map(|chunk| PackedBaseField::from_array(*chunk))
+            .collect_vec();
 
-        if let Some(remainder) = chunks.into_remainder() {
-            let rem = remainder.len();
-            if rem > 0 {
-                length += rem;
-                let mut last = [BaseField::zero(); N_LANES];
-                last[..rem].copy_from_slice(remainder.as_slice());
-                data.push(PackedBaseField::from_array(last));
-            }
+        if !remainder.is_empty() {
+            let mut last = [BaseField::zero(); N_LANES];
+            last[..remainder.len()].copy_from_slice(remainder);
+            data.push(PackedBaseField::from_array(last));
         }
 
         Self { data, length }
@@ -215,18 +214,18 @@ impl Column<CM31> for CM31Column {
 
 impl FromIterator<CM31> for CM31Column {
     fn from_iter<I: IntoIterator<Item = CM31>>(iter: I) -> Self {
-        let mut chunks = iter.into_iter().array_chunks();
-        let mut data = (&mut chunks).map(PackedCM31::from_array).collect_vec();
-        let mut length = data.len() * N_LANES;
+        let values = iter.into_iter().collect_vec();
+        let length = values.len();
+        let (full_chunks, remainder) = values.as_chunks::<N_LANES>();
+        let mut data = full_chunks
+            .iter()
+            .map(|chunk| PackedCM31::from_array(*chunk))
+            .collect_vec();
 
-        if let Some(remainder) = chunks.into_remainder() {
-            let rem = remainder.len();
-            if rem > 0 {
-                length += rem;
-                let mut last = [CM31::zero(); N_LANES];
-                last[..rem].copy_from_slice(remainder.as_slice());
-                data.push(PackedCM31::from_array(last));
-            }
+        if !remainder.is_empty() {
+            let mut last = [CM31::zero(); N_LANES];
+            last[..remainder.len()].copy_from_slice(remainder);
+            data.push(PackedCM31::from_array(last));
         }
 
         Self { data, length }
@@ -280,12 +279,30 @@ impl SecureColumn {
 
         let length = self.length;
         let packed_length = self.data.len();
-        let mut columns = array::from_fn(|_| Vec::with_capacity(packed_length));
+        let mut columns: [Vec<PackedBaseField>; SECURE_EXTENSION_DEGREE] =
+            array::from_fn(|_| unsafe { crate::core::utils::uninit_vec(packed_length) });
 
-        for v in self.data {
-            let packed_coords = v.into_packed_m31s();
-            zip(&mut columns, packed_coords).for_each(|(col, packed_coord)| col.push(packed_coord));
-        }
+        // Unpack coordinates in parallel chunks; every slot is written exactly once.
+        let [c0, c1, c2, c3] = &mut columns;
+        #[cfg(feature = "parallel")]
+        let iter = (self.data.par_iter())
+            .zip(c0.par_iter_mut())
+            .zip(c1.par_iter_mut())
+            .zip(c2.par_iter_mut())
+            .zip(c3.par_iter_mut());
+        #[cfg(not(feature = "parallel"))]
+        let iter = (self.data.iter())
+            .zip(c0.iter_mut())
+            .zip(c1.iter_mut())
+            .zip(c2.iter_mut())
+            .zip(c3.iter_mut());
+        iter.for_each(|((((v, d0), d1), d2), d3)| {
+            let [p0, p1, p2, p3] = v.into_packed_m31s();
+            *d0 = p0;
+            *d1 = p1;
+            *d2 = p2;
+            *d3 = p3;
+        });
 
         SecureColumnByCoords {
             columns: columns.map(|col| BaseColumn { data: col, length }),
@@ -349,20 +366,18 @@ impl Column<SecureField> for SecureColumn {
 
 impl FromIterator<SecureField> for SecureColumn {
     fn from_iter<I: IntoIterator<Item = SecureField>>(iter: I) -> Self {
-        let mut chunks = iter.into_iter().array_chunks();
-        let mut data = (&mut chunks)
-            .map(PackedSecureField::from_array)
+        let values = iter.into_iter().collect_vec();
+        let length = values.len();
+        let (full_chunks, remainder) = values.as_chunks::<N_LANES>();
+        let mut data = full_chunks
+            .iter()
+            .map(|chunk| PackedSecureField::from_array(*chunk))
             .collect_vec();
-        let mut length = data.len() * N_LANES;
 
-        if let Some(remainder) = chunks.into_remainder() {
-            let rem = remainder.len();
-            if rem > 0 {
-                length += rem;
-                let mut last = [SecureField::zero(); N_LANES];
-                last[..rem].copy_from_slice(remainder.as_slice());
-                data.push(PackedSecureField::from_array(last));
-            }
+        if !remainder.is_empty() {
+            let mut last = [SecureField::zero(); N_LANES];
+            last[..remainder.len()].copy_from_slice(remainder);
+            data.push(PackedSecureField::from_array(last));
         }
 
         Self { data, length }

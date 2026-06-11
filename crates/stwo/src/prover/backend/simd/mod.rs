@@ -47,4 +47,7 @@ impl BackendForChannel<Poseidon252MerkleChannel> for SimdBackend {}
 // Optimal chunk sizes were determined empirically on an intel 155u machine.
 pub(super) const PACKED_M31_BATCH_INVERSE_CHUNK_SIZE: usize = 1 << 9;
 pub(super) const PACKED_CM31_BATCH_INVERSE_CHUNK_SIZE: usize = 1 << 10;
-pub(super) const PACKED_QM31_BATCH_INVERSE_CHUNK_SIZE: usize = 1 << 11;
+// One field inversion is amortized over each chunk; 2^9 packed rows keep that
+// amortization while yielding enough chunks to occupy all threads even for
+// small columns.
+pub(super) const PACKED_QM31_BATCH_INVERSE_CHUNK_SIZE: usize = 1 << 9;

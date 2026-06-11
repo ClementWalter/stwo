@@ -114,7 +114,7 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
         samples_with_randomness.iter().flatten(),
     )
     .sorted_by_key(|(c, _)| c.domain.log_size())
-    .group_by(|(c, _)| c.domain.log_size())
+    .chunk_by(|(c, _)| c.domain.log_size())
     .into_iter()
     .for_each(|(_, tuples)| {
         let (columns, samples_with_randomness): (Vec<_>, Vec<_>) = tuples.unzip();
@@ -134,7 +134,7 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
     let accumulations_per_sample_point = accumulated_numerators_vec
         .into_iter()
         .sorted_by_key(|c| (c.sample_point.x, c.sample_point.y))
-        .group_by(|c| c.sample_point)
+        .chunk_by(|c| c.sample_point)
         .into_iter()
         .map(|(sample_point, accumulations_per_log_size)| {
             let accumulations_per_log_size = accumulations_per_log_size.collect_vec();

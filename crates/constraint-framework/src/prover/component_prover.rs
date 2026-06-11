@@ -9,7 +9,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::TreeVec;
 use stwo::core::poly::circle::{CanonicCoset, CircleDomain};
-use stwo::core::utils::bit_reverse;
+use stwo::core::utils::{bit_reverse, offset_bit_reversed_circle_domain_index};
 use stwo::prover::backend::simd::column::VeryPackedSecureColumnByCoords;
 use stwo::prover::backend::simd::m31::LOG_N_LANES;
 use stwo::prover::backend::simd::very_packed_m31::{VeryPackedBaseField, LOG_N_VERY_PACKED_ELEMS};
@@ -21,10 +21,12 @@ use stwo::prover::secure_column::SecureColumnByCoords;
 use stwo::prover::{ComponentProver, DomainEvaluationAccumulator, EvaluationMode, Poly, Trace};
 use tracing::{span, Level};
 
-use super::{CpuDomainEvaluator, SimdDomainEvaluator};
+use super::{BatchCpuDomainEvaluator, CpuDomainEvaluator, SimdDomainEvaluator};
 use crate::{FrameworkComponent, FrameworkEval, PREPROCESSED_TRACE_IDX};
 
-const CHUNK_SIZE: usize = 1;
+/// Number of very-packed rows evaluated per rayon task. Large enough to amortize
+/// work-stealing overhead, small enough to balance load across threads.
+const CHUNK_SIZE: usize = 32;
 
 /// Common inputs for constraint quotient evaluation, shared between the SIMD and CPU backends.
 struct ConstraintQuotientInputs<'a, B: Backend> {
@@ -146,7 +148,8 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
             let trace_cols = trace.as_cols_ref().map_cols(|c| c.to_cpu());
             let trace_cols = trace_cols.as_cols_ref();
             *accum.col = SecureColumnByCoords::from_cpu(accumulate_pointwise_cpu(
-                self,
+                &self.eval,
+                self.claimed_sum,
                 trace_cols,
                 eval_domain.log_size(),
                 trace_domain.log_size(),
@@ -159,7 +162,11 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
 
         let col = unsafe { VeryPackedSecureColumnByCoords::transform_under_mut(accum.col) };
 
-        let range = 0..(1 << (eval_domain.log_size() - LOG_N_LANES - LOG_N_VERY_PACKED_ELEMS));
+        // Number of valid very-packed rows. The transformed column's inner vectors still
+        // report their pre-transform (PackedBaseField) length, so chunks taken from them
+        // can extend past this count and must be clamped.
+        let n_vec_rows = 1 << (eval_domain.log_size() - LOG_N_LANES - LOG_N_VERY_PACKED_ELEMS);
+        let range = 0..n_vec_rows;
 
         #[cfg(not(feature = "parallel"))]
         let iter = range.step_by(CHUNK_SIZE).zip(col.chunks_mut(CHUNK_SIZE));
@@ -175,22 +182,69 @@ impl<E: FrameworkEval + Sync> ComponentProver<SimdBackend> for FrameworkComponen
         let self_eval = &self.eval;
         let self_claimed_sum = self.claimed_sum;
 
-        iter.for_each(|(chunk_idx, mut chunk)| {
-            let trace_cols = trace.as_cols_ref().map_cols(|c| c.as_ref());
+        // Shared read-only view of the trace columns, built once and borrowed by every
+        // row task to avoid per-row allocations inside the hot loop.
+        let trace_cols = trace.as_cols_ref().map_cols(|c| c.as_ref());
+        let trace_cols = &trace_cols;
+        // Broadcast the random coefficient powers to SIMD lanes once for all rows.
+        let broadcast_powers =
+            SimdDomainEvaluator::broadcast_random_coeff_powers(&accum.random_coeff_powers);
+        let broadcast_powers = &broadcast_powers;
+        // Precompute, for every non-zero mask offset, the bit-reversed circle-domain index
+        // of each evaluation point's offset neighbor. The maps are shared by all rows and
+        // all columns using that offset, replacing per-row per-lane index computations.
+        let offset_index_maps: Vec<(isize, Vec<u32>)> = self
+            .nonzero_mask_offsets()
+            .into_iter()
+            .map(|off| {
+                let n = 1usize << eval_domain.log_size();
+                let mut map = vec![0u32; n];
+                #[cfg(feature = "parallel")]
+                let chunks = map.par_chunks_mut(1 << 12);
+                #[cfg(not(feature = "parallel"))]
+                let chunks = map.chunks_mut(1 << 12);
+                chunks.enumerate().for_each(|(chunk_idx, chunk)| {
+                    let base = chunk_idx << 12;
+                    for (j, slot) in chunk.iter_mut().enumerate() {
+                        *slot = offset_bit_reversed_circle_domain_index(
+                            base + j,
+                            trace_domain.log_size(),
+                            eval_domain.log_size(),
+                            off,
+                        ) as u32;
+                    }
+                });
+                (off, map)
+            })
+            .collect();
+        let offset_index_maps = &offset_index_maps;
 
-            for idx_in_chunk in 0..CHUNK_SIZE {
-                let vec_row = chunk_idx * CHUNK_SIZE + idx_in_chunk;
+        iter.for_each(|(chunk_start_row, mut chunk)| {
+            // Logup fraction buffers, recycled across the chunk's rows: finalize_logup_batched
+            // hands the vectors back cleared, so only the first row of the chunk allocates.
+            let mut denoms_buf = Vec::new();
+            let mut numerators_buf = Vec::new();
+            // Clamp to both the chunk length and the valid row count (see n_vec_rows above).
+            let chunk_rows = chunk.0[0].0.len().min(n_vec_rows - chunk_start_row);
+            for idx_in_chunk in 0..chunk_rows {
+                let vec_row = chunk_start_row + idx_in_chunk;
                 // Evaluate constrains at row.
-                let eval = SimdDomainEvaluator::new(
-                    &trace_cols,
+                let mut eval = SimdDomainEvaluator::new(
+                    trace_cols,
                     vec_row,
-                    &accum.random_coeff_powers,
+                    broadcast_powers,
                     trace_domain.log_size(),
                     eval_domain.log_size(),
                     self_eval.log_size(),
                     self_claimed_sum,
                 );
-                let row_res = self_eval.evaluate(eval).row_res;
+                eval.offset_index_maps = offset_index_maps;
+                eval.logup_denoms = std::mem::take(&mut denoms_buf);
+                eval.logup_nonunit_numerators = std::mem::take(&mut numerators_buf);
+                let mut evaluated = self_eval.evaluate(eval);
+                let row_res = evaluated.row_res;
+                denoms_buf = std::mem::take(&mut evaluated.logup_denoms);
+                numerators_buf = std::mem::take(&mut evaluated.logup_nonunit_numerators);
 
                 // Finalize row.
                 unsafe {
@@ -238,7 +292,8 @@ impl<E: FrameworkEval + Sync> ComponentProver<CpuBackend> for FrameworkComponent
         let trace_cols = trace.as_cols_ref().map_cols(|c| c.as_ref());
 
         *accum.col = accumulate_pointwise_cpu(
-            self,
+            &self.eval,
+            self.claimed_sum,
             trace_cols,
             eval_domain.log_size(),
             trace_domain.log_size(),
@@ -261,8 +316,10 @@ fn subdomain_eval_domain(max_constraint_log_degree_bound: u32, log_expansion: u3
     committed_domain.split(log_expansion).0
 }
 
-fn accumulate_pointwise_cpu<E: FrameworkEval>(
-    component: &FrameworkComponent<E>,
+#[allow(clippy::too_many_arguments)]
+fn accumulate_pointwise_cpu<E: FrameworkEval + Sync>(
+    component_eval: &E,
+    claimed_sum: SecureField,
     trace_cols: TreeVec<Vec<&CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>>>,
     eval_log_size: u32,
     trace_log_size: u32,
@@ -270,23 +327,121 @@ fn accumulate_pointwise_cpu<E: FrameworkEval>(
     random_coeff_powers: &[SecureField],
     accum: &SecureColumnByCoords<CpuBackend>,
 ) -> SecureColumnByCoords<CpuBackend> {
-    let mut res = SecureColumnByCoords::zeros(1 << eval_log_size);
-    for row in 0..(1 << eval_log_size) {
-        // Evaluate constrains at row.
-        let eval = CpuDomainEvaluator::new(
-            &trace_cols,
-            row,
-            random_coeff_powers,
-            trace_log_size,
-            eval_log_size,
-            component.eval.log_size(),
-            component.claimed_sum,
-        );
-        let row_res = component.eval.evaluate(eval).row_res;
-
-        // Finalize row.
-        let row_denom_inv = denom_inv[row >> trace_log_size];
-        res.set(row, accum.at(row) + row_res * row_denom_inv)
+    // Apple-GPU path for AIRs that supply an MSL constraint body; bit-identical to the
+    // CPU evaluator below, which remains the reference.
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    if eval_log_size >= stwo::prover::backend::metal::constraints::MIN_METAL_CONSTRAINT_LOG_SIZE {
+        if let Some(body) = component_eval.metal_constraint_body() {
+            let columns: Vec<Vec<&[BaseField]>> = trace_cols
+                .iter()
+                .map(|cols| cols.iter().map(|c| c.values.as_slice()).collect())
+                .collect();
+            if let Some(res) =
+                stwo::prover::backend::metal::constraints::accumulate_constraints_metal(
+                    &columns,
+                    random_coeff_powers,
+                    &denom_inv,
+                    accum,
+                    1 << eval_log_size,
+                    trace_log_size,
+                    &body,
+                )
+            {
+                return res;
+            }
+        }
     }
+
+    let mut res = SecureColumnByCoords::zeros(1 << eval_log_size);
+
+    // Rows are independent; evaluate disjoint row chunks concurrently (each chunk owns
+    // a disjoint range of every coordinate column), and within a chunk evaluate BATCH
+    // consecutive rows at a time: lanes break the per-row dependency chains of deep
+    // constraint expressions.
+    const BATCH: usize = crate::prover::batch_cpu_domain::BATCH_ROWS;
+    let chunk_size = 1 << 12;
+    let trace_cols = &trace_cols;
+    let denom_inv = &denom_inv;
+    let batch_powers = BatchCpuDomainEvaluator::broadcast_random_coeff_powers(random_coeff_powers);
+    let batch_powers = &batch_powers;
+    // The packed finalize broadcasts one vanishing-denominator inverse per batch, which
+    // requires the batch to stay inside one coset repetition.
+    let batch_path = BATCH <= (1 << trace_log_size);
+    let mut chunk_views = {
+        let [c0, c1, c2, c3]: &mut [Vec<BaseField>; 4] = &mut res.columns;
+        (c0.chunks_mut(chunk_size))
+            .zip(c1.chunks_mut(chunk_size))
+            .zip(c2.chunks_mut(chunk_size))
+            .zip(c3.chunks_mut(chunk_size))
+            .enumerate()
+            .map(|(i, (((d0, d1), d2), d3))| (i * chunk_size, [d0, d1, d2, d3]))
+            .collect_vec()
+    };
+
+    let process_chunk = |(start, chunk): &mut (usize, [&mut [BaseField]; 4])| {
+        use stwo::prover::backend::simd::m31::{PackedM31, N_LANES};
+
+        use crate::prover::batch_cpu_domain::load_secure_coords;
+
+        let rows = chunk[0].len();
+        let mut idx = 0;
+        while batch_path && idx + BATCH <= rows {
+            let row = *start + idx;
+            // Evaluate constraints at rows row..row + BATCH.
+            let eval = BatchCpuDomainEvaluator::new(
+                trace_cols,
+                row,
+                batch_powers,
+                trace_log_size,
+                eval_log_size,
+                component_eval.log_size(),
+                claimed_sum,
+            );
+            let row_res = component_eval.evaluate(eval).row_res;
+
+            // Finalize the batch with packed ops; the denominator inverse is constant
+            // across the batch (chunks and batches stay coset-repetition aligned).
+            let row_denom_inv = PackedM31::broadcast(denom_inv[row >> trace_log_size]);
+            for (j, lane_res) in row_res.0.into_iter().enumerate() {
+                let lane_row = row + j * N_LANES;
+                let acc = load_secure_coords(&accum.columns, lane_row);
+                let coords = (acc + lane_res * row_denom_inv).into_packed_m31s();
+                for (c, coord) in coords.into_iter().enumerate() {
+                    chunk[c][idx + j * N_LANES..idx + (j + 1) * N_LANES]
+                        .copy_from_slice(&coord.to_array());
+                }
+            }
+            idx += BATCH;
+        }
+        // Tail rows shorter than a batch.
+        for idx in idx..rows {
+            let row = *start + idx;
+            // Evaluate constrains at row.
+            let eval = CpuDomainEvaluator::new(
+                trace_cols,
+                row,
+                random_coeff_powers,
+                trace_log_size,
+                eval_log_size,
+                component_eval.log_size(),
+                claimed_sum,
+            );
+            let row_res = component_eval.evaluate(eval).row_res;
+
+            // Finalize row.
+            let row_denom_inv = denom_inv[row >> trace_log_size];
+            let [v0, v1, v2, v3] = (accum.at(row) + row_res * row_denom_inv).to_m31_array();
+            chunk[0][idx] = v0;
+            chunk[1][idx] = v1;
+            chunk[2][idx] = v2;
+            chunk[3][idx] = v3;
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    chunk_views.par_iter_mut().for_each(process_chunk);
+    #[cfg(not(feature = "parallel"))]
+    chunk_views.iter_mut().for_each(process_chunk);
+
     res
 }
