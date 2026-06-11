@@ -31,7 +31,6 @@ import logging
 import os
 import platform
 import re
-import statistics
 import subprocess
 from pathlib import Path
 
@@ -43,22 +42,13 @@ SHAPE_RE = re.compile(
 )
 HASH_RE = re.compile(r"PROOF_HASH\[air_shape\]=([0-9a-f]{16})")
 
-# (log_rows, cols) grid; both constraint modes run for every shape.
+# (log_rows, cols) grid; both constraint modes run for every shape. Shapes are
+# capped at 2^30 cells (~4.3 GB base trace, ~10 GB peak RSS while proving).
 SHAPES = [
-    (14, 16),
-    (14, 64),
-    (14, 256),
-    (16, 16),
-    (16, 64),
-    (16, 256),
-    (18, 16),
-    (18, 64),
-    (18, 256),
-    (20, 16),
-    (20, 64),
-    (20, 256),
-    (22, 16),
-    (22, 64),
+    (log_rows, cols)
+    for log_rows in (14, 16, 18, 20, 22)
+    for cols in (16, 64, 256, 1024)
+    if (cols << log_rows) <= 1 << 30
 ]
 MODES = [1, 0]  # constrained, unconstrained
 
@@ -161,7 +151,8 @@ def main() -> None:
                 f"{r['pair']},{r['status']},{r['prove_s'] or ''},{r['hash'] or ''}\n"
             )
 
-    # One table per mode: median prove time and Mcells/s per configuration.
+    # One table per mode: best (min) prove time per configuration — the min over
+    # interleaved pairs is the least-interference estimate on a noisy machine.
     lines = []
     for constrained in MODES:
         mode = "constrained (degree-2 per column)" if constrained else "unconstrained (commit/FRI only)"
@@ -187,7 +178,7 @@ def main() -> None:
                     and r["status"] == "ok"
                 ]
                 if times:
-                    medians[config] = statistics.median(times)
+                    medians[config] = min(times)
                     row += [
                         f"{medians[config]:.3f}",
                         f"{cells / medians[config] / 1e6:.0f}",
