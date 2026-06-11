@@ -1,4 +1,5 @@
 #![feature(portable_simd, iter_array_chunks, array_chunks)]
+pub mod air_shape;
 pub mod blake;
 pub mod plonk;
 pub mod poseidon;

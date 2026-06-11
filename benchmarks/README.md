@@ -39,3 +39,23 @@ Each run writes `benchmarks/results/<timestamp>/`:
 Programs that a configuration cannot run (e.g. `simd_poseidon` is unsupported by the
 lifted protocol upstream) are recorded with their failure status and excluded from the
 table rather than silently dropped.
+
+## AIR-shape throughput sweep
+
+`run_air_shapes.py` measures prover throughput in **Mcells/s** over a grid of trace
+shapes (2^14–2^22 rows x 16–256 columns) using the parametric `air_shape` example
+(SimdBackend), in two modes:
+
+- **constrained** — one degree-2 constraint per derived column (real-AIR workload),
+- **unconstrained** — masks only, measuring the commitment/FRI envelope (in the
+  spirit of kkrt-labs/rookie-numbers' frequency benchmark).
+
+The timed section is the protocol itself (twiddle precompute through proof),
+excluding trace generation. Same interleaving and bit-identity guarantees as the
+main campaign. Note the SimdBackend path does not route through the Metal kernels
+(the GPU chained commit currently specializes the CpuBackend route only), so this
+sweep isolates the CPU/SIMD-side gains.
+
+```
+uv run benchmarks/run_air_shapes.py --baseline <bin> --metal <bin> --nometal <bin>
+```
