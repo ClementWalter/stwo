@@ -96,6 +96,32 @@ Route B for performance. **Route B's mapping onto stwo's lifted PCS is a
 derivation, not paper-stated for the circle — validate against the paper before
 coding (repo rule: no proceeding on intuition).**
 
+**Implementation constraint (verified in code, 2026-06-11).** Unlike the salting
+(Phase 1) and FRI mask (Phase 3) mechanisms, witness randomization is *not*
+containable inside the PCS/prover. Trace degree bounds are fixed by the AIR
+component, not derived from the committed column sizes:
+`constraint-framework` `component.rs::trace_log_degree_bounds()` returns
+`vec![self.eval.log_size(); ...]`, and the verifier
+(`core/verifier.rs`) reconstructs the per-column bounds from
+`component.max_constraint_log_degree_bound()` / `trace_log_degree_bounds()` and
+checks them against the commitment. Adding `v_H·r` pushes a column to degree
+`2^n + h` (committed size `2^{n+1}` in Route A), so the component must report the
+randomized size. Therefore Phase 4 requires coordinated changes to:
+1. the `Component`/`ComponentProver` degree reporting (so randomized trees report
+   `n+1`), affecting all components and examples;
+2. `Components::composition_log_degree_bound()` and the composition split;
+3. the verifier's bound reconstruction; and
+4. **stark-v's own component definitions** (downstream of this crate).
+
+This is a SOUNDNESS-CRITICAL, AIR-level change. Its hiding property is *not*
+validatable by completeness (round-trip) tests — a too-small `h` still verifies
+while leaking. Per the repo's operation boundaries it must be implemented with
+human + cryptographer review, not as an autonomous PCS-local change. Phases 1
+and 3 (salting, FRI mask) are the parts that *were* PCS-containable and are
+implemented + completeness-tested; Phase 4 (and Phase 5, which shares the
+composition degree machinery) are the remaining core and are deferred to a
+reviewed change.
+
 ### Mechanism 2 — composition randomization (Phase 5, deferred)
 
 stwo's `split_at_mid` into 8 coordinate columns (`prover/mod.rs`) is the note's
