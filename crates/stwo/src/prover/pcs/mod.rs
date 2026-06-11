@@ -8,6 +8,8 @@ use crate::core::channel::{Channel, MerkleChannel};
 use crate::core::circle::CirclePoint;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
+#[cfg(feature = "zk")]
+use crate::core::pcs::quotients::FriMaskProof;
 use crate::core::pcs::quotients::{
     CommitmentSchemeProof, CommitmentSchemeProofAux, ExtendedCommitmentSchemeProof, PointSample,
 };
@@ -25,6 +27,8 @@ use crate::prover::backend::{BackendForChannel, Col};
 use crate::prover::fri::{FriDecommitResult, FriProver};
 use crate::prover::mempool::BaseColumnPool;
 use crate::prover::pcs::quotient_ops::compute_fri_quotients;
+#[cfg(feature = "zk")]
+use crate::prover::poly::circle::SecureCirclePoly;
 use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation};
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
@@ -254,6 +258,48 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             .map_cols(|x| x.iter().map(|o| o.value).collect());
         channel.mix_felts(&sampled_values.clone().flatten_cols());
 
+        // Zero-knowledge: commit a uniformly random low-degree codeword `R` BEFORE drawing the
+        // quotient-batching challenge, and add it to the batched DEEP quotient (`B = Q + R`) below.
+        // Because `v_H` is even, the trace randomizer's entropy halves at every FRI fold; the
+        // independent mask `R` is what keeps the FRI transcript (inner layers and last-layer
+        // polynomial) free of witness information. Mixing `R`'s root here binds it ahead of the
+        // challenge, so the batched combination is an affine shift (sound by correlated agreement).
+        // See `docs/zk.md`, Phase 3.
+        #[cfg(feature = "zk")]
+        let zk_fri_mask = if self.config.zk {
+            let mask_log_degree_bound = lifting_log_size - self.config.fri_config.log_blowup_factor;
+            let n_coeffs = 1usize << mask_log_degree_bound;
+            let degree = crate::core::fields::qm31::SECURE_EXTENSION_DEGREE;
+            let rng = self.zk_rng.as_mut().expect("zk config requires a zk RNG");
+            let seed = rng.draw_salt_seed();
+            let coeffs: Vec<BaseField> = (0..degree * n_coeffs)
+                .map(|_| rng.draw_base_felt())
+                .collect();
+            let mask_poly = SecureCirclePoly::<B>(core::array::from_fn(|c| {
+                CircleCoefficients::new(
+                    coeffs[c * n_coeffs..(c + 1) * n_coeffs]
+                        .iter()
+                        .copied()
+                        .collect(),
+                )
+            }));
+            let mask_eval = mask_poly.evaluate_with_twiddles(
+                CanonicCoset::new(lifting_log_size).circle_domain(),
+                self.twiddles,
+            );
+            let mask_columns: Vec<&Col<B, BaseField>> = mask_eval.values.columns.iter().collect();
+            let mask_tree = MerkleProverLifted::<B, MC::H>::commit_salted(
+                mask_columns,
+                lifting_log_size,
+                0,
+                &seed,
+            );
+            MC::mix_root(channel, mask_tree.root());
+            Some((mask_eval, mask_tree, seed))
+        } else {
+            None
+        };
+
         let columns = self.evaluations();
         print_column_size_histogram::<B, MC>(&columns);
         // Compute oods quotients for boundary constraints on the sampled points.
@@ -266,7 +312,20 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             self.config.fri_config.log_blowup_factor,
         );
 
-        // Run FRI commitment phase on the oods quotients.
+        // Blind the batched quotient with the zk mask: `B = Q + R` (no-op when zk is off).
+        #[cfg(feature = "zk")]
+        let quotients = {
+            let mut quotients = quotients;
+            if let Some((mask_eval, ..)) = &zk_fri_mask {
+                for i in 0..quotients.len() {
+                    let blinded = quotients.at(i) + mask_eval.at(i);
+                    quotients.set(i, blinded);
+                }
+            }
+            quotients
+        };
+
+        // Run FRI commitment phase on the (possibly blinded) oods quotients.
         let fri_prover =
             FriProver::<B, MC>::commit(channel, self.config.fri_config, &quotients, self.twiddles);
 
@@ -282,6 +341,20 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
             query_positions,
             unsorted_query_locations,
         } = fri_prover.decommit(channel);
+
+        // Open the zk mask at the FRI query positions so the verifier can re-add `R` to the
+        // batched-quotient answers and reconstruct the committed FRI input.
+        #[cfg(feature = "zk")]
+        let fri_mask = zk_fri_mask.map(|(mask_eval, mask_tree, seed)| {
+            let mask_columns: Vec<&Col<B, BaseField>> = mask_eval.values.columns.iter().collect();
+            let (queried_values, ext_decommitment) =
+                mask_tree.decommit_salted(&query_positions, mask_columns, &seed);
+            FriMaskProof {
+                commitment: mask_tree.root(),
+                queried_values,
+                decommitment: ext_decommitment.decommitment,
+            }
+        });
         // Build the query position tree.
         let preprocessed_query_positions = prepare_preprocessed_query_positions(
             &query_positions,
@@ -331,6 +404,8 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 proof_of_work,
                 fri_proof: fri_proof.proof,
                 config: self.config,
+                #[cfg(feature = "zk")]
+                fri_mask,
             },
             aux: CommitmentSchemeProofAux {
                 unsorted_query_locations,

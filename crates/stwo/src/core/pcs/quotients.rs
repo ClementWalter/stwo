@@ -32,6 +32,28 @@ pub struct CommitmentSchemeProof<H: MerkleHasherLifted> {
     pub queried_values: TreeVec<ColumnVec<Vec<BaseField>>>,
     pub proof_of_work: u64,
     pub fri_proof: FriProof<H>,
+    /// Zero-knowledge FRI blinding mask. `Some` iff the proof is zk. The mask is a committed,
+    /// uniformly random low-degree codeword added to the batched DEEP quotient before FRI, so the
+    /// FRI transcript (inner layers and last-layer polynomial) reveals nothing about the witness.
+    /// See `docs/zk.md`, Phase 3.
+    #[cfg(feature = "zk")]
+    pub fri_mask: Option<FriMaskProof<H>>,
+}
+
+/// The opening of the zero-knowledge FRI blinding mask `R` at the FRI query positions. `R` is a
+/// secret random low-degree codeword committed (as `SECURE_EXTENSION_DEGREE` base-field coordinate
+/// columns) before the quotient-batching challenge is drawn. The verifier adds `R` at the query
+/// positions back into the batched-quotient answers to reconstruct the committed FRI input. See
+/// `docs/zk.md`, Phase 3.
+#[cfg(feature = "zk")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FriMaskProof<H: MerkleHasherLifted> {
+    /// Merkle root of the committed mask codeword.
+    pub commitment: H::Hash,
+    /// The mask's coordinate-column values at the (deduplicated) FRI query positions.
+    pub queried_values: ColumnVec<Vec<BaseField>>,
+    /// Merkle decommitment for the queried mask values.
+    pub decommitment: MerkleDecommitmentLifted<H>,
 }
 
 /// Auxiliary data for a [CommitmentSchemeProof].

@@ -393,6 +393,20 @@ mod tests {
 
     #[cfg(feature = "zk")]
     #[test]
+    fn test_pcs_prove_and_verify_zk_simd() {
+        let (proof, sizes0, sizes1, sampled_points) = build_zk_pcs_proof::<SimdBackend>();
+        assert!(verify_zk_pcs_proof(proof, &sizes0, &sizes1, sampled_points).is_ok());
+    }
+
+    #[cfg(feature = "zk")]
+    #[test]
+    fn test_zk_proof_carries_a_fri_mask() {
+        let (proof, ..) = build_zk_pcs_proof::<CpuBackend>();
+        assert!(proof.fri_mask.is_some());
+    }
+
+    #[cfg(feature = "zk")]
+    #[test]
     fn test_zk_salts_the_witness_tree_but_not_the_preprocessed_tree() {
         let (proof, ..) = build_zk_pcs_proof::<CpuBackend>();
         let placement = (

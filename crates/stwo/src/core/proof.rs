@@ -73,6 +73,8 @@ impl<H: MerkleHasherLifted> StarkProof<H> {
             proof_of_work: _,
             fri_proof,
             config: _,
+            #[cfg(feature = "zk")]
+                fri_mask: _,
         } = commitment_scheme_proof;
 
         let FriProof {
@@ -206,14 +208,24 @@ impl<H: MerkleHasherLifted> SizeEstimate for CommitmentSchemeProof<H> {
             proof_of_work,
             fri_proof,
             config,
+            #[cfg(feature = "zk")]
+            fri_mask,
         } = self;
-        commitments.size_estimate()
+        let estimate = commitments.size_estimate()
             + sampled_values.size_estimate()
             + decommitments.size_estimate()
             + queried_values.size_estimate()
             + mem::size_of_val(proof_of_work)
             + fri_proof.size_estimate()
-            + mem::size_of_val(config)
+            + mem::size_of_val(config);
+        #[cfg(feature = "zk")]
+        let estimate = estimate
+            + fri_mask.as_ref().map_or(0, |mask| {
+                mask.commitment.size_estimate()
+                    + mask.queried_values.size_estimate()
+                    + mask.decommitment.size_estimate()
+            });
+        estimate
     }
 }
 

@@ -63,8 +63,33 @@ impl<MC: MerkleChannel> CommitmentSchemeVerifier<MC> {
         channel: &mut MC::C,
     ) -> Result<(), VerificationError> {
         channel.mix_felts(&proof.sampled_values.clone().flatten_cols());
-        let random_coeff = channel.draw_secure_felt();
+
         let lifting_log_size = self.trees.last().unwrap().height;
+
+        // Zero-knowledge: clone the FRI blinding mask opening, mix its commitment into the channel
+        // before the batching challenge (matching the prover), and prepare its Merkle verifier.
+        // Fail closed if a zk verifier is given a proof without a mask. See `docs/zk.md`, Phase 3.
+        #[cfg(feature = "zk")]
+        let zk_mask = proof.fri_mask.clone();
+        #[cfg(feature = "zk")]
+        let zk_mask_verifier = if self.config.zk {
+            let mask = zk_mask.as_ref().ok_or_else(|| {
+                VerificationError::InvalidStructure(std_shims::ToString::to_string(
+                    &"zero-knowledge enabled but the proof carries no FRI mask",
+                ))
+            })?;
+            MC::mix_root(channel, mask.commitment);
+            let degree = crate::core::fields::qm31::SECURE_EXTENSION_DEGREE;
+            Some(MerkleVerifierLifted::<MC::H>::new(
+                mask.commitment,
+                (0..degree).map(|_| lifting_log_size).collect(),
+                None,
+            ))
+        } else {
+            None
+        };
+
+        let random_coeff = channel.draw_secure_felt();
         let bound =
             CirclePolyDegreeBound::new(lifting_log_size - self.config.fri_config.log_blowup_factor);
 
@@ -156,6 +181,27 @@ impl<MC: MerkleChannel> CommitmentSchemeVerifier<MC> {
             proof.queried_values,
             lifting_log_size,
         )?;
+
+        // Zero-knowledge: verify the FRI mask opening and add `R` back into the answers so they
+        // equal the committed FRI input `B = Q + R`. See `docs/zk.md`, Phase 3.
+        #[cfg(feature = "zk")]
+        let fri_answers = {
+            let mut fri_answers = fri_answers;
+            if let (Some(mask), Some(mask_verifier)) = (&zk_mask, &zk_mask_verifier) {
+                mask_verifier.verify(
+                    &query_positions,
+                    mask.queried_values.clone(),
+                    mask.decommitment.clone(),
+                )?;
+                for (i, answer) in fri_answers.iter_mut().enumerate() {
+                    let mask_value = SecureField::from_m31_array(core::array::from_fn(|c| {
+                        mask.queried_values[c][i]
+                    }));
+                    *answer += mask_value;
+                }
+            }
+            fri_answers
+        };
 
         fri_verifier.decommit(fri_answers)?;
 

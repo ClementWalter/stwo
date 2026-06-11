@@ -103,4 +103,11 @@ impl ZkRng {
             BaseField::from_u32_unchecked(self.0.gen_range(0..crate::core::fields::m31::P))
         }))
     }
+
+    /// Draws a uniformly random base-field element. Used to build the random low-degree codeword
+    /// that blinds the FRI batch (`docs/zk.md`, Phase 3).
+    pub fn draw_base_felt(&mut self) -> BaseField {
+        use rand::Rng;
+        BaseField::from_u32_unchecked(self.0.gen_range(0..crate::core::fields::m31::P))
+    }
 }
