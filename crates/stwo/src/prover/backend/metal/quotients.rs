@@ -143,6 +143,17 @@ pub(crate) fn warmup() {
     let _ = context();
 }
 
+/// Returns whether both static quotient pipelines compiled successfully.
+pub(crate) fn is_ready() -> bool {
+    let Some(context) = context() else {
+        return false;
+    };
+    let Ok(mut context) = context.lock() else {
+        return false;
+    };
+    ensure_combine_pipeline(&mut context).is_some()
+}
+
 #[repr(C)]
 struct AccumulateParams {
     n_rows: u32,
@@ -401,6 +412,24 @@ kernel void combine_quotients(
 }
 "#;
 
+fn ensure_combine_pipeline(context: &mut QuotientContext) -> Option<()> {
+    if context.combine_pipeline.is_some() {
+        return Some(());
+    }
+    let library = context
+        .device
+        .new_library_with_source(COMBINE_KERNEL, &CompileOptions::new())
+        .ok()?;
+    let function = library.get_function("combine_quotients", None).ok()?;
+    context.combine_pipeline = Some(
+        context
+            .device
+            .new_compute_pipeline_state_with_function(&function)
+            .ok()?,
+    );
+    Some(())
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SampleParams {
@@ -481,18 +510,7 @@ pub(crate) fn combine_quotients_metal(
     let xy = domain_xy(subdomain);
     let ctx = context()?;
     let mut ctx = ctx.lock().unwrap();
-    if ctx.combine_pipeline.is_none() {
-        let library = ctx
-            .device
-            .new_library_with_source(COMBINE_KERNEL, &CompileOptions::new())
-            .ok()?;
-        let function = library.get_function("combine_quotients", None).ok()?;
-        ctx.combine_pipeline = Some(
-            ctx.device
-                .new_compute_pipeline_state_with_function(&function)
-                .ok()?,
-        );
-    }
+    ensure_combine_pipeline(&mut ctx)?;
 
     let samples: Vec<SampleParams> = accumulations
         .iter()

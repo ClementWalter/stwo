@@ -135,6 +135,14 @@ pub(crate) fn warmup() {
     let _ = context();
 }
 
+/// Returns whether the static twiddle-generation pipeline compiled successfully.
+pub(crate) fn is_ready() -> bool {
+    let Some(context) = context() else {
+        return false;
+    };
+    context.lock().is_ok()
+}
+
 #[repr(C)]
 struct LayerParams {
     initial_x: u32,

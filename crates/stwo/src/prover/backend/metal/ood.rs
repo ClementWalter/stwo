@@ -117,6 +117,14 @@ pub(crate) fn warmup() {
     let _ = context();
 }
 
+/// Returns whether the static out-of-domain pipeline compiled successfully.
+pub(crate) fn is_ready() -> bool {
+    let Some(context) = context() else {
+        return false;
+    };
+    context.lock().is_ok()
+}
+
 fn bind_input(device: &Device, ptr: *const u8, bytes: usize) -> Buffer {
     let page = 16384;
     if (ptr as usize).is_multiple_of(page) && bytes.is_multiple_of(page) {

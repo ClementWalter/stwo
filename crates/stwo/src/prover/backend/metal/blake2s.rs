@@ -219,6 +219,14 @@ pub(crate) fn warmup() {
     let _ = context();
 }
 
+/// Returns whether the static Blake2s pipelines compiled successfully.
+pub(crate) fn is_ready() -> bool {
+    let Some(context) = context() else {
+        return false;
+    };
+    context.lock().is_ok()
+}
+
 fn context() -> Option<&'static Mutex<MetalContext>> {
     static CONTEXT: OnceLock<Option<Mutex<MetalContext>>> = OnceLock::new();
     CONTEXT
