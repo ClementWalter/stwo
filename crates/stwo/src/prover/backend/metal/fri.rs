@@ -17,7 +17,6 @@ use metal::{
 use crate::core::circle::Coset;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
-use crate::core::utils::uninit_vec;
 use crate::prover::backend::CpuBackend;
 use crate::prover::secure_column::SecureColumnByCoords;
 
@@ -230,9 +229,25 @@ fn bind_input(device: &Device, data: &[BaseField]) -> Buffer {
     }
 }
 
+fn bind_output(device: &Device, data: &mut [BaseField]) -> Buffer {
+    let bytes = std::mem::size_of_val(data);
+    let page = 16384;
+    if (data.as_mut_ptr() as usize).is_multiple_of(page) && bytes.is_multiple_of(page) {
+        // The exclusive borrow is not used again until the awaited command completes.
+        device.new_buffer_with_bytes_no_copy(
+            data.as_mut_ptr() as *const std::ffi::c_void,
+            bytes as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        )
+    } else {
+        device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+    }
+}
+
 /// GPU FRI fold over secure-column coordinates. `coset` is the half coset whose points
 /// supply the fold coordinate (`x` for line folds, `y` for circle folds). Returns
-/// `None` without a usable device.
+/// `None` without a usable device or successful command.
 pub(crate) fn fold_metal(
     values: &SecureColumnByCoords<CpuBackend>,
     coset: Coset,
@@ -246,14 +261,16 @@ pub(crate) fn fold_metal(
     let ctx = context()?;
     let ctx = ctx.lock().unwrap();
 
-    // Safety: the kernel writes every entry before anything reads them.
-    let mut out: [Vec<BaseField>; 4] = std::array::from_fn(|_| unsafe { uninit_vec(half_n) });
+    let mut out: [Vec<BaseField>; 4] = std::array::from_fn(|_| vec![BaseField::default(); half_n]);
     let in_buffers: Vec<Buffer> = values
         .columns
         .iter()
         .map(|c| bind_input(&ctx.device, c))
         .collect();
-    let out_buffers: Vec<Buffer> = out.iter().map(|c| bind_input(&ctx.device, c)).collect();
+    let out_buffers: Vec<Buffer> = out
+        .iter_mut()
+        .map(|c| bind_output(&ctx.device, c))
+        .collect();
 
     let initial = coset.at(0);
     let alpha_coords = alpha.to_m31_array();
@@ -292,7 +309,7 @@ pub(crate) fn fold_metal(
     encoder.dispatch_threads(MTLSize::new(half_n as u64, 1, 1), MTLSize::new(256, 1, 1));
     encoder.end_encoding();
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::context::wait_for_completion(command_buffer).ok()?;
 
     for (vec, buffer) in out.iter_mut().zip(&out_buffers) {
         let zero_copy = std::ptr::eq(buffer.contents() as *const BaseField, vec.as_ptr());
@@ -316,7 +333,7 @@ pub(crate) fn fold_metal(
 /// Chains all fold steps of one FRI layer and the packed Merkle tree of the final
 /// folded evaluation into one submission. Returns the folded coordinates and, when the
 /// folded size clears the tree threshold, the tree layers (leaves first, above-threshold
-/// only). `None` without a usable device or for sub-threshold sizes.
+/// only). `None` without a usable device, for sub-threshold sizes, or on command failure.
 #[allow(clippy::type_complexity)]
 pub(crate) fn fold_line_chain_and_packed_tree_metal(
     values: &SecureColumnByCoords<CpuBackend>,
@@ -327,7 +344,6 @@ pub(crate) fn fold_line_chain_and_packed_tree_metal(
     SecureColumnByCoords<CpuBackend>,
     Option<Vec<Vec<crate::core::vcs::blake2_hash::Blake2sHash>>>,
 )> {
-    use crate::core::utils::uninit_vec;
     let n0 = values.len();
     if alphas.is_empty() || (n0 >> alphas.len()) < (1 << MIN_METAL_FOLD_LOG_SIZE) {
         return None;
@@ -346,9 +362,12 @@ pub(crate) fn fold_line_chain_and_packed_tree_metal(
     let mut step_buffers: Vec<Vec<Buffer>> = Vec::with_capacity(alphas.len());
     for (step, &alpha) in alphas.iter().enumerate() {
         let half_n = n0 >> (step + 1);
-        // Safety: the fold kernel writes every entry before anything reads them.
-        let out: [Vec<BaseField>; 4] = std::array::from_fn(|_| unsafe { uninit_vec(half_n) });
-        let out_buffers: Vec<Buffer> = out.iter().map(|c| bind_input(&ctx.device, c)).collect();
+        let mut out: [Vec<BaseField>; 4] =
+            std::array::from_fn(|_| vec![BaseField::default(); half_n]);
+        let out_buffers: Vec<Buffer> = out
+            .iter_mut()
+            .map(|c| bind_output(&ctx.device, c))
+            .collect();
 
         let initial = coset.at(0);
         let alpha_coords = alpha.to_m31_array();
@@ -407,7 +426,7 @@ pub(crate) fn fold_line_chain_and_packed_tree_metal(
     };
 
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::context::wait_for_completion(command_buffer).ok()?;
 
     // Copy out any fold output that couldn't bind zero-copy.
     let final_buffers = step_buffers.last().unwrap();

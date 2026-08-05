@@ -314,8 +314,8 @@ fn encode_pass(
     encoder.end_encoding();
 }
 
-/// Binds a page-aligned, page-multiple slice zero-copy; returns `None` otherwise.
-fn bind_zero_copy(device: &Device, data: &[BaseField]) -> Option<Buffer> {
+/// Binds a page-aligned, page-multiple input slice zero-copy; returns `None` otherwise.
+fn bind_input_zero_copy(device: &Device, data: &[BaseField]) -> Option<Buffer> {
     let bytes = std::mem::size_of_val(data);
     let page = 16384;
     ((data.as_ptr() as usize).is_multiple_of(page) && bytes.is_multiple_of(page)).then(|| {
@@ -328,9 +328,25 @@ fn bind_zero_copy(device: &Device, data: &[BaseField]) -> Option<Buffer> {
     })
 }
 
+/// Binds a page-aligned, page-multiple output slice zero-copy. The exclusive borrow
+/// must not be used again until the command buffer that writes it has completed.
+fn bind_output_zero_copy(device: &Device, data: &mut [BaseField]) -> Option<Buffer> {
+    let bytes = std::mem::size_of_val(data);
+    let page = 16384;
+    ((data.as_mut_ptr() as usize).is_multiple_of(page) && bytes.is_multiple_of(page)).then(|| {
+        device.new_buffer_with_bytes_no_copy(
+            data.as_mut_ptr() as *const std::ffi::c_void,
+            bytes as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        )
+    })
+}
+
 /// Batched in-place GPU inverse circle FFTs: every column's passes encoded into one
 /// command buffer, one synchronization. Returns the evaluations on `Err` when the GPU
-/// path can't take them.
+/// path can't take them before dispatch. A command failure panics because the returned
+/// evaluations may already have been mutated and are not a valid CPU fallback.
 #[allow(clippy::type_complexity)]
 pub(crate) fn ifft_batch_metal(
     columns: Vec<
@@ -367,8 +383,8 @@ pub(crate) fn ifft_batch_metal(
         .map(|eval| (eval.values, eval.domain))
         .collect();
     let mut bindings = Vec::with_capacity(work.len());
-    for (values, _) in &work {
-        let Some(buffer) = bind_zero_copy(&ctx.device, values) else {
+    for (values, _) in &mut work {
+        let Some(buffer) = bind_output_zero_copy(&ctx.device, values) else {
             return Err(repack_evals(work));
         };
         bindings.push(buffer);
@@ -416,7 +432,8 @@ pub(crate) fn ifft_batch_metal(
         }
     }
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::context::wait_for_completion(command_buffer)
+        .unwrap_or_else(|status| panic!("Metal batched inverse FFT failed with status {status:?}"));
 
     Ok(work
         .drain(..)
@@ -457,7 +474,7 @@ pub(crate) fn ifft_metal(
         return false;
     };
     let mut ctx = ctx.lock().unwrap();
-    let Some(values_buffer) = bind_zero_copy(&ctx.device, values) else {
+    let Some(values_buffer) = bind_output_zero_copy(&ctx.device, values) else {
         return false;
     };
 
@@ -493,13 +510,16 @@ pub(crate) fn ifft_metal(
         );
     }
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::context::wait_for_completion(command_buffer)
+        .unwrap_or_else(|status| panic!("Metal inverse FFT failed with status {status:?}"));
     true
 }
 
 /// GPU circle FFT from `coeffs` (natural order) onto `domain`, writing evaluations to
 /// `out` — exactly [`evaluate_into_scalar`]'s output. Returns `false` (out untouched)
-/// when no usable device exists or the buffers aren't zero-copy bindable.
+/// when no usable device exists or the buffers aren't zero-copy bindable. On a
+/// submitted-command failure it also returns `false`, and the caller must discard
+/// `out` because it may have been partially written.
 ///
 /// [`evaluate_into_scalar`]: crate::prover::backend::cpu::circle::evaluate_into_scalar
 pub(crate) fn rfft_metal(
@@ -518,8 +538,8 @@ pub(crate) fn rfft_metal(
     };
     let mut ctx = ctx.lock().unwrap();
     let (Some(out_buffer), Some(coeffs_buffer)) = (
-        bind_zero_copy(&ctx.device, out),
-        bind_zero_copy(&ctx.device, coeffs),
+        bind_output_zero_copy(&ctx.device, out),
+        bind_input_zero_copy(&ctx.device, coeffs),
     ) else {
         return false;
     };
@@ -554,14 +574,14 @@ pub(crate) fn rfft_metal(
         );
     }
     command_buffer.commit();
-    command_buffer.wait_until_completed();
-    true
+    super::context::wait_for_completion(command_buffer).is_ok()
 }
 
 /// Batched fused interpolate+extend for the commit path: encodes every column's ifft
 /// and rfft passes into one command buffer and waits once, so GPU work streams
 /// back-to-back instead of synchronizing per column. Returns the columns on `Err`
-/// when the GPU path can't take them (no device, small or unalignable columns).
+/// when the GPU path can't take them before dispatch (no device, small or unalignable
+/// columns). A command failure panics because interpolation mutates fallback inputs.
 #[allow(clippy::type_complexity)]
 pub(crate) fn fused_transform_metal(
     columns: Vec<EvalsOrCoeffs<CpuBackend>>,
@@ -643,19 +663,18 @@ pub(crate) fn fused_transform_metal_chained<R>(
                 }
             };
             let ext_size = 1usize << (domain.log_size() + log_blowup_factor);
-            // Safety: the extend kernel writes every element before anything reads it.
-            let out: Vec<BaseField> = unsafe { crate::core::utils::uninit_vec(ext_size) };
+            let out = vec![BaseField::default(); ext_size];
             (values, domain, needs_ifft, out)
         })
         .collect();
 
     // Bind everything zero-copy up front; bail out (returning ownership) on failure.
     let mut bindings = Vec::with_capacity(work.len());
-    for (values, _, _, out) in &work {
-        let Some(values_buffer) = bind_zero_copy(&ctx.device, values) else {
+    for (values, _, _, out) in &mut work {
+        let Some(values_buffer) = bind_output_zero_copy(&ctx.device, values) else {
             return Err(repack(work));
         };
-        let Some(out_buffer) = bind_zero_copy(&ctx.device, out) else {
+        let Some(out_buffer) = bind_output_zero_copy(&ctx.device, out) else {
             return Err(repack(work));
         };
         bindings.push((values_buffer, out_buffer));
@@ -716,24 +735,11 @@ pub(crate) fn fused_transform_metal_chained<R>(
     }
     ifft_buffer.commit();
 
-    // While the GPU interpolates, fault the fresh output pages in on the CPU so the
-    // extension kernels don't stall on first-touch page faults.
-    {
-        let page_elems = 16384 / 4;
-        let prefault = |out: &mut [BaseField]| {
-            for slot in out.iter_mut().step_by(page_elems) {
-                *slot = BaseField::from_u32_unchecked(0);
-            }
-        };
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            work.par_iter_mut().for_each(|(_, _, _, out)| prefault(out));
-        }
-        #[cfg(not(feature = "parallel"))]
-        work.iter_mut().for_each(|(_, _, _, out)| prefault(out));
-    }
-    ifft_buffer.wait_until_completed();
+    super::context::wait_for_completion(ifft_buffer).unwrap_or_else(|status| {
+        // The input evaluations may already be partially transformed, so returning
+        // them as an `Err` fallback would silently feed corrupted data to the CPU.
+        panic!("Metal fused inverse FFT failed with status {status:?}")
+    });
 
     let command_buffer = ctx.queue.new_command_buffer();
     for ((values, domain, _, out), (values_buffer, out_buffer)) in work.iter().zip(&bindings) {
@@ -771,7 +777,9 @@ pub(crate) fn fused_transform_metal_chained<R>(
     tracing::debug!("metal fused: encode {:?}", t_encode.elapsed());
     let t_wait = std::time::Instant::now();
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::context::wait_for_completion(command_buffer).unwrap_or_else(|status| {
+        panic!("Metal fused extension/commit failed with status {status:?}")
+    });
     tracing::debug!("metal fused: gpu {:?}", t_wait.elapsed());
 
     let polys = work

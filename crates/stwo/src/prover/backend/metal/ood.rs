@@ -138,7 +138,7 @@ fn bind_input(device: &Device, ptr: *const u8, bytes: usize) -> Buffer {
 
 /// GPU shared-basis evaluation of many same-size polynomials at one point; equals
 /// mapping the CPU dot exactly (summation regrouping only). Returns `None` without a
-/// usable device.
+/// usable device or successful command.
 pub(crate) fn eval_many_metal(
     polys: &[&CircleCoefficients<CpuBackend>],
     basis: &[SecureField],
@@ -186,7 +186,7 @@ pub(crate) fn eval_many_metal(
     );
     encoder.end_encoding();
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::context::wait_for_completion(command_buffer).ok()?;
 
     // Safety: the kernel wrote 4 coordinates per column.
     let words =

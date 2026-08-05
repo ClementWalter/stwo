@@ -15,7 +15,6 @@ use metal::{
 
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
-use crate::core::utils::uninit_vec;
 use crate::prover::backend::CpuBackend;
 use crate::prover::secure_column::SecureColumnByCoords;
 
@@ -173,9 +172,25 @@ fn bind_input(device: &Device, data: &[BaseField]) -> Buffer {
     }
 }
 
+fn bind_output(device: &Device, data: &mut [BaseField]) -> Buffer {
+    let bytes = std::mem::size_of_val(data);
+    let page = 16384;
+    if (data.as_mut_ptr() as usize).is_multiple_of(page) && bytes.is_multiple_of(page) {
+        // The exclusive borrow is not used again until the awaited command completes.
+        device.new_buffer_with_bytes_no_copy(
+            data.as_mut_ptr() as *const std::ffi::c_void,
+            bytes as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        )
+    } else {
+        device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+    }
+}
+
 /// GPU partial-numerator accumulation over the first `n_rows` entries of each column:
 /// `acc[row] = -b_sum + sum_i columns[i][row] * coeffs[i]`. Returns `None` when no
-/// usable device exists.
+/// usable device exists or command execution fails.
 pub(crate) fn accumulate_numerators_metal(
     columns: &[&[BaseField]],
     coeffs: &[SecureField],
@@ -186,8 +201,7 @@ pub(crate) fn accumulate_numerators_metal(
     let ctx = context()?;
     let mut ctx = ctx.lock().unwrap();
 
-    // Safety: the final GPU chunk writes every entry before anything reads them.
-    let mut out: [Vec<BaseField>; 4] = std::array::from_fn(|_| unsafe { uninit_vec(n_rows) });
+    let mut out: [Vec<BaseField>; 4] = std::array::from_fn(|_| vec![BaseField::default(); n_rows]);
 
     let state_bytes = (n_rows * 16) as u64;
     if ctx
@@ -205,7 +219,10 @@ pub(crate) fn accumulate_numerators_metal(
         .iter()
         .map(|c| bind_input(&ctx.device, &c[..n_rows.min(c.len())]))
         .collect();
-    let out_buffers: Vec<Buffer> = out.iter().map(|c| bind_input(&ctx.device, c)).collect();
+    let out_buffers: Vec<Buffer> = out
+        .iter_mut()
+        .map(|c| bind_output(&ctx.device, c))
+        .collect();
 
     let command_buffer = ctx.queue.new_command_buffer();
     let n_chunks = columns.len().div_ceil(CHUNK_COLS);
@@ -248,7 +265,7 @@ pub(crate) fn accumulate_numerators_metal(
         encoder.end_encoding();
     }
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::context::wait_for_completion(command_buffer).ok()?;
 
     // Copy out any column that couldn't bind zero-copy (small sizes).
     for (vec, buffer) in out.iter_mut().zip(&out_buffers) {
@@ -449,7 +466,8 @@ pub(crate) struct XyColumns {
 /// GPU quotient combine over the subdomain: per row, the denominator inverses are
 /// computed by Fermat exponentiation (the inverse is unique, so values equal
 /// `CM31::batch_inverse` exactly) and every accumulation's lifted numerator is folded
-/// in, mirroring the CPU loop bit for bit. Returns `None` without a usable device.
+/// in, mirroring the CPU loop bit for bit. Returns `None` without a usable device or
+/// successful command.
 pub(crate) fn combine_quotients_metal(
     accumulations: &[crate::prover::pcs::quotient_ops::AccumulatedNumerators<CpuBackend>],
     subdomain: crate::core::poly::circle::CircleDomain,
@@ -511,9 +529,11 @@ pub(crate) fn combine_quotients_metal(
     let xs_buffer = bind_input(&ctx.device, &xy.xs[..n_rows]);
     let ys_buffer = bind_input(&ctx.device, &xy.ys[..n_rows]);
 
-    // Safety: the kernel writes every entry before anything reads them.
-    let mut out: [Vec<BaseField>; 4] = std::array::from_fn(|_| unsafe { uninit_vec(n_rows) });
-    let out_buffers: Vec<Buffer> = out.iter().map(|c| bind_input(&ctx.device, c)).collect();
+    let mut out: [Vec<BaseField>; 4] = std::array::from_fn(|_| vec![BaseField::default(); n_rows]);
+    let out_buffers: Vec<Buffer> = out
+        .iter_mut()
+        .map(|c| bind_output(&ctx.device, c))
+        .collect();
 
     let params = CombineParams {
         n_rows: n_rows as u32,
@@ -544,7 +564,7 @@ pub(crate) fn combine_quotients_metal(
     encoder.dispatch_threads(MTLSize::new(n_rows as u64, 1, 1), MTLSize::new(256, 1, 1));
     encoder.end_encoding();
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::context::wait_for_completion(command_buffer).ok()?;
 
     for (vec, buffer) in out.iter_mut().zip(&out_buffers) {
         let zero_copy = std::ptr::eq(buffer.contents() as *const BaseField, vec.as_ptr());

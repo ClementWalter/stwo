@@ -14,7 +14,6 @@ use metal::{
     Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
 };
 
-use crate::core::utils::uninit_vec;
 use crate::core::vcs::blake2_hash::Blake2sHash;
 
 /// Blake message block width, in u32 column values.
@@ -277,35 +276,16 @@ fn input_buffer(device: &Device, data: &[u32]) -> Buffer {
     }
 }
 
-/// Faults a fresh allocation's pages in on the CPU (parallel) so GPU kernels don't
-/// stall on first-touch page faults; contents are fully overwritten by the kernels.
-fn prefault<T: Send>(data: &mut [T]) {
-    let page_elems = 16384 / std::mem::size_of::<T>();
-    let fill = |chunk: &mut [T]| {
-        for slot in chunk.iter_mut().step_by(page_elems) {
-            // Safety: writing zero bytes into allocated memory of any plain type.
-            unsafe { std::ptr::write_bytes(slot, 0, 1) };
-        }
-    };
-    #[cfg(feature = "parallel")]
-    {
-        use rayon::prelude::*;
-        data.par_chunks_mut(page_elems * 256).for_each(fill);
-    }
-    #[cfg(not(feature = "parallel"))]
-    fill(data);
-}
-
 /// Binds the result vector as a zero-copy shared buffer when page-aligned, else
 /// allocates a shared scratch buffer the caller copies out of after completion.
 /// Returns (buffer, is_zero_copy).
 fn output_buffer(device: &Device, res: &mut [Blake2sHash]) -> (Buffer, bool) {
     let bytes = res.len() * 32;
     let page = 16384;
-    if (res.as_ptr() as usize).is_multiple_of(page) && bytes.is_multiple_of(page) {
-        // The vector outlives the awaited command buffer.
+    if (res.as_mut_ptr() as usize).is_multiple_of(page) && bytes.is_multiple_of(page) {
+        // The exclusive borrow is not used again until the awaited command completes.
         let buffer = device.new_buffer_with_bytes_no_copy(
-            res.as_ptr() as *const std::ffi::c_void,
+            res.as_mut_ptr() as *const std::ffi::c_void,
             bytes as u64,
             MTLResourceOptions::StorageModeShared,
             None,
@@ -329,7 +309,7 @@ struct AbsorbParams {
 }
 
 /// GPU leaf builder for same-size columns. Returns `None` when no usable device is
-/// present; callers must fall back to the CPU/SIMD builders. The output equals
+/// present or execution fails; callers must fall back to the CPU/SIMD builders. The output equals
 /// [`crate::prover::backend::simd::blake2s_lifted::build_leaves_from_flat_columns`]
 /// bit for bit.
 pub(crate) fn build_leaves_metal(
@@ -343,9 +323,7 @@ pub(crate) fn build_leaves_metal(
     let ctx = context()?;
     let mut ctx = ctx.lock().unwrap();
 
-    // Safety: every entry is written by the final GPU chunk before being read.
-    let mut res: Vec<Blake2sHash> = unsafe { uninit_vec(n_rows) };
-    prefault(&mut res);
+    let mut res = vec![Blake2sHash::default(); n_rows];
 
     let state_bytes = (n_rows * 32) as u64;
     if ctx
@@ -395,7 +373,7 @@ pub(crate) fn build_leaves_metal(
         byte_count += chunk.len() as u32 * 4;
     }
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::context::wait_for_completion(command_buffer).ok()?;
     if !out_zero_copy {
         // Safety: the kernel wrote all `n_rows` hashes into the shared buffer.
         unsafe {
@@ -411,7 +389,7 @@ pub(crate) fn build_leaves_metal(
 }
 
 /// GPU Merkle layer step: hashes consecutive child pairs of `prev_layer`. Returns
-/// `None` when no usable device is present.
+/// `None` when no usable device is present or execution fails.
 pub(crate) fn build_next_layer_metal(
     prev_layer: &[Blake2sHash],
     is_m31_output: bool,
@@ -423,9 +401,7 @@ pub(crate) fn build_next_layer_metal(
     let ctx = context()?;
     let ctx = ctx.lock().unwrap();
 
-    // Safety: every entry is written by the kernel before being read.
-    let mut res: Vec<Blake2sHash> = unsafe { uninit_vec(n_out) };
-    prefault(&mut res);
+    let mut res = vec![Blake2sHash::default(); n_out];
     let prev_words = unsafe {
         std::slice::from_raw_parts(prev_layer.as_ptr() as *const u32, prev_layer.len() * 8)
     };
@@ -444,7 +420,7 @@ pub(crate) fn build_next_layer_metal(
     encoder.dispatch_threads(MTLSize::new(n_out as u64, 1, 1), MTLSize::new(256, 1, 1));
     encoder.end_encoding();
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::context::wait_for_completion(command_buffer).ok()?;
     if !out_zero_copy {
         // Safety: the kernel wrote all `n_out` hashes into the shared buffer.
         unsafe {
@@ -464,6 +440,7 @@ pub(crate) fn build_next_layer_metal(
 /// finished by the caller's fallback. Returns `None` when no usable device exists,
 /// passing `leaves` back untouched via the `Err`-like option contract (callers keep
 /// ownership by cloning nothing: `leaves` is returned as the first layer on success).
+/// A command failure also returns the untouched input leaves through `Err`.
 pub(crate) fn build_layers_metal(
     leaves: Vec<Blake2sHash>,
     n_layers: u32,
@@ -484,10 +461,10 @@ pub(crate) fn build_layers_metal(
         sizes.push(n);
         n /= 2;
     }
-    // Safety: every entry of every level is written by its kernel before being read.
-    let mut levels: Vec<Vec<Blake2sHash>> =
-        sizes.iter().map(|&n| unsafe { uninit_vec(n) }).collect();
-    levels.iter_mut().for_each(|level| prefault(level));
+    let mut levels: Vec<Vec<Blake2sHash>> = sizes
+        .iter()
+        .map(|&n| vec![Blake2sHash::default(); n])
+        .collect();
 
     let command_buffer = ctx.queue.new_command_buffer();
     let mut prev_buffer = {
@@ -519,7 +496,9 @@ pub(crate) fn build_layers_metal(
         prev_buffer = out_buffer;
     }
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    if super::context::wait_for_completion(command_buffer).is_err() {
+        return Err(leaves);
+    }
     for ((buffer, copy_len), level) in copy_outs.into_iter().zip(levels.iter_mut()) {
         if copy_len > 0 {
             // Safety: the kernel wrote all entries into the shared buffer.
@@ -547,7 +526,7 @@ pub(crate) struct PendingTree {
 
 impl PendingTree {
     /// Resolves any non-zero-copy level buffers; call only after the submission that
-    /// ran the encoded kernels has completed.
+    /// ran the encoded kernels has completed successfully.
     pub(crate) fn finish(mut self) -> Vec<Vec<Blake2sHash>> {
         for ((buffer, copy_len), level) in self.copy_outs.iter().zip(self.levels.iter_mut()) {
             if *copy_len > 0 {
@@ -581,8 +560,7 @@ pub(crate) fn encode_tree(
     let mut ctx = ctx.lock().unwrap();
 
     // Leaves: chunked absorption, exactly as build_leaves_metal.
-    let mut leaves: Vec<Blake2sHash> = unsafe { uninit_vec(n_rows) };
-    prefault(&mut leaves);
+    let mut leaves = vec![Blake2sHash::default(); n_rows];
     let state_bytes = (n_rows * 32) as u64;
     if ctx
         .state_buffer
@@ -635,9 +613,10 @@ pub(crate) fn encode_tree(
         sizes.push(n);
         n /= 2;
     }
-    let mut levels: Vec<Vec<Blake2sHash>> =
-        sizes.iter().map(|&n| unsafe { uninit_vec(n) }).collect();
-    levels.iter_mut().for_each(|level| prefault(level));
+    let mut levels: Vec<Vec<Blake2sHash>> = sizes
+        .iter()
+        .map(|&n| vec![Blake2sHash::default(); n])
+        .collect();
     let mut prev_buffer = leaves_buffer;
     let mut copy_outs = vec![];
     for level in levels.iter_mut() {
@@ -698,7 +677,7 @@ pub(crate) fn build_packed_tree_metal(
         is_m31_output,
     )?;
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::context::wait_for_completion(command_buffer).ok()?;
     Some(pending.finish())
 }
 
@@ -722,8 +701,7 @@ fn encode_packed_tree_inner(
     n_leaves: usize,
     is_m31_output: bool,
 ) -> Option<PendingTree> {
-    let mut leaves: Vec<Blake2sHash> = unsafe { uninit_vec(n_leaves) };
-    prefault(&mut leaves);
+    let mut leaves = vec![Blake2sHash::default(); n_leaves];
     let (leaves_buffer, leaves_zero_copy) = output_buffer(&ctx.device, &mut leaves);
     if !leaves_zero_copy {
         return None;
@@ -750,9 +728,10 @@ fn encode_packed_tree_inner(
         sizes.push(n);
         n /= 2;
     }
-    let mut levels: Vec<Vec<Blake2sHash>> =
-        sizes.iter().map(|&n| unsafe { uninit_vec(n) }).collect();
-    levels.iter_mut().for_each(|level| prefault(level));
+    let mut levels: Vec<Vec<Blake2sHash>> = sizes
+        .iter()
+        .map(|&n| vec![Blake2sHash::default(); n])
+        .collect();
     let mut prev_buffer = leaves_buffer;
     let mut copy_outs = vec![];
     for level in levels.iter_mut() {

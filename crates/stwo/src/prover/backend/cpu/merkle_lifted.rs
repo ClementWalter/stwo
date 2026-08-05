@@ -1,4 +1,4 @@
-use std::any::TypeId;
+use std::any::{Any, TypeId};
 
 use itertools::Itertools;
 #[cfg(feature = "parallel")]
@@ -16,6 +16,23 @@ use crate::prover::backend::simd::blake2s_lifted::{
 };
 use crate::prover::backend::{Col, CpuBackend};
 use crate::prover::vcs_lifted::ops::{MerkleOpsLifted, PackLeavesOps};
+
+/// Safely changes the concrete type of owned data while returning the original
+/// allocation unchanged when the types differ.
+fn downcast_owned<T: Any, U: Any>(value: T) -> Result<U, T> {
+    let value: Box<dyn Any> = Box::new(value);
+    match value.downcast::<U>() {
+        Ok(value) => Ok(*value),
+        Err(value) => match value.downcast::<T>() {
+            Ok(value) => Err(*value),
+            Err(_) => unreachable!("failed to recover the original Any value"),
+        },
+    }
+}
+
+fn downcast_ref<T: Any, U: Any>(value: &T) -> Option<&U> {
+    (value as &dyn Any).downcast_ref()
+}
 
 impl<H: MerkleHasherLifted + Send + Sync + 'static> MerkleOpsLifted<H> for CpuBackend {
     /// Computes the leaves of the Merkle tree. This is the core logic of the lifted Merkle
@@ -142,9 +159,9 @@ impl<H: MerkleHasherLifted + Send + Sync + 'static> MerkleOpsLifted<H> for CpuBa
                     }
                     let folded_eval = crate::prover::line::LineEvaluation::new(domain, folded);
                     let lifting = folded_eval.values.len().ilog2() - LOG_PACKED_LEAF_SIZE;
-                    // Safety: TypeId equality makes this an identity conversion.
-                    let mut layers: Vec<Vec<H::Hash>> = unsafe {
-                        std::mem::transmute::<Vec<Vec<Blake2sHash>>, Vec<Vec<H::Hash>>>(layers)
+                    let Ok(mut layers): Result<Vec<Vec<H::Hash>>, _> = downcast_owned(layers)
+                    else {
+                        unreachable!("Blake2s hasher TypeId must use Blake2sHash layers");
                     };
                     while (layers.len() as u32) < lifting + 1 {
                         let next =
@@ -176,10 +193,10 @@ impl<H: MerkleHasherLifted + Send + Sync + 'static> MerkleOpsLifted<H> for CpuBa
                 if let Some(layers) =
                     crate::prover::backend::metal::blake2s::build_packed_tree_metal(coords, is_m31)
                 {
-                    // Safety: TypeId equality makes this an identity conversion.
-                    return Some(unsafe {
-                        std::mem::transmute::<Vec<Vec<Blake2sHash>>, Vec<Vec<H::Hash>>>(layers)
-                    });
+                    let Ok(layers): Result<Vec<Vec<H::Hash>>, _> = downcast_owned(layers) else {
+                        unreachable!("Blake2s hasher TypeId must use Blake2sHash layers");
+                    };
+                    return Some(layers);
                 }
             }
         }
@@ -194,13 +211,18 @@ impl<H: MerkleHasherLifted + Send + Sync + 'static> MerkleOpsLifted<H> for CpuBa
             let is_m31 = TypeId::of::<H>() == TypeId::of::<Blake2sMerkleHasherGeneric<true>>();
             let is_bytes = TypeId::of::<H>() == TypeId::of::<Blake2sMerkleHasherGeneric<false>>();
             if is_m31 || is_bytes {
-                let leaves_b: Vec<Blake2sHash> = unsafe { std::mem::transmute(leaves) };
+                let Ok(leaves_b): Result<Vec<Blake2sHash>, _> = downcast_owned(leaves) else {
+                    unreachable!("Blake2s hasher TypeId must use Blake2sHash leaves");
+                };
                 match crate::prover::backend::metal::blake2s::build_layers_metal(
                     leaves_b, n_layers, is_m31,
                 ) {
                     Ok(layers) => {
                         // Finish the sub-threshold tail on the CPU/SIMD path.
-                        let mut layers: Vec<Vec<H::Hash>> = unsafe { std::mem::transmute(layers) };
+                        let Ok(mut layers): Result<Vec<Vec<H::Hash>>, _> = downcast_owned(layers)
+                        else {
+                            unreachable!("Blake2s hasher TypeId must use Blake2sHash layers");
+                        };
                         while (layers.len() as u32) < n_layers + 1 {
                             let next = <Self as MerkleOpsLifted<H>>::build_next_layer(
                                 layers.last().unwrap(),
@@ -210,7 +232,9 @@ impl<H: MerkleHasherLifted + Send + Sync + 'static> MerkleOpsLifted<H> for CpuBa
                         return layers;
                     }
                     Err(leaves_b) => {
-                        let leaves: Vec<H::Hash> = unsafe { std::mem::transmute(leaves_b) };
+                        let Ok(leaves): Result<Vec<H::Hash>, _> = downcast_owned(leaves_b) else {
+                            unreachable!("Blake2s hasher TypeId must use Blake2sHash leaves");
+                        };
                         let mut layers = vec![leaves];
                         (0..n_layers).for_each(|_| {
                             let next = <Self as MerkleOpsLifted<H>>::build_next_layer(
@@ -234,26 +258,32 @@ impl<H: MerkleHasherLifted + Send + Sync + 'static> MerkleOpsLifted<H> for CpuBa
     fn build_next_layer(prev_layer: &Vec<H::Hash>) -> Vec<H::Hash> {
         // Blake2s fast path; see `build_leaves`.
         if TypeId::of::<H>() == TypeId::of::<Blake2sMerkleHasherGeneric<true>>() {
-            let prev: &Vec<Blake2sHash> = unsafe { std::mem::transmute(prev_layer) };
+            let prev = downcast_ref::<_, Vec<Blake2sHash>>(prev_layer)
+                .expect("Blake2s hasher TypeId must use Blake2sHash layers");
             #[cfg(all(feature = "metal", target_os = "macos"))]
             if let Some(next) =
                 crate::prover::backend::metal::blake2s::build_next_layer_metal(prev, true)
             {
-                return unsafe { std::mem::transmute::<Vec<Blake2sHash>, Vec<H::Hash>>(next) };
+                return downcast_owned(next)
+                    .unwrap_or_else(|_| unreachable!("Blake2sHash output type changed"));
             }
             let next = build_next_layer_simd::<true>(prev);
-            return unsafe { std::mem::transmute::<Vec<Blake2sHash>, Vec<H::Hash>>(next) };
+            return downcast_owned(next)
+                .unwrap_or_else(|_| unreachable!("Blake2sHash output type changed"));
         }
         if TypeId::of::<H>() == TypeId::of::<Blake2sMerkleHasherGeneric<false>>() {
-            let prev: &Vec<Blake2sHash> = unsafe { std::mem::transmute(prev_layer) };
+            let prev = downcast_ref::<_, Vec<Blake2sHash>>(prev_layer)
+                .expect("Blake2s hasher TypeId must use Blake2sHash layers");
             #[cfg(all(feature = "metal", target_os = "macos"))]
             if let Some(next) =
                 crate::prover::backend::metal::blake2s::build_next_layer_metal(prev, false)
             {
-                return unsafe { std::mem::transmute::<Vec<Blake2sHash>, Vec<H::Hash>>(next) };
+                return downcast_owned(next)
+                    .unwrap_or_else(|_| unreachable!("Blake2sHash output type changed"));
             }
             let next = build_next_layer_simd::<false>(prev);
-            return unsafe { std::mem::transmute::<Vec<Blake2sHash>, Vec<H::Hash>>(next) };
+            return downcast_owned(next)
+                .unwrap_or_else(|_| unreachable!("Blake2sHash output type changed"));
         }
 
         let log_size: u32 = prev_layer.len().ilog2() - 1;
@@ -275,12 +305,10 @@ fn blake2s_fast_path<H: MerkleHasherLifted + 'static>(
     if !is_m31 && !is_bytes {
         return None;
     }
-    // `BaseField` is a transparent u32 wrapper, so a column is a flat run of u32s.
+    // `BaseField` is a transparent Pod u32 wrapper, so a column is a flat run of u32s.
     let flat_columns: Vec<&[u32]> = columns
         .iter()
-        .map(|column| unsafe {
-            std::slice::from_raw_parts(column.as_ptr() as *const u32, column.len())
-        })
+        .map(|column| bytemuck::cast_slice(column.as_slice()))
         .collect();
     // Apple-GPU path for large uniform-size commitments; bit-identical output, with
     // the SIMD builder as fallback (no device / unsupported shape).
@@ -293,9 +321,10 @@ fn blake2s_fast_path<H: MerkleHasherLifted + 'static>(
             && n_rows == 1 << lifting_log_size
         {
             if let Some(leaves) = build_leaves_metal(&flat_columns, is_m31) {
-                return Some(unsafe {
-                    std::mem::transmute::<Vec<Blake2sHash>, Vec<H::Hash>>(leaves)
-                });
+                return Some(
+                    downcast_owned(leaves)
+                        .unwrap_or_else(|_| unreachable!("Blake2sHash output type changed")),
+                );
             }
         }
     }
@@ -304,7 +333,7 @@ fn blake2s_fast_path<H: MerkleHasherLifted + 'static>(
     } else {
         build_leaves_from_flat_columns::<false>(&flat_columns, lifting_log_size)
     };
-    Some(unsafe { std::mem::transmute::<Vec<Blake2sHash>, Vec<H::Hash>>(leaves) })
+    Some(downcast_owned(leaves).unwrap_or_else(|_| unreachable!("Blake2sHash output type changed")))
 }
 
 impl PackLeavesOps for CpuBackend {
@@ -352,6 +381,19 @@ mod tests {
     use crate::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasherGeneric;
     use crate::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
     use crate::prover::vcs_lifted::ops::MerkleOpsLifted;
+
+    #[test]
+    fn owned_any_downcast_recovers_original_vec_allocation_on_mismatch() {
+        let values = Vec::from([1_u32, 2, 3, 4]);
+        let ptr = values.as_ptr();
+        let capacity = values.capacity();
+
+        let recovered = downcast_owned::<_, Vec<u64>>(values).unwrap_err();
+
+        assert_eq!(recovered, [1, 2, 3, 4]);
+        assert_eq!(recovered.as_ptr(), ptr);
+        assert_eq!(recovered.capacity(), capacity);
+    }
 
     /// Delegates to the blake2s hasher but, having a distinct type, takes the generic
     /// row-by-row absorption path instead of the 16-way fast path.
@@ -410,5 +452,15 @@ mod tests {
         let reference_next =
             <CpuBackend as MerkleOpsLifted<ReferenceBlake>>::build_next_layer(&reference);
         assert_eq!(fast_next, reference_next);
+
+        // On Metal builds this size is deliberately below the GPU threshold, so
+        // it also covers returning ownership from the attempted Metal chain.
+        let fast_layers =
+            <CpuBackend as MerkleOpsLifted<Blake2sMerkleHasherGeneric<false>>>::build_layers(
+                fast, 4,
+            );
+        let reference_layers =
+            <CpuBackend as MerkleOpsLifted<ReferenceBlake>>::build_layers(reference, 4);
+        assert_eq!(fast_layers, reference_layers);
     }
 }

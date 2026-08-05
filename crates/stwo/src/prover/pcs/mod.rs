@@ -30,6 +30,29 @@ use crate::prover::vcs_lifted::prover::MerkleProverLifted;
 
 pub mod quotient_ops;
 
+/// Safely moves an owned value across a runtime type check. Unlike a
+/// `TypeId`-guarded `transmute_copy`, a failed check returns the original value and
+/// never creates duplicate ownership.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn downcast_owned<T: 'static, U: 'static>(value: T) -> Result<U, T> {
+    let value: Box<dyn std::any::Any> = Box::new(value);
+    match value.downcast::<U>() {
+        Ok(value) => Ok(*value),
+        Err(value) => Err(*value.downcast::<T>().unwrap_or_else(|_| {
+            panic!("owned type-erasure recovery must preserve its input type")
+        })),
+    }
+}
+
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+mod metal_type_erasure_tests {
+    #[test]
+    fn owned_downcast_moves_or_recovers_once() {
+        assert_eq!(super::downcast_owned::<_, u32>(7u32), Ok(7));
+        assert_eq!(super::downcast_owned::<_, u64>(11u32), Err(11));
+    }
+}
+
 /// The prover side of a FRI polynomial commitment scheme. See [super].
 pub struct CommitmentSchemeProver<'a, B: BackendForChannel<MC>, MC: MerkleChannel> {
     pub trees: TreeVec<MaybeOwned<'a, CommitmentTreeProver<B, MC>>>,
@@ -498,61 +521,68 @@ impl<B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentTreeProver<B, MC> {
         // tree layers in one submission with one wait (CpuBackend + blake2s only).
         #[cfg(all(feature = "metal", target_os = "macos"))]
         let columns = {
-            use std::any::TypeId;
+            use std::any::{Any, TypeId};
 
             use crate::core::vcs_lifted::blake2_merkle::Blake2sMerkleHasherGeneric;
-            let is_cpu = TypeId::of::<B>() == TypeId::of::<crate::prover::backend::CpuBackend>();
             let is_m31 = TypeId::of::<MC::H>() == TypeId::of::<Blake2sMerkleHasherGeneric<true>>();
             let is_bytes =
                 TypeId::of::<MC::H>() == TypeId::of::<Blake2sMerkleHasherGeneric<false>>();
-            if is_cpu && (is_m31 || is_bytes) {
-                // Safety: TypeId equality makes these transmutes identity conversions.
+            if is_m31 || is_bytes {
                 type CpuCols = Vec<EvalsOrCoeffs<crate::prover::backend::CpuBackend>>;
-                let cpu_columns: CpuCols = unsafe { std::mem::transmute_copy(&columns) };
-                std::mem::forget(columns);
-                let cpu_twiddles: &TwiddleTree<crate::prover::backend::CpuBackend> =
-                    unsafe { std::mem::transmute(twiddles) };
-                let span = span!(Level::INFO, "Extension").entered();
-                let result = crate::prover::backend::metal::commit::commit_polynomials_metal(
-                    cpu_columns,
-                    log_blowup_factor,
-                    cpu_twiddles,
-                    store_polynomials_coefficients,
-                    lifting_log_size,
-                    is_m31,
-                );
-                span.exit();
-                match result {
-                    Ok((cpu_polys, Some(mut cpu_layers))) => {
-                        let _span = span!(Level::INFO, "Merkle").entered();
-                        cpu_layers.reverse();
-                        // Safety: identity conversions under the TypeId checks above.
-                        let polynomials: ColumnVec<Poly<B>> =
-                            unsafe { std::mem::transmute_copy(&cpu_polys) };
-                        std::mem::forget(cpu_polys);
-                        let layers: Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>> =
-                            unsafe { std::mem::transmute_copy(&cpu_layers) };
-                        std::mem::forget(cpu_layers);
-                        return CommitmentTreeProver {
-                            polynomials,
-                            commitment: crate::prover::vcs_lifted::prover::MerkleProverLifted {
-                                layers,
-                            },
-                        };
+                match downcast_owned::<_, CpuCols>(columns) {
+                    Ok(cpu_columns) => {
+                        // A successful owned downcast proves `B = CpuBackend`; the
+                        // twiddle tree has the same backend parameter by construction.
+                        let cpu_twiddles = (twiddles as &dyn Any)
+                            .downcast_ref::<TwiddleTree<crate::prover::backend::CpuBackend>>()
+                            .unwrap_or_else(|| {
+                                panic!("CPU columns must be paired with CPU twiddles")
+                            });
+                        let span = span!(Level::INFO, "Extension").entered();
+                        let result =
+                            crate::prover::backend::metal::commit::commit_polynomials_metal(
+                                cpu_columns,
+                                log_blowup_factor,
+                                cpu_twiddles,
+                                store_polynomials_coefficients,
+                                lifting_log_size,
+                                is_m31,
+                            );
+                        span.exit();
+                        match result {
+                            Ok((cpu_polys, Some(mut cpu_layers))) => {
+                                let _span = span!(Level::INFO, "Merkle").entered();
+                                cpu_layers.reverse();
+                                let polynomials: ColumnVec<Poly<B>> = downcast_owned(cpu_polys)
+                                    .unwrap_or_else(|_| {
+                                        panic!("CPU polynomial downcast must match backend")
+                                    });
+                                let layers: Vec<Col<B, <MC::H as MerkleHasherLifted>::Hash>> =
+                                    downcast_owned(cpu_layers).unwrap_or_else(|_| {
+                                        panic!("Blake2s layer downcast must match channel")
+                                    });
+                                return CommitmentTreeProver {
+                                    polynomials,
+                                    commitment:
+                                        crate::prover::vcs_lifted::prover::MerkleProverLifted {
+                                            layers,
+                                        },
+                                };
+                            }
+                            Ok((cpu_polys, None)) => {
+                                // Transforms ran; only the tree fell back. Build it normally.
+                                let polynomials: ColumnVec<Poly<B>> = downcast_owned(cpu_polys)
+                                    .unwrap_or_else(|_| {
+                                        panic!("CPU polynomial downcast must match backend")
+                                    });
+                                return Self::commit_polynomials(polynomials, lifting_log_size);
+                            }
+                            Err(cpu_columns) => downcast_owned(cpu_columns).unwrap_or_else(|_| {
+                                panic!("CPU column recovery must match backend")
+                            }),
+                        }
                     }
-                    Ok((cpu_polys, None)) => {
-                        // Transforms ran; only the tree fell back. Build it normally.
-                        let polynomials: ColumnVec<Poly<B>> =
-                            unsafe { std::mem::transmute_copy(&cpu_polys) };
-                        std::mem::forget(cpu_polys);
-                        return Self::commit_polynomials(polynomials, lifting_log_size);
-                    }
-                    Err(cpu_columns) => {
-                        let columns: ColumnVec<EvalsOrCoeffs<B>> =
-                            unsafe { std::mem::transmute_copy(&cpu_columns) };
-                        std::mem::forget(cpu_columns);
-                        columns
-                    }
+                    Err(columns) => columns,
                 }
             } else {
                 columns

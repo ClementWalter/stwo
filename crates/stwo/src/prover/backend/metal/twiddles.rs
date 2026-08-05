@@ -15,7 +15,6 @@ use metal::{
 
 use crate::core::circle::Coset;
 use crate::core::fields::m31::BaseField;
-use crate::core::utils::uninit_vec;
 use crate::prover::backend::CpuBackend;
 use crate::prover::poly::twiddles::TwiddleTree;
 
@@ -149,9 +148,9 @@ struct LayerParams {
 fn bind_output(device: &Device, data: &mut [BaseField]) -> Option<Buffer> {
     let bytes = std::mem::size_of_val(data);
     let page = 16384;
-    ((data.as_ptr() as usize).is_multiple_of(page) && bytes.is_multiple_of(page)).then(|| {
+    ((data.as_mut_ptr() as usize).is_multiple_of(page) && bytes.is_multiple_of(page)).then(|| {
         device.new_buffer_with_bytes_no_copy(
-            data.as_ptr() as *const std::ffi::c_void,
+            data.as_mut_ptr() as *const std::ffi::c_void,
             bytes as u64,
             MTLResourceOptions::StorageModeShared,
             None,
@@ -160,7 +159,7 @@ fn bind_output(device: &Device, data: &mut [BaseField]) -> Option<Buffer> {
 }
 
 /// GPU twiddle-tree precomputation; values are bit-identical to the CPU path. Returns
-/// `None` without a usable device or zero-copy-bindable buffers.
+/// `None` without a usable device, zero-copy-bindable buffers, or successful command.
 pub(crate) fn precompute_twiddles_metal(mut coset: Coset) -> Option<TwiddleTree<CpuBackend>> {
     if coset.log_size() < MIN_METAL_TWIDDLE_LOG_SIZE {
         return None;
@@ -170,10 +169,10 @@ pub(crate) fn precompute_twiddles_metal(mut coset: Coset) -> Option<TwiddleTree<
     let ctx = ctx.lock().unwrap();
 
     let total = coset.size();
-    // Safety: every entry below `total - 1` is written by a kernel; the final padding
-    // slot is written on the CPU below.
-    let mut twiddles: Vec<BaseField> = unsafe { uninit_vec(total) };
-    let mut itwiddles: Vec<BaseField> = unsafe { uninit_vec(total) };
+    // Keep the Rust values valid even when allocation/binding/submission fails. The
+    // successful kernel overwrites every non-padding entry.
+    let mut twiddles = vec![BaseField::default(); total];
+    let mut itwiddles = vec![BaseField::default(); total];
     let (tw_buffer, itw_buffer) = (
         bind_output(&ctx.device, &mut twiddles)?,
         bind_output(&ctx.device, &mut itwiddles)?,
@@ -208,7 +207,7 @@ pub(crate) fn precompute_twiddles_metal(mut coset: Coset) -> Option<TwiddleTree<
         coset = coset.double();
     }
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::context::wait_for_completion(command_buffer).ok()?;
 
     // The CPU path pads the buffer to a power of two with this constant.
     twiddles[total - 1] = BaseField::from_u32_unchecked(1);

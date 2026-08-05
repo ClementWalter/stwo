@@ -24,7 +24,6 @@ use metal::{
 
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
-use crate::core::utils::uninit_vec;
 use crate::prover::backend::CpuBackend;
 use crate::prover::secure_column::SecureColumnByCoords;
 
@@ -157,10 +156,26 @@ fn bind_input(device: &Device, data: &[BaseField]) -> Buffer {
     }
 }
 
+fn bind_output(device: &Device, data: &mut [BaseField]) -> Buffer {
+    let bytes = std::mem::size_of_val(data);
+    let page = 16384;
+    if (data.as_mut_ptr() as usize).is_multiple_of(page) && bytes.is_multiple_of(page) {
+        // The exclusive borrow is not used again until the awaited command completes.
+        device.new_buffer_with_bytes_no_copy(
+            data.as_mut_ptr() as *const std::ffi::c_void,
+            bytes as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        )
+    } else {
+        device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+    }
+}
+
 /// Evaluates an AIR's constraints over all evaluation-domain rows on the GPU and
 /// accumulates the quotients, given the AIR's MSL body (see the module docs for the
 /// contract). `trace_columns` are grouped per interaction, in mask order. Returns
-/// `None` when no usable device exists or the body fails to compile.
+/// `None` when no usable device exists, the body fails to compile, or execution fails.
 #[allow(clippy::too_many_arguments)]
 pub fn accumulate_constraints_metal(
     trace_columns: &[Vec<&[BaseField]>],
@@ -229,9 +244,11 @@ pub fn accumulate_constraints_metal(
         .iter()
         .map(|c| bind_input(&ctx.device, c))
         .collect();
-    // Safety: the kernel writes every entry before anything reads them.
-    let mut out: [Vec<BaseField>; 4] = std::array::from_fn(|_| unsafe { uninit_vec(n_rows) });
-    let out_buffers: Vec<Buffer> = out.iter().map(|c| bind_input(&ctx.device, c)).collect();
+    let mut out: [Vec<BaseField>; 4] = std::array::from_fn(|_| vec![BaseField::default(); n_rows]);
+    let out_buffers: Vec<Buffer> = out
+        .iter_mut()
+        .map(|c| bind_output(&ctx.device, c))
+        .collect();
 
     let params = Params {
         n_rows: n_rows as u32,
@@ -264,7 +281,7 @@ pub fn accumulate_constraints_metal(
     encoder.dispatch_threads(MTLSize::new(n_rows as u64, 1, 1), MTLSize::new(256, 1, 1));
     encoder.end_encoding();
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::context::wait_for_completion(command_buffer).ok()?;
 
     for (vec, buffer) in out.iter_mut().zip(&out_buffers) {
         let zero_copy = std::ptr::eq(buffer.contents() as *const BaseField, vec.as_ptr());
