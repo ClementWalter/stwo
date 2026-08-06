@@ -706,8 +706,10 @@ pub(crate) fn fused_transform_metal_chained<R>(
     tracing::debug!("metal fused: alloc+bind {:?}", t_alloc.elapsed());
     let t_encode = std::time::Instant::now();
 
-    // First command buffer: every column's ifft, in place.
-    let ifft_buffer = ctx.queue.new_command_buffer();
+    // Encode IFFT, LDE, and the optional commitment chain into one ordered command
+    // buffer. Metal's encoder ordering makes the coefficient writes visible to the
+    // following LDE reads without a host synchronization boundary.
+    let command_buffer = ctx.queue.new_command_buffer();
     for ((_, domain, needs_ifft, _), (values_buffer, _)) in work.iter().zip(&bindings) {
         if !*needs_ifft {
             continue;
@@ -729,7 +731,7 @@ pub(crate) fn fused_transform_metal_chained<R>(
             let scale = if idx == last { n_inv } else { 1 };
             encode_pass(
                 &ctx,
-                ifft_buffer,
+                command_buffer,
                 values_buffer,
                 tw,
                 n_log,
@@ -741,15 +743,6 @@ pub(crate) fn fused_transform_metal_chained<R>(
             );
         }
     }
-    ifft_buffer.commit();
-
-    super::context::wait_for_completion(ifft_buffer).unwrap_or_else(|status| {
-        // The input evaluations may already be partially transformed, so returning
-        // them as an `Err` fallback would silently feed corrupted data to the CPU.
-        panic!("Metal fused inverse FFT failed with status {status:?}")
-    });
-
-    let command_buffer = ctx.queue.new_command_buffer();
     for ((values, domain, _, out), (values_buffer, out_buffer)) in work.iter().zip(&bindings) {
         let n_log = domain.log_size();
         let ext_domain = CanonicCoset::new(n_log + log_blowup_factor).circle_domain();
@@ -786,7 +779,9 @@ pub(crate) fn fused_transform_metal_chained<R>(
     let t_wait = std::time::Instant::now();
     command_buffer.commit();
     super::context::wait_for_completion(command_buffer).unwrap_or_else(|status| {
-        panic!("Metal fused extension/commit failed with status {status:?}")
+        // Inputs may already contain transformed coefficients, so a post-dispatch
+        // failure remains fail-closed rather than attempting a CPU fallback.
+        panic!("Metal fused transform/commit failed with status {status:?}")
     });
     tracing::debug!("metal fused: gpu {:?}", t_wait.elapsed());
 

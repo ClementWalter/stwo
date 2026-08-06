@@ -324,21 +324,6 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
         };
         basis_span.exit();
 
-        // Lambda that evaluates a polynomial on a collection of circle points and returns a vector
-        // of point samples.
-        let eval_at_points = |(poly, points): (&Poly<B>, &Vec<CirclePoint<SecureField>>)| {
-            points
-                .iter()
-                .map(|&point| PointSample {
-                    point,
-                    value: poly.eval_at_point(
-                        point.repeated_double(lifting_log_size - poly.evals.domain.log_size()),
-                        weights_hash_map.as_ref(),
-                    ),
-                })
-                .collect_vec()
-        };
-
         let samples: TreeVec<Vec<Vec<PointSample>>> = if self.store_polynomials_coefficients {
             // All same-size columns sampled at one (folded) point share an FFT-basis
             // column; grouping them lets the backend stream that basis once for the
@@ -349,6 +334,20 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                 lifting_log_size,
             )
         } else {
+            // Lambda that evaluates a polynomial on a collection of circle points and returns a
+            // vector of point samples.
+            let eval_at_points = |(poly, points): (&Poly<B>, &Vec<CirclePoint<SecureField>>)| {
+                points
+                    .iter()
+                    .map(|&point| PointSample {
+                        point,
+                        value: poly.eval_at_point(
+                            point.repeated_double(lifting_log_size - poly.evals.domain.log_size()),
+                            weights_hash_map.as_ref(),
+                        ),
+                    })
+                    .collect_vec()
+            };
             #[cfg(not(feature = "parallel"))]
             {
                 self.polynomials()
@@ -362,6 +361,9 @@ impl<'a, B: BackendForChannel<MC>, MC: MerkleChannel> CommitmentSchemeProver<'a,
                     .par_map_cols(eval_at_points)
             }
         };
+        // Basis/weight columns are only needed to produce `samples`. Release them
+        // before quotient and FRI allocations reach their high-water mark.
+        drop(weights_hash_map);
 
         span.exit();
         let sampled_values = samples

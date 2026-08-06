@@ -131,22 +131,83 @@ impl PolyOps for CpuBackend {
         use crate::prover::poly::circle::CircleEvaluation as GenericCircleEvaluation;
 
         const MIN_SIMD_DISPATCH_LOG_SIZE: u32 = 10;
-        let all_large = columns.iter().all(|column| {
-            let log_size = match column {
-                EvalsOrCoeffs::Evals(evals) => evals.domain.log_size(),
-                EvalsOrCoeffs::Coeffs(coeffs) => coeffs.log_size(),
-            };
-            log_size >= MIN_SIMD_DISPATCH_LOG_SIZE
-        });
-        if columns.is_empty() || !all_large {
-            // Fall back to the scalar single-pass default.
-            return fallback_interpolate_and_evaluate_polynomials(
-                columns,
+        if columns.is_empty() {
+            return Vec::new();
+        }
+
+        // A heterogeneous commitment must not let one tiny column drag every large
+        // column through the scalar transform. Partition first, process each class in
+        // a batch, then restore the protocol-visible column order exactly.
+        if columns
+            .iter()
+            .any(|column| column_log_size(column) < MIN_SIMD_DISPATCH_LOG_SIZE)
+        {
+            let total_columns = columns.len();
+            let (simd, scalar): (Vec<_>, Vec<_>) = columns
+                .into_iter()
+                .enumerate()
+                .partition(|(_, column)| column_log_size(column) >= MIN_SIMD_DISPATCH_LOG_SIZE);
+            let (simd_indices, simd_columns): (Vec<_>, Vec<_>) = simd.into_iter().unzip();
+            let (scalar_indices, scalar_columns): (Vec<_>, Vec<_>) = scalar.into_iter().unzip();
+            let simd_polys = Self::interpolate_and_evaluate_polynomials(
+                simd_columns,
                 log_blowup_factor,
                 twiddles,
                 store_polynomials_coefficients,
                 pool,
             );
+            let scalar_polys = fallback_interpolate_and_evaluate_polynomials(
+                scalar_columns,
+                log_blowup_factor,
+                twiddles,
+                store_polynomials_coefficients,
+                pool,
+            );
+            return restore_polynomial_order(
+                total_columns,
+                [(simd_indices, simd_polys), (scalar_indices, scalar_polys)],
+            );
+        }
+
+        // The Metal batch has a higher crossover than SIMD. Split only when both
+        // classes are present; an all-SIMD batch falls through to the existing cheap
+        // Metal rejection and then the packed CPU implementation.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let min_metal_log = crate::prover::backend::metal::fft::MIN_METAL_FFT_LOG_SIZE;
+            let has_metal = columns
+                .iter()
+                .any(|column| column_log_size(column) >= min_metal_log);
+            let has_simd_only = columns
+                .iter()
+                .any(|column| column_log_size(column) < min_metal_log);
+            if has_metal && has_simd_only {
+                let total_columns = columns.len();
+                let (metal, simd): (Vec<_>, Vec<_>) = columns
+                    .into_iter()
+                    .enumerate()
+                    .partition(|(_, column)| column_log_size(column) >= min_metal_log);
+                let (metal_indices, metal_columns): (Vec<_>, Vec<_>) = metal.into_iter().unzip();
+                let (simd_indices, simd_columns): (Vec<_>, Vec<_>) = simd.into_iter().unzip();
+                let metal_polys = Self::interpolate_and_evaluate_polynomials(
+                    metal_columns,
+                    log_blowup_factor,
+                    twiddles,
+                    store_polynomials_coefficients,
+                    pool,
+                );
+                let simd_polys = Self::interpolate_and_evaluate_polynomials(
+                    simd_columns,
+                    log_blowup_factor,
+                    twiddles,
+                    store_polynomials_coefficients,
+                    pool,
+                );
+                return restore_polynomial_order(
+                    total_columns,
+                    [(metal_indices, metal_polys), (simd_indices, simd_polys)],
+                );
+            }
         }
 
         // Apple-GPU path: all columns' transforms encoded into one command buffer
@@ -673,15 +734,38 @@ pub(crate) fn cached_simd_twiddles(
 
     use crate::prover::backend::simd::SimdBackend;
 
-    static CACHE: OnceLock<Mutex<HashMap<(u32, u32), Arc<TwiddleTree<SimdBackend>>>>> =
-        OnceLock::new();
+    type Tree = TwiddleTree<SimdBackend>;
+    type Cache = Mutex<HashMap<(u32, u32), Arc<OnceLock<Arc<Tree>>>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
     let key = (root_coset.initial_index.0 as u32, root_coset.log_size);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(tree) = cache.lock().unwrap().get(&key) {
-        return tree.clone();
-    }
-    let tree = Arc::new(SimdBackend::precompute_twiddles(root_coset));
-    cache.lock().unwrap().entry(key).or_insert(tree).clone()
+    cached_arc(cache, key, || SimdBackend::precompute_twiddles(root_coset))
+}
+
+/// Returns one shared value per key and permits at most one concurrent builder. The
+/// map lock only protects slot publication; expensive initialization is serialized by
+/// the per-key `OnceLock`, so unrelated keys can still initialize independently.
+fn cached_arc<K, V>(
+    cache: &std::sync::Mutex<
+        std::collections::HashMap<K, std::sync::Arc<std::sync::OnceLock<std::sync::Arc<V>>>>,
+    >,
+    key: K,
+    build: impl FnOnce() -> V,
+) -> std::sync::Arc<V>
+where
+    K: Eq + std::hash::Hash,
+{
+    use std::sync::{Arc, OnceLock};
+
+    let slot = {
+        let mut cache = cache.lock().unwrap();
+        Arc::clone(
+            cache
+                .entry(key)
+                .or_insert_with(|| Arc::new(OnceLock::new())),
+        )
+    };
+    Arc::clone(slot.get_or_init(|| Arc::new(build())))
 }
 
 /// Size from which eligible CPU polynomial operations dispatch to shared SIMD kernels.
@@ -1034,6 +1118,41 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_cache_miss_builds_value_once() {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier, Mutex, OnceLock};
+
+        let cache: Mutex<HashMap<u32, Arc<OnceLock<Arc<u32>>>>> = Mutex::new(HashMap::new());
+        let barrier = Barrier::new(16);
+        let builds = AtomicUsize::new(0);
+        let values = std::thread::scope(|scope| {
+            let handles = (0..16)
+                .map(|_| {
+                    let cache = &cache;
+                    let barrier = &barrier;
+                    let builds = &builds;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        super::cached_arc(cache, 7, || {
+                            builds.fetch_add(1, Ordering::Relaxed);
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            42
+                        })
+                    })
+                })
+                .collect_vec();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect_vec()
+        });
+
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        assert!(values.iter().all(|value| Arc::ptr_eq(value, &values[0])));
+    }
+
+    #[test]
     fn scalar_and_direct_simd_barycentric_weights_are_exact() {
         for log_size in [5, 9, 10, 11] {
             let coset = CanonicCoset::new(log_size);
@@ -1306,6 +1425,30 @@ fn fallback_interpolate_and_evaluate_polynomials(
     .collect()
 }
 
+const fn column_log_size(column: &EvalsOrCoeffs<CpuBackend>) -> u32 {
+    match column {
+        EvalsOrCoeffs::Evals(evals) => evals.domain.log_size(),
+        EvalsOrCoeffs::Coeffs(coeffs) => coeffs.log_size(),
+    }
+}
+
+fn restore_polynomial_order<const N: usize>(
+    total_columns: usize,
+    groups: [(Vec<usize>, Vec<Poly<CpuBackend>>); N],
+) -> Vec<Poly<CpuBackend>> {
+    let mut ordered: Vec<Option<Poly<CpuBackend>>> = (0..total_columns).map(|_| None).collect();
+    for (indices, polynomials) in groups {
+        assert_eq!(indices.len(), polynomials.len());
+        for (index, polynomial) in zip(indices, polynomials) {
+            assert!(ordered[index].replace(polynomial).is_none());
+        }
+    }
+    ordered
+        .into_iter()
+        .map(|polynomial| polynomial.expect("partition omitted a polynomial"))
+        .collect()
+}
+
 #[cfg(test)]
 mod dispatch_tests {
     use itertools::Itertools;
@@ -1503,6 +1646,122 @@ mod dispatch_tests {
                     "coeffs log_size {log_size} col {c}"
                 );
             }
+        }
+    }
+
+    /// Mixed-size commitments retain their original order while independently taking
+    /// the scalar, SIMD, and (when enabled) Metal transform paths. Both evaluations and
+    /// already-interpolated coefficients are covered so partitioning cannot change the
+    /// representation contract at either input boundary.
+    #[test]
+    fn mixed_size_commit_partition_matches_scalar_in_order() {
+        const LOG_BLOWUP: u32 = 1;
+        // Adjacent pairs put both input representations through every dispatch tier.
+        let logs = [5u32, 5, 9, 9, 10, 10, 13, 13, 14, 14, 20, 20];
+        let twiddles =
+            CpuBackend::precompute_twiddles(CanonicCoset::new(21).circle_domain().half_coset);
+        let mut columns = Vec::with_capacity(logs.len());
+        let mut expected = Vec::with_capacity(logs.len());
+
+        for (column_index, &log_size) in logs.iter().enumerate() {
+            let values = (0..1usize << log_size)
+                .map(|row| {
+                    BaseField::from(
+                        (row as u32)
+                            .wrapping_mul(2654435761)
+                            .wrapping_add((column_index as u32 + 1) * 97)
+                            >> 1,
+                    )
+                })
+                .collect_vec();
+            let domain = CanonicCoset::new(log_size).circle_domain();
+            let scalar_coeffs = if column_index.is_multiple_of(2) {
+                let eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+                    domain,
+                    values.clone(),
+                );
+                columns.push(EvalsOrCoeffs::Evals(eval));
+                interpolate_scalar(
+                    CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+                        domain, values,
+                    ),
+                    &twiddles,
+                )
+            } else {
+                let coeffs = CircleCoefficients::<CpuBackend>::new(values);
+                columns.push(EvalsOrCoeffs::Coeffs(CircleCoefficients::new(
+                    coeffs.coeffs.clone(),
+                )));
+                coeffs
+            };
+            let ext_domain = CanonicCoset::new(log_size + LOG_BLOWUP).circle_domain();
+            let scalar_evals = evaluate_into_scalar(
+                &scalar_coeffs,
+                ext_domain,
+                &twiddles,
+                vec![BaseField::zero(); ext_domain.size()],
+            );
+            expected.push((scalar_coeffs, scalar_evals));
+        }
+
+        let pool = BaseColumnPool::new();
+        let dispatched = <CpuBackend as PolyOps>::interpolate_and_evaluate_polynomials(
+            columns, LOG_BLOWUP, &twiddles, true, &pool,
+        );
+
+        assert_eq!(dispatched.len(), logs.len());
+        for (index, (actual, (expected_coeffs, expected_evals))) in
+            dispatched.iter().zip(expected).enumerate()
+        {
+            assert_eq!(
+                actual.coeffs.as_ref().unwrap().coeffs,
+                expected_coeffs.coeffs,
+                "coefficient order or value mismatch at input index {index}"
+            );
+            assert_eq!(
+                actual.evals.values, expected_evals.values,
+                "evaluation order or value mismatch at input index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_size_commit_without_stored_coefficients_matches_scalar() {
+        const LOG_BLOWUP: u32 = 1;
+        let logs = [9u32, 10, 14];
+        let twiddles =
+            CpuBackend::precompute_twiddles(CanonicCoset::new(15).circle_domain().half_coset);
+        let mut columns = Vec::new();
+        let mut expected = Vec::new();
+        for (index, &log_size) in logs.iter().enumerate() {
+            let domain = CanonicCoset::new(log_size).circle_domain();
+            let values = (0..1usize << log_size)
+                .map(|row| BaseField::from((row as u32 + 1) * (index as u32 + 3)))
+                .collect_vec();
+            let scalar_coeffs = interpolate_scalar(
+                CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+                    domain,
+                    values.clone(),
+                ),
+                &twiddles,
+            );
+            let ext_domain = CanonicCoset::new(log_size + LOG_BLOWUP).circle_domain();
+            expected.push(evaluate_into_scalar(
+                &scalar_coeffs,
+                ext_domain,
+                &twiddles,
+                vec![BaseField::zero(); ext_domain.size()],
+            ));
+            columns.push(EvalsOrCoeffs::Evals(CircleEvaluation::new(domain, values)));
+        }
+
+        let pool = BaseColumnPool::new();
+        let dispatched = <CpuBackend as PolyOps>::interpolate_and_evaluate_polynomials(
+            columns, LOG_BLOWUP, &twiddles, false, &pool,
+        );
+        for (actual, expected) in dispatched.iter().zip(expected) {
+            assert!(actual.coeffs.is_none());
+            assert_eq!(actual.evals.values, expected.values);
         }
     }
 }

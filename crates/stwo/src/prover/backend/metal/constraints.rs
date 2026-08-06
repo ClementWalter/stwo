@@ -186,6 +186,29 @@ pub fn accumulate_constraints_metal(
     trace_log_size: u32,
     air_body: &str,
 ) -> Option<SecureColumnByCoords<CpuBackend>> {
+    metal::objc::rc::autoreleasepool(|| {
+        accumulate_constraints_metal_inner(
+            trace_columns,
+            random_coeff_powers,
+            denom_inv,
+            accum,
+            n_rows,
+            trace_log_size,
+            air_body,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_constraints_metal_inner(
+    trace_columns: &[Vec<&[BaseField]>],
+    random_coeff_powers: &[SecureField],
+    denom_inv: &[BaseField],
+    accum: &SecureColumnByCoords<CpuBackend>,
+    n_rows: usize,
+    trace_log_size: u32,
+    air_body: &str,
+) -> Option<SecureColumnByCoords<CpuBackend>> {
     assert!(trace_columns.len() <= 4);
     let ctx = context()?;
     let mut ctx = ctx.lock().unwrap();
