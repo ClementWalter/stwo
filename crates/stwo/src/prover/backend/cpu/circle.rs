@@ -438,33 +438,14 @@ impl PolyOps for CpuBackend {
         coset: CanonicCoset,
         p: CirclePoint<SecureField>,
     ) -> Col<CpuBackend, SecureField> {
-        let domain = coset.circle_domain();
+        if barycentric_weights_use_simd(coset.log_size()) {
+            use crate::prover::backend::simd::SimdBackend;
 
-        let (si_i, vi_p): (Vec<_>, Vec<_>) = (0..domain.size())
-            .map(|i| {
-                let coset_point = domain
-                    .at(bit_reverse_index(i, domain.log_size()))
-                    .into_ef::<SecureField>();
-                let minus_two_coset_point_y = coset_point.y * SecureField::from(-2);
-                (
-                    minus_two_coset_point_y
-                        * coset_vanishing_derivative(
-                            Coset::new(CirclePointIndex::generator(), domain.log_size()),
-                            coset_point,
-                        ),
-                    point_vanishing(coset_point, p.into_ef::<SecureField>()),
-                )
-            })
-            .unzip();
+            let weights = <SimdBackend as PolyOps>::barycentric_weights(coset, p);
+            return weights.to_cpu();
+        }
 
-        let vn_p: SecureField = coset_vanishing(
-            CanonicCoset::new(domain.log_size()).coset,
-            p.into_ef::<SecureField>(),
-        );
-
-        (0..domain.size())
-            .map(|i| vn_p / (si_i[i] * vi_p[i]))
-            .collect_vec()
+        barycentric_weights_scalar(coset, p)
     }
 
     fn barycentric_eval_at_point(
@@ -703,8 +684,46 @@ pub(crate) fn cached_simd_twiddles(
     cache.lock().unwrap().entry(key).or_insert(tree).clone()
 }
 
-/// Size from which single-column transforms dispatch to the shared SIMD FFT kernels.
+/// Size from which eligible CPU polynomial operations dispatch to shared SIMD kernels.
 const SIMD_DISPATCH_LOG_SIZE: u32 = 10;
+
+const fn barycentric_weights_use_simd(log_size: u32) -> bool {
+    log_size >= SIMD_DISPATCH_LOG_SIZE
+}
+
+/// Scalar barycentric-weight implementation and recursion-safe SIMD base case.
+pub(crate) fn barycentric_weights_scalar(
+    coset: CanonicCoset,
+    p: CirclePoint<SecureField>,
+) -> Vec<SecureField> {
+    let domain = coset.circle_domain();
+
+    let (si_i, vi_p): (Vec<_>, Vec<_>) = (0..domain.size())
+        .map(|i| {
+            let coset_point = domain
+                .at(bit_reverse_index(i, domain.log_size()))
+                .into_ef::<SecureField>();
+            let minus_two_coset_point_y = coset_point.y * SecureField::from(-2);
+            (
+                minus_two_coset_point_y
+                    * coset_vanishing_derivative(
+                        Coset::new(CirclePointIndex::generator(), domain.log_size()),
+                        coset_point,
+                    ),
+                point_vanishing(coset_point, p.into_ef::<SecureField>()),
+            )
+        })
+        .unzip();
+
+    let vn_p: SecureField = coset_vanishing(
+        CanonicCoset::new(domain.log_size()).coset,
+        p.into_ef::<SecureField>(),
+    );
+
+    (0..domain.size())
+        .map(|i| vn_p / (si_i[i] * vi_p[i]))
+        .collect_vec()
+}
 
 /// Converts a coefficient column between the SIMD kernels' large-transform layout and
 /// natural coefficient order. Above [`CACHED_FFT_LOG_SIZE`] the SIMD ifft leaves
@@ -979,14 +998,76 @@ mod tests {
     use itertools::Itertools;
     use num_traits::One;
 
-    use crate::core::circle::CirclePoint;
+    use crate::core::circle::{CirclePoint, SECURE_FIELD_CIRCLE_GEN};
     use crate::core::fields::m31::BaseField;
     use crate::core::fields::qm31::SecureField;
     use crate::core::poly::circle::CanonicCoset;
     use crate::prover::backend::cpu::CpuCirclePoly;
-    use crate::prover::backend::CpuBackend;
+    use crate::prover::backend::simd::SimdBackend;
+    use crate::prover::backend::{Column, CpuBackend};
     use crate::prover::poly::circle::{CircleEvaluation, PolyOps};
     use crate::prover::poly::BitReversedOrder;
+
+    fn extension_barycentric_points() -> [CirclePoint<SecureField>; 2] {
+        let points = [
+            SECURE_FIELD_CIRCLE_GEN,
+            SECURE_FIELD_CIRCLE_GEN.mul(1_234_567),
+        ];
+        for point in points {
+            let x = point.x.to_m31_array();
+            let y = point.y.to_m31_array();
+            assert!(
+                x[1..]
+                    .iter()
+                    .chain(&y[1..])
+                    .any(|coordinate| coordinate.0 != 0),
+                "test point must not be base-field-valued"
+            );
+        }
+        points
+    }
+
+    #[test]
+    fn barycentric_dispatch_threshold_is_pinned() {
+        assert!(!super::barycentric_weights_use_simd(9));
+        assert!(super::barycentric_weights_use_simd(10));
+    }
+
+    #[test]
+    fn scalar_and_direct_simd_barycentric_weights_are_exact() {
+        for log_size in [5, 9, 10, 11] {
+            let coset = CanonicCoset::new(log_size);
+            for point in extension_barycentric_points() {
+                let scalar = super::barycentric_weights_scalar(coset, point);
+                let simd = <SimdBackend as PolyOps>::barycentric_weights(coset, point).to_cpu();
+                assert_eq!(simd, scalar, "log_size={log_size}, point={point:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn public_cpu_barycentric_weights_match_scalar_across_dispatch() {
+        for log_size in [9, 10, 11] {
+            let coset = CanonicCoset::new(log_size);
+            for point in extension_barycentric_points() {
+                let scalar = super::barycentric_weights_scalar(coset, point);
+                let public = <CpuBackend as PolyOps>::barycentric_weights(coset, point);
+                assert_eq!(public, scalar, "log_size={log_size}, point={point:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn small_simd_barycentric_fallback_matches_scalar() {
+        for log_size in 1..=4 {
+            let coset = CanonicCoset::new(log_size);
+            for point in extension_barycentric_points() {
+                let scalar = super::barycentric_weights_scalar(coset, point);
+                let simd = <SimdBackend as PolyOps>::barycentric_weights(coset, point).to_cpu();
+                assert_eq!(simd, scalar, "log_size={log_size}, point={point:?}");
+            }
+        }
+    }
 
     #[test]
     fn test_eval_at_point_with_4_coeffs() {

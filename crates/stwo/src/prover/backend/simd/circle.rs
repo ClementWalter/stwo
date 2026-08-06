@@ -380,13 +380,9 @@ impl PolyOps for SimdBackend {
         let log_size = domain.log_size();
         let weights_vec_len = domain.size().div_ceil(N_LANES);
         if weights_vec_len == 1 {
-            return Col::<SimdBackend, SecureField>::from_iter(CircleEvaluation::<
-                CpuBackend,
-                BaseField,
-                BitReversedOrder,
-            >::barycentric_weights(
-                coset, p
-            ));
+            return crate::prover::backend::cpu::circle::barycentric_weights_scalar(coset, p)
+                .into_iter()
+                .collect();
         }
 
         let p = p.into_ef::<SecureField>();
