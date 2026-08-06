@@ -8,6 +8,7 @@ use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::core::fields::FieldExpOps;
 use crate::core::poly::line::LineDomain;
+use crate::core::poly::utils::domain_line_twiddles_from_tree;
 use crate::core::utils::bit_reverse_index;
 use crate::prover::fri::FriOps;
 use crate::prover::line::LineEvaluation;
@@ -53,9 +54,11 @@ impl FriOps for CpuBackend {
             let mut ok = true;
             for &alpha in alphas {
                 let src = values.as_ref().unwrap_or(&eval.values);
+                let coordinate_inverses =
+                    domain_line_twiddles_from_tree(domain, &twiddles.itwiddles)[0];
                 match crate::prover::backend::metal::fri::fold_metal(
                     src,
-                    domain.coset(),
+                    coordinate_inverses,
                     false,
                     alpha,
                 ) {
@@ -105,9 +108,11 @@ impl FriOps for CpuBackend {
         // Apple-GPU path; bit-identical to the scalar fold.
         #[cfg(all(feature = "metal", target_os = "macos"))]
         if src.len() / 2 >= 1 << crate::prover::backend::metal::fri::MIN_METAL_FOLD_LOG_SIZE {
+            let coordinate_inverses =
+                domain_line_twiddles_from_tree(src.domain, &twiddles.itwiddles)[0];
             if let Some(values) = crate::prover::backend::metal::fri::fold_metal(
                 &src.values,
-                src.domain.half_coset,
+                coordinate_inverses,
                 true,
                 alpha,
             ) {

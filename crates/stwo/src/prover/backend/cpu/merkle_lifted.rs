@@ -132,7 +132,7 @@ impl<H: MerkleHasherLifted + Send + Sync + 'static> MerkleOpsLifted<H> for CpuBa
     fn fold_line_and_packed_tree(
         eval: &crate::prover::line::LineEvaluation<Self>,
         alphas: &[crate::core::fields::qm31::SecureField],
-        _twiddles: &crate::prover::poly::twiddles::TwiddleTree<Self>,
+        twiddles: &crate::prover::poly::twiddles::TwiddleTree<Self>,
     ) -> Option<(crate::prover::line::LineEvaluation<Self>, Vec<Vec<H::Hash>>)>
     where
         Self: crate::prover::fri::FriOps,
@@ -150,6 +150,7 @@ impl<H: MerkleHasherLifted + Send + Sync + 'static> MerkleOpsLifted<H> for CpuBa
                         &eval.values,
                         eval.domain().coset(),
                         alphas,
+                        &twiddles.itwiddles,
                         is_m31,
                     )
                 {
