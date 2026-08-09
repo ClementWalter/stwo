@@ -204,6 +204,17 @@ pub fn warmup() {
     ood::warmup();
 }
 
+/// Waits for an externally encoded Metal command buffer and records its result in
+/// the same checked-submission counters used by [`MetalSession`].
+///
+/// Callers must invoke this exactly once after committing the command buffer and
+/// must not read outputs or fall back to mutation-sensitive host work on error.
+pub fn record_checked_completion(
+    command_buffer: &metal::CommandBufferRef,
+) -> Result<(), metal::MTLCommandBufferStatus> {
+    context::wait_for_completion(command_buffer)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{mpsc, Arc, Mutex};

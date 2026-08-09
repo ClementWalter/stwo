@@ -481,6 +481,23 @@ impl PolyOps for SimdBackend {
             .sum::<SecureField>();
     }
 
+    fn barycentric_eval_many_at_point(
+        evals: &[&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>],
+        weights: &Col<SimdBackend, SecureField>,
+    ) -> Vec<SecureField> {
+        #[cfg(feature = "parallel")]
+        return evals
+            .par_iter()
+            .map(|eval| Self::barycentric_eval_at_point(eval, weights))
+            .collect();
+
+        #[cfg(not(feature = "parallel"))]
+        evals
+            .iter()
+            .map(|eval| Self::barycentric_eval_at_point(eval, weights))
+            .collect()
+    }
+
     fn eval_at_point_by_folding(
         evals: &CircleEvaluation<Self, BaseField, BitReversedOrder>,
         point: CirclePoint<SecureField>,

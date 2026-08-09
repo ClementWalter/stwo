@@ -21,6 +21,13 @@ pub enum EvalsOrCoeffs<B: ColumnOps<BaseField>> {
     Coeffs(CircleCoefficients<B>),
 }
 
+/// Same-domain evaluation columns sampled at one already-folded OOD point.
+pub struct BarycentricEvalGroup<'a, B: ColumnOps<BaseField>> {
+    pub coset: CanonicCoset,
+    pub point: CirclePoint<SecureField>,
+    pub evals: Vec<&'a CircleEvaluation<B, BaseField, BitReversedOrder>>,
+}
+
 pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
     // TODO(alont): Use a column instead of this type.
     /// The type for precomputed twiddles.
@@ -101,6 +108,32 @@ pub trait PolyOps: ColumnOps<BaseField> + ColumnOps<SecureField> + Sized {
         evals: &CircleEvaluation<Self, BaseField, BitReversedOrder>,
         weights: &Col<Self, SecureField>,
     ) -> SecureField;
+
+    /// Evaluates many same-domain evaluation columns at one sampled point through its
+    /// shared barycentric-weight column. The output order matches `evals` exactly.
+    fn barycentric_eval_many_at_point(
+        evals: &[&CircleEvaluation<Self, BaseField, BitReversedOrder>],
+        weights: &Col<Self, SecureField>,
+    ) -> Vec<SecureField> {
+        evals
+            .iter()
+            .map(|eval| Self::barycentric_eval_at_point(eval, weights))
+            .collect()
+    }
+
+    /// Attempts to evaluate several shared-point groups as one backend batch.
+    /// `None` entries are intentionally left to the caller's scalar/SIMD fallback.
+    fn barycentric_eval_many_groups(
+        groups: &[BarycentricEvalGroup<'_, Self>],
+    ) -> Vec<Option<Vec<SecureField>>> {
+        groups.iter().map(|_| None).collect()
+    }
+
+    /// Minimum log size at which the backend can generate and consume barycentric
+    /// groups without first materializing host weight columns.
+    fn resident_barycentric_min_log_size() -> Option<u32> {
+        None
+    }
 
     /// Evaluates a polynomial, represented by it's evaluations, at a point using folding.
     /// Used by the [`CircleEvaluation::eval_at_point_by_folding()`] function.

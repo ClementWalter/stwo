@@ -50,6 +50,7 @@ impl BaseExpr {
     pub fn degree_bound(&self, named_exprs: &NamedExprs) -> Degree {
         match self {
             BaseExpr::Col(_) => 1,
+            BaseExpr::PreprocessedColumn(_) => 1,
             BaseExpr::Const(_) => 0,
             BaseExpr::Param(name) => named_exprs.degree_bound(name.clone()),
             BaseExpr::Add(a, b) => a.degree_bound(named_exprs).max(b.degree_bound(named_exprs)),

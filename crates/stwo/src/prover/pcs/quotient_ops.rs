@@ -257,9 +257,15 @@ mod tests {
         B: BackendForChannel<Blake2sMerkleChannel>,
         const STORE_COEFFS: bool,
     >() -> Result<(), VerificationError> {
-        const N_COLS: usize = 10;
-        const LIFTING_LOG_SIZE: u32 = 8;
+        prove_and_verify_pcs_sized::<B, STORE_COEFFS, 10, 8>()
+    }
 
+    fn prove_and_verify_pcs_sized<
+        B: BackendForChannel<Blake2sMerkleChannel>,
+        const STORE_COEFFS: bool,
+        const N_COLS: usize,
+        const LIFTING_LOG_SIZE: u32,
+    >() -> Result<(), VerificationError> {
         // Setup the prover side of the pcs.
         let mut channel = Blake2sChannel::default();
         let config = PcsConfig::default();
@@ -301,6 +307,23 @@ mod tests {
     #[test]
     fn test_pcs_prove_and_verify_cpu() {
         assert!(prove_and_verify_pcs::<CpuBackend, true>().is_ok());
+    }
+    #[test]
+    fn test_pcs_prove_and_verify_cpu_with_barycentric() {
+        assert!(prove_and_verify_pcs::<CpuBackend, false>().is_ok());
+    }
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn test_pcs_prove_and_verify_cpu_with_resident_barycentric() {
+        use crate::prover::backend::metal::{MetalRequirement, MetalSession};
+
+        let session = MetalSession::admit().expect("resident PCS test requires Metal");
+        assert!(prove_and_verify_pcs_sized::<CpuBackend, false, 3, 16>().is_ok());
+        let report = session.finish();
+        assert_eq!(report.failed_submissions, 0);
+        MetalRequirement::ParticipationRequired
+            .validate(&report)
+            .expect("resident PCS proof must execute checked Metal work");
     }
     #[test]
     fn test_pcs_prove_and_verify_simd() {

@@ -174,7 +174,7 @@ impl<H: MerkleHasherLifted + Send + Sync + 'static> MerkleOpsLifted<H> for CpuBa
                 }
             }
         }
-        let _ = (eval, alphas);
+        let _ = (eval, alphas, twiddles);
         None
     }
 

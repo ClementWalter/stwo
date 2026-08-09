@@ -6,9 +6,9 @@ use stwo::core::Fraction;
 use super::assignment::{ExprVarAssignment, ExprVariables};
 use super::degree::NamedExprs;
 use super::{BaseExpr, ExtExpr};
-use crate::expr::ColumnExpr;
+use crate::expr::{ColumnExpr, PreprocessedColumnExpr};
 use crate::preprocessed_columns::PreProcessedColumnId;
-use crate::{EvalAtRow, Relation, RelationEntry, INTERACTION_TRACE_IDX};
+use crate::{EvalAtRow, Relation, RelationEntry, INTERACTION_TRACE_IDX, MAX_N_INTERACTIONS};
 
 pub struct FormalLogupAtRow {
     pub interaction: usize,
@@ -61,7 +61,8 @@ fn combine_formal<R: Relation<BaseExpr, ExtExpr>>(relation: &R, values: &[BaseEx
 
 /// An Evaluator that saves all constraint expressions.
 pub struct ExprEvaluator {
-    pub cur_var_index: usize,
+    pub column_index_per_interaction: [usize; MAX_N_INTERACTIONS],
+    preprocessed_column_access_index: usize,
     pub constraints: Vec<ExtExpr>,
     pub logup: FormalLogupAtRow,
     pub intermediates: HashMap<String, BaseExpr>,
@@ -79,7 +80,8 @@ impl Default for ExprEvaluator {
 impl ExprEvaluator {
     pub fn new() -> Self {
         Self {
-            cur_var_index: Default::default(),
+            column_index_per_interaction: [0; MAX_N_INTERACTIONS],
+            preprocessed_column_access_index: 0,
             constraints: Default::default(),
             logup: FormalLogupAtRow::new(INTERACTION_TRACE_IDX),
             // TODO(alont) unify both intermediate types.
@@ -146,6 +148,11 @@ impl ExprEvaluator {
             .collect()
     }
 
+    /// Intermediate names in dependency order, for deterministic offline lowering.
+    pub fn ordered_intermediates(&self) -> &[String] {
+        &self.ordered_intermediates
+    }
+
     /// Collects all the variables used in the constraints and intermediates. Excludes the
     /// intermediates themselves.
     fn collect_variables(&self) -> ExprVariables {
@@ -206,11 +213,12 @@ impl EvalAtRow for ExprEvaluator {
         interaction: usize,
         offsets: [isize; N],
     ) -> [Self::F; N] {
+        let column_index = self.column_index_per_interaction[interaction];
+        self.column_index_per_interaction[interaction] += 1;
         let res = std::array::from_fn(|i| {
-            let col = ColumnExpr::from((interaction, self.cur_var_index, offsets[i]));
+            let col = ColumnExpr::from((interaction, column_index, offsets[i]));
             BaseExpr::Col(col)
         });
-        self.cur_var_index += 1;
         res
     }
 
@@ -263,7 +271,9 @@ impl EvalAtRow for ExprEvaluator {
     }
 
     fn get_preprocessed_column(&mut self, column: PreProcessedColumnId) -> Self::F {
-        BaseExpr::Param(column.id)
+        let access_index = self.preprocessed_column_access_index;
+        self.preprocessed_column_access_index += 1;
+        BaseExpr::PreprocessedColumn(PreprocessedColumnExpr::new(column, access_index))
     }
 
     crate::logup_proxy!();
@@ -288,11 +298,81 @@ impl EvalAtRow for ExprEvaluator {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use num_traits::One;
+    use stwo::core::fields::m31::BaseField;
     use stwo::core::fields::FieldExpOps;
 
-    use crate::expr::{ExprEvaluator, ExtExpr};
-    use crate::{relation, EvalAtRow, FrameworkEval, RelationEntry};
+    use crate::expr::{BaseExpr, ExprEvaluator, ExtExpr};
+    use crate::preprocessed_columns::PreProcessedColumnId;
+    use crate::{relation, EvalAtRow, FrameworkEval, InfoEvaluator, RelationEntry};
+
+    #[test]
+    fn captures_column_indices_per_interaction_like_info_evaluator() {
+        let mut expr_eval = ExprEvaluator::new();
+        let mut info_eval = InfoEvaluator::empty();
+
+        let first_original = expr_eval.next_interaction_mask(1, [0, 2]);
+        info_eval.next_interaction_mask(1, [0, 2]);
+        let first_interaction = expr_eval.next_interaction_mask(2, [-3, 1]);
+        info_eval.next_interaction_mask(2, [-3, 1]);
+        let second_original = expr_eval.next_interaction_mask(1, [4]);
+        info_eval.next_interaction_mask(1, [4]);
+
+        assert_eq!(
+            first_original,
+            [
+                BaseExpr::Col((1, 0, 0).into()),
+                BaseExpr::Col((1, 0, 2).into()),
+            ]
+        );
+        assert_eq!(
+            first_interaction,
+            [
+                BaseExpr::Col((2, 0, -3).into()),
+                BaseExpr::Col((2, 0, 1).into()),
+            ]
+        );
+        assert_eq!(second_original, [BaseExpr::Col((1, 1, 4).into())]);
+        assert_eq!(expr_eval.column_index_per_interaction, [0, 2, 1, 0]);
+        assert_eq!(info_eval.mask_offsets[1], vec![vec![0, 2], vec![4]]);
+        assert_eq!(info_eval.mask_offsets[2], vec![vec![-3, 1]]);
+    }
+
+    #[test]
+    fn preprocessed_column_is_distinct_from_colliding_scalar_param() {
+        let column = PreProcessedColumnId {
+            id: "collision".to_string(),
+        };
+        let mut expr_eval = ExprEvaluator::new();
+        let preprocessed = expr_eval.get_preprocessed_column(column.clone());
+        let scalar_param = BaseExpr::Param(column.id.clone());
+
+        assert_ne!(preprocessed, scalar_param);
+        let BaseExpr::PreprocessedColumn(access) = &preprocessed else {
+            panic!("preprocessed access was not captured as a typed column")
+        };
+        assert_eq!(access.column(), &column);
+        assert_eq!(access.access_index(), 0);
+        assert_eq!(access.bind(&[17]), 17);
+
+        let expression = preprocessed - scalar_param;
+        let variables = expression.collect_variables();
+        assert!(variables.preprocessed_cols.contains(&column));
+        assert!(variables.params.contains(&column.id));
+
+        let assignment = (
+            HashMap::new(),
+            HashMap::from([(column.id.clone(), BaseField::from(11))]),
+            HashMap::new(),
+            HashMap::from([(column, BaseField::from(7))]),
+        );
+        assert_eq!(
+            expression.assign(&assignment),
+            BaseField::from(7) - BaseField::from(11)
+        );
+    }
 
     #[test]
     fn test_expr_evaluator() {
@@ -310,8 +390,8 @@ mod tests {
         let constraint_0 = ((trace_1_column_0_offset_0) * (intermediate0)) * (1 / (trace_1_column_0_offset_0 + trace_1_column_1_offset_0));
 
 \
-        let constraint_1 = (QM31Impl::from_partial_evals([trace_2_column_3_offset_0, trace_2_column_4_offset_0, trace_2_column_5_offset_0, trace_2_column_6_offset_0]) \
-            - (QM31Impl::from_partial_evals([trace_2_column_3_offset_neg_1, trace_2_column_4_offset_neg_1, trace_2_column_5_offset_neg_1, trace_2_column_6_offset_neg_1])) \
+        let constraint_1 = (QM31Impl::from_partial_evals([trace_2_column_0_offset_0, trace_2_column_1_offset_0, trace_2_column_2_offset_0, trace_2_column_3_offset_0]) \
+            - (QM31Impl::from_partial_evals([trace_2_column_0_offset_neg_1, trace_2_column_1_offset_neg_1, trace_2_column_2_offset_neg_1, trace_2_column_3_offset_neg_1])) \
                 + (claimed_sum) * (1 / (column_size))) \
             * (intermediate1) \
             - (qm31(1, 0, 0, 0));"

@@ -183,6 +183,16 @@ impl<E: FrameworkEval> FrameworkComponent<E> {
         &self.preprocessed_column_indices
     }
 
+    /// Preprocessed accesses in the exact order used by [`Self::preprocessed_column_indices`].
+    pub fn preprocessed_columns(&self) -> &[PreProcessedColumnId] {
+        &self.info.preprocessed_columns
+    }
+
+    /// Captured mask offsets grouped by interaction and component-local column order.
+    pub fn mask_offsets(&self) -> &TreeVec<Vec<Vec<isize>>> {
+        &self.info.mask_offsets
+    }
+
     pub const fn claimed_sum(&self) -> SecureField {
         self.claimed_sum
     }

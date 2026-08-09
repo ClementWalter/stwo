@@ -18,6 +18,8 @@ use std::sync::{Mutex, OnceLock};
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLResourceOptions, MTLSize,
 };
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use crate::core::circle::Coset;
 use crate::core::fields::m31::BaseField;
@@ -25,7 +27,7 @@ use crate::core::poly::circle::{CanonicCoset, CircleDomain};
 use crate::core::poly::utils::domain_line_twiddles_from_tree;
 use crate::prover::backend::cpu::circle::circle_twiddles_from_line_twiddles;
 use crate::prover::backend::CpuBackend;
-use crate::prover::poly::circle::EvalsOrCoeffs;
+use crate::prover::poly::circle::{CircleEvaluation, EvalsOrCoeffs, PolyOps};
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::Poly;
 
@@ -351,6 +353,28 @@ fn bind_output_zero_copy(device: &Device, data: &mut [BaseField]) -> Option<Buff
     })
 }
 
+/// Binds exactly `len` elements from a vector's spare capacity without first creating
+/// initialized `BaseField` values. The vector must not grow or otherwise move until
+/// the command buffer has completed and the caller has initialized every element.
+fn bind_spare_output_zero_copy(
+    device: &Device,
+    data: &mut Vec<BaseField>,
+    len: usize,
+) -> Option<Buffer> {
+    assert_eq!(data.len(), 0, "spare output must remain unpublished");
+    assert!(data.capacity() >= len, "insufficient spare output capacity");
+    let bytes = len.checked_mul(std::mem::size_of::<BaseField>())?;
+    let page = 16384;
+    ((data.as_mut_ptr() as usize).is_multiple_of(page) && bytes.is_multiple_of(page)).then(|| {
+        device.new_buffer_with_bytes_no_copy(
+            data.as_mut_ptr() as *const std::ffi::c_void,
+            u64::try_from(bytes).expect("Metal output length must fit u64"),
+            MTLResourceOptions::StorageModeShared,
+            None,
+        )
+    })
+}
+
 /// Batched in-place GPU inverse circle FFTs: every column's passes encoded into one
 /// command buffer, one synchronization. Returns the evaluations on `Err` when the GPU
 /// path can't take them before dispatch. A command failure panics because the returned
@@ -493,7 +517,7 @@ pub(crate) fn ifft_metal(
         &twiddles.itwiddles,
         true,
     );
-    // Safety: the cache entry lives as long as the context; no eviction.
+    // SAFETY: the cache entry lives as long as the locked context and the cache never evicts.
     let tw = unsafe { &*tw_ptr };
 
     let n_inv = BaseField::from_u32_unchecked(domain.size() as u32)
@@ -588,8 +612,10 @@ pub(crate) fn rfft_metal(
 /// Batched fused interpolate+extend for the commit path: encodes every column's ifft
 /// and rfft passes into one command buffer and waits once, so GPU work streams
 /// back-to-back instead of synchronizing per column. Returns the columns on `Err`
-/// when the GPU path can't take them before dispatch (no device, small or unalignable
-/// columns). A command failure panics because interpolation mutates fallback inputs.
+/// when the GPU path can't take them before dispatch (no device). Small or unaligned
+/// columns use shared copy buffers so a heterogeneous chained commitment can retain
+/// one ordered GPU epoch. A command failure panics because interpolation may already
+/// have mutated fallback inputs.
 #[allow(clippy::type_complexity)]
 pub(crate) fn fused_transform_metal(
     columns: Vec<EvalsOrCoeffs<CpuBackend>>,
@@ -643,24 +669,15 @@ pub(crate) fn fused_transform_metal_chained<R>(
     chain: impl FnOnce(&metal::CommandBufferRef, &[Buffer]) -> Option<R>,
 ) -> Result<(Vec<Poly<CpuBackend>>, Option<R>), Vec<EvalsOrCoeffs<CpuBackend>>> {
     let itw = ifft_twiddles.unwrap_or(twiddles);
-    let small = columns.iter().any(|column| {
-        let log_size = match column {
-            EvalsOrCoeffs::Evals(evals) => evals.domain.log_size(),
-            EvalsOrCoeffs::Coeffs(coeffs) => coeffs.log_size(),
-        };
-        log_size < MIN_METAL_FFT_LOG_SIZE
-    });
-    if small {
-        return Err(columns);
-    }
-    let Some(ctx) = context() else {
+    let Some(ctx_ref) = context() else {
         return Err(columns);
     };
-    let mut ctx = ctx.lock().unwrap();
 
-    // Unpack: (values, domain, needs_ifft) per column, plus a zeroed output vector.
+    // Unpack: values, domain, whether interpolation is needed, LDE output, and
+    // whether both transforms were completed on CPU/SIMD before the Metal epoch.
+    type Work = (Vec<BaseField>, CircleDomain, bool, Vec<BaseField>, bool);
     let t_alloc = std::time::Instant::now();
-    let mut work: Vec<(Vec<BaseField>, CircleDomain, bool, Vec<BaseField>)> = columns
+    let mut work: Vec<Work> = columns
         .into_iter()
         .map(|column| {
             let (values, domain, needs_ifft) = match column {
@@ -670,27 +687,117 @@ pub(crate) fn fused_transform_metal_chained<R>(
                     (coeffs.coeffs, domain, false)
                 }
             };
-            let ext_size = 1usize << (domain.log_size() + log_blowup_factor);
-            let out = vec![BaseField::default(); ext_size];
-            (values, domain, needs_ifft, out)
+            let ext_log = domain.log_size() + log_blowup_factor;
+            let ext_size = 1usize
+                .checked_shl(ext_log)
+                .expect("Metal LDE element count must fit usize");
+            ext_size
+                .checked_mul(std::mem::size_of::<BaseField>())
+                .expect("Metal LDE byte count must fit usize");
+            let out = if ext_log < MIN_METAL_FFT_LOG_SIZE {
+                Vec::new()
+            } else {
+                // Keep the typed length at zero until the completed RFFT has written
+                // every destination element. This avoids both the host zero-fill and
+                // exposing uninitialized `BaseField` values through a Rust slice.
+                Vec::with_capacity(ext_size)
+            };
+            (values, domain, needs_ifft, out, false)
         })
         .collect();
 
-    // Bind everything zero-copy up front; bail out (returning ownership) on failure.
+    // A sub-crossover LDE is faster in the existing scalar/SIMD path than as two tiny
+    // Metal encoders. Complete those columns in parallel, then expose their finished
+    // evaluations to the compact resident tree. Requiring the extended log to remain
+    // below the Metal crossover prevents the CPU helper from recursively dispatching
+    // a standalone GPU evaluation.
+    let t_small = std::time::Instant::now();
+    let prepare_small = |(values, domain, needs_ifft, out, cpu_complete): &mut Work| {
+        if domain.log_size() + log_blowup_factor >= MIN_METAL_FFT_LOG_SIZE {
+            return;
+        }
+        let coefficients = if *needs_ifft {
+            CircleEvaluation::<CpuBackend, BaseField, crate::prover::poly::BitReversedOrder>::new(
+                *domain,
+                std::mem::take(values),
+            )
+            .interpolate_with_twiddles(itw)
+        } else {
+            crate::prover::poly::circle::CircleCoefficients::new(std::mem::take(values))
+        };
+        let ext_domain = CanonicCoset::new(domain.log_size() + log_blowup_factor).circle_domain();
+        let evaluations = <CpuBackend as PolyOps>::evaluate(&coefficients, ext_domain, twiddles);
+        *values = coefficients.coeffs;
+        *out = evaluations.values;
+        *cpu_complete = true;
+    };
+    #[cfg(feature = "parallel")]
+    work.par_iter_mut().for_each(prepare_small);
+    #[cfg(not(feature = "parallel"))]
+    work.iter_mut().for_each(prepare_small);
+    tracing::debug!("metal fused: small CPU/SIMD {:?}", t_small.elapsed());
+
+    let mut ctx = ctx_ref.lock().unwrap();
+
+    // Bind aligned large vectors zero-copy. Finished small LDEs use shared copy
+    // buffers so the following compact hash can consume them in the same epoch.
     let mut bindings = Vec::with_capacity(work.len());
-    for (values, _, _, out) in &mut work {
-        let Some(values_buffer) = bind_output_zero_copy(&ctx.device, values) else {
-            return Err(repack(work));
+    for (values, domain, _, out, cpu_complete) in &mut work {
+        let out_len = 1usize
+            .checked_shl(domain.log_size() + log_blowup_factor)
+            .expect("Metal LDE element count must fit usize");
+        let out_bytes = out_len
+            .checked_mul(std::mem::size_of::<BaseField>())
+            .expect("Metal LDE byte count must fit usize");
+        let (out_buffer, out_zero_copy) = if *cpu_complete {
+            if let Some(buffer) = bind_output_zero_copy(&ctx.device, out) {
+                (buffer, true)
+            } else {
+                (
+                    ctx.device.new_buffer_with_data(
+                        out.as_ptr() as *const std::ffi::c_void,
+                        u64::try_from(out_bytes).expect("Metal output length must fit u64"),
+                        MTLResourceOptions::StorageModeShared,
+                    ),
+                    false,
+                )
+            }
+        } else if let Some(buffer) = bind_spare_output_zero_copy(&ctx.device, out, out_len) {
+            (buffer, true)
+        } else {
+            assert!(out.capacity() >= out_len);
+            (
+                ctx.device.new_buffer(
+                    u64::try_from(out_bytes).expect("Metal output length must fit u64"),
+                    MTLResourceOptions::StorageModeShared,
+                ),
+                false,
+            )
         };
-        let Some(out_buffer) = bind_output_zero_copy(&ctx.device, out) else {
-            return Err(repack(work));
+        let (values_buffer, values_zero_copy) = if *cpu_complete {
+            // No transform encoder reads coefficients for a CPU-complete column.
+            (out_buffer.clone(), true)
+        } else if let Some(buffer) = bind_output_zero_copy(&ctx.device, values) {
+            (buffer, true)
+        } else {
+            (
+                ctx.device.new_buffer_with_data(
+                    values.as_ptr() as *const std::ffi::c_void,
+                    std::mem::size_of_val(values.as_slice()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                ),
+                false,
+            )
         };
-        bindings.push((values_buffer, out_buffer));
+        bindings.push((values_buffer, out_buffer, values_zero_copy, out_zero_copy));
     }
 
     // Columns can have distinct sizes; ensure every (domain, direction) is cached
     // before encoding (cache insertion needs &mut ctx).
-    let domains: Vec<CircleDomain> = work.iter().map(|w| w.1).collect();
+    let domains: Vec<CircleDomain> = work
+        .iter()
+        .filter_map(|column| (!column.4).then_some(column.1))
+        .collect();
     for &domain in &domains {
         let ext_domain = CanonicCoset::new(domain.log_size() + log_blowup_factor).circle_domain();
         pack_twiddles(&mut ctx, domain, itw.root_coset, &itw.itwiddles, true);
@@ -710,8 +817,10 @@ pub(crate) fn fused_transform_metal_chained<R>(
     // buffer. Metal's encoder ordering makes the coefficient writes visible to the
     // following LDE reads without a host synchronization boundary.
     let command_buffer = ctx.queue.new_command_buffer();
-    for ((_, domain, needs_ifft, _), (values_buffer, _)) in work.iter().zip(&bindings) {
-        if !*needs_ifft {
+    for ((_, domain, needs_ifft, _, cpu_complete), (values_buffer, ..)) in
+        work.iter().zip(&bindings)
+    {
+        if *cpu_complete || !*needs_ifft {
             continue;
         }
         let n_log = domain.log_size();
@@ -743,7 +852,12 @@ pub(crate) fn fused_transform_metal_chained<R>(
             );
         }
     }
-    for ((values, domain, _, out), (values_buffer, out_buffer)) in work.iter().zip(&bindings) {
+    for ((values, domain, _, out, cpu_complete), (values_buffer, out_buffer, ..)) in
+        work.iter().zip(&bindings)
+    {
+        if *cpu_complete {
+            continue;
+        }
         let n_log = domain.log_size();
         let ext_domain = CanonicCoset::new(n_log + log_blowup_factor).circle_domain();
         let _ = out;
@@ -773,7 +887,7 @@ pub(crate) fn fused_transform_metal_chained<R>(
             );
         }
     }
-    let out_buffers: Vec<Buffer> = bindings.iter().map(|(_, out)| out.clone()).collect();
+    let out_buffers: Vec<Buffer> = bindings.iter().map(|(_, out, ..)| out.clone()).collect();
     let chained = chain(command_buffer, &out_buffers);
     tracing::debug!("metal fused: encode {:?}", t_encode.elapsed());
     let t_wait = std::time::Instant::now();
@@ -785,9 +899,57 @@ pub(crate) fn fused_transform_metal_chained<R>(
     });
     tracing::debug!("metal fused: gpu {:?}", t_wait.elapsed());
 
+    for (
+        (values, domain, needs_ifft, out, cpu_complete),
+        (values_buffer, out_buffer, values_zero_copy, out_zero_copy),
+    ) in work.iter_mut().zip(&bindings)
+    {
+        if !*cpu_complete && *needs_ifft && store_polynomials_coefficients && !values_zero_copy {
+            // SAFETY: successful checked completion guarantees the IFFT initialized all
+            // `values.len()` entries in this distinct, live StorageModeShared buffer. Metal
+            // buffer contents are suitably aligned for BaseField, and `values` is a valid,
+            // nonoverlapping destination for exactly that many initialized entries.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    values_buffer.contents() as *const BaseField,
+                    values.as_mut_ptr(),
+                    values.len(),
+                );
+            }
+        }
+        if !*cpu_complete && !out_zero_copy {
+            // SAFETY: successful checked completion guarantees the LDE initialized all
+            // `out_len` entries in this distinct, live StorageModeShared buffer. Metal buffer
+            // contents and the Vec allocation are BaseField-aligned; the capacity check proves
+            // the destination extent, and the copy initializes it before `set_len` exposes it.
+            let out_len = 1usize
+                .checked_shl(domain.log_size() + log_blowup_factor)
+                .expect("Metal LDE element count must fit usize");
+            assert!(out.capacity() >= out_len);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    out_buffer.contents() as *const BaseField,
+                    out.as_mut_ptr(),
+                    out_len,
+                );
+                out.set_len(out_len);
+            }
+        } else if !*cpu_complete {
+            let out_len = 1usize
+                .checked_shl(domain.log_size() + log_blowup_factor)
+                .expect("Metal LDE element count must fit usize");
+            assert!(out.capacity() >= out_len);
+            // SAFETY: `bind_spare_output_zero_copy` admitted the Vec allocation and capacity
+            // for `out_len` BaseFields. Successful checked completion means the first RFFT pass
+            // initialized that entire extent through the live no-copy buffer; later passes only
+            // rewrite it in place, so exposing exactly `out_len` initialized entries is valid.
+            unsafe { out.set_len(out_len) };
+        }
+    }
+
     let polys = work
         .into_iter()
-        .map(|(values, domain, _, out)| {
+        .map(|(values, domain, _, out, _)| {
             let ext_domain =
                 CanonicCoset::new(domain.log_size() + log_blowup_factor).circle_domain();
             let coeffs = store_polynomials_coefficients
@@ -801,28 +963,86 @@ pub(crate) fn fused_transform_metal_chained<R>(
     Ok((polys, chained))
 }
 
-fn repack(
-    work: Vec<(Vec<BaseField>, CircleDomain, bool, Vec<BaseField>)>,
-) -> Vec<EvalsOrCoeffs<CpuBackend>> {
-    work.into_iter()
-        .map(|(values, domain, needs_ifft, _)| {
-            if needs_ifft {
-                EvalsOrCoeffs::Evals(crate::prover::poly::circle::CircleEvaluation::new(
-                    domain, values,
-                ))
-            } else {
-                EvalsOrCoeffs::Coeffs(crate::prover::poly::circle::CircleCoefficients::new(values))
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod bench {
     use super::*;
     use crate::core::poly::circle::CanonicCoset;
     use crate::prover::backend::cpu::CpuBackend;
-    use crate::prover::poly::circle::PolyOps;
+    use crate::prover::poly::circle::{CircleEvaluation, PolyOps};
+    use crate::prover::poly::BitReversedOrder;
+
+    /// The fused path publishes spare-capacity output only after the completed RFFT.
+    /// Poison every destination and check both a one-pass and multi-pass transform so
+    /// an omitted store cannot accidentally inherit a valid zero-filled value.
+    #[test]
+    fn rfft_fully_overwrites_poisoned_output() {
+        for ext_log in [MIN_METAL_FFT_LOG_SIZE, MIN_METAL_FFT_LOG_SIZE + 3] {
+            let ext_domain = CanonicCoset::new(ext_log).circle_domain();
+            let twiddles = <CpuBackend as PolyOps>::precompute_twiddles(ext_domain.half_coset);
+            let zero = BaseField::from_u32_unchecked(0);
+            let coefficients = vec![zero; 1 << (ext_log - 1)];
+            let poison = BaseField::from_u32_unchecked(1);
+            let mut output = vec![poison; ext_domain.size()];
+
+            assert!(rfft_metal(
+                &coefficients,
+                ext_domain,
+                &twiddles,
+                &mut output,
+            ));
+            assert!(
+                output.iter().all(|value| *value == zero),
+                "RFFT left poisoned entries at log size {ext_log}"
+            );
+        }
+    }
+
+    /// The copied-buffer branch used by mixed commitments must retain exact FFT
+    /// semantics below the normal Metal crossover as well as on zero-copy columns.
+    #[test]
+    fn fused_transform_mixed_small_logs_matches_cpu_reference() {
+        const BLOWUP: u32 = 1;
+        let logs = [5u32, 7, 10, 12, 14, 17];
+        let twiddles = <CpuBackend as PolyOps>::precompute_twiddles(
+            CanonicCoset::new(logs.last().copied().unwrap() + BLOWUP)
+                .circle_domain()
+                .half_coset,
+        );
+        let mut columns = vec![];
+        let mut references = vec![];
+        for (column, log) in logs.into_iter().enumerate() {
+            let domain = CanonicCoset::new(log).circle_domain();
+            let values = (0..1u32 << log)
+                .map(|row| {
+                    BaseField::from_u32_unchecked(
+                        row.wrapping_mul(2654435761)
+                            .wrapping_add(column as u32 * 97)
+                            >> 1,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let reference_eval =
+                CircleEvaluation::<CpuBackend, _, BitReversedOrder>::new(domain, values.clone());
+            let reference_coeffs = reference_eval.interpolate_with_twiddles(&twiddles);
+            let extended_domain = CanonicCoset::new(log + BLOWUP).circle_domain();
+            let extended = reference_coeffs.evaluate(extended_domain);
+            references.push((reference_coeffs.coeffs, extended.values));
+            columns.push(EvalsOrCoeffs::Evals(CircleEvaluation::new(domain, values)));
+        }
+
+        let started = std::time::Instant::now();
+        let Ok((polys, chained)) =
+            fused_transform_metal_chained(columns, BLOWUP, &twiddles, None, true, |_, _| Some(()))
+        else {
+            panic!("strict mixed-log Metal transform must dispatch");
+        };
+        std::println!("mixed copied+zero-copy fused FFT: {:?}", started.elapsed());
+        assert_eq!(chained, Some(()));
+        for (poly, (coeffs, evals)) in polys.iter().zip(references) {
+            assert_eq!(poly.coeffs.as_ref().unwrap().coeffs, coeffs);
+            assert_eq!(poly.evals.values, evals);
+        }
+    }
 
     /// GPU kernel micro-benchmark (CPU-load insensitive). Run manually:
     /// `cargo test -p stwo --features prover,metal --release --lib fft_kernel_bench -- --ignored

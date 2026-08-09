@@ -18,6 +18,26 @@ use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::secure_column::SecureColumnByCoords;
 
+/// Fails closed before a LogUp denominator can reach packed inversion.
+///
+/// LogUp fractions are defined only away from their poles. A packed field
+/// element may contain a zero in just one SIMD lane, so `PackedQM31::is_zero`
+/// is not sufficient here: it reports whether every lane is zero. `to_array`
+/// canonicalizes each lane first, making raw `P` coordinates indistinguishable
+/// from the other M31 zero representative (`0`). This check is unconditional in
+/// debug and release builds.
+#[track_caller]
+#[inline]
+fn assert_no_logup_poles(denom: PackedSecureField) {
+    assert!(
+        denom
+            .to_array()
+            .into_iter()
+            .all(|lane| lane != SecureField::zero()),
+        "logup denominator contains a zero lane"
+    );
+}
+
 // SIMD backend generator for logup interaction trace.
 pub struct LogupTraceGenerator {
     log_size: u32,
@@ -96,6 +116,7 @@ impl LogupTraceGenerator {
             .zip(n3.data.par_iter_mut())
             .zip(iter)
             .for_each(|(((((dst_denom, d0), d1), d2), d3), (numerator, denom))| {
+                assert_no_logup_poles(denom);
                 *dst_denom = denom;
                 let [c0, c1, c2, c3] = numerator.into_packed_m31s();
                 *d0 = c0;
@@ -183,10 +204,7 @@ impl LogupTraceGenerator {
             for (col_idx, col) in cols.iter_mut().enumerate() {
                 for (i, denom_slot) in denoms.iter_mut().enumerate() {
                     let (numerator, denom) = frac_at(col_idx, band_start + i);
-                    debug_assert!(
-                        denom.to_array().iter().all(|x| *x != SecureField::zero()),
-                        "logup denominator is zero at column {col_idx}"
-                    );
+                    assert_no_logup_poles(denom);
                     *denom_slot = denom;
                     // Stash the numerator in the output slots until the inverse pass.
                     let [c0, c1, c2, c3] = numerator.into_packed_m31s();
@@ -293,11 +311,7 @@ impl LogupColGenerator<'_> {
         numerator: PackedSecureField,
         denom: PackedSecureField,
     ) {
-        debug_assert!(
-            denom.to_array().iter().all(|x| *x != SecureField::zero()),
-            "{:?}",
-            ("denom at vec_row {} is zero {}", denom, vec_row)
-        );
+        assert_no_logup_poles(denom);
         unsafe {
             self.numerator.set_packed(vec_row, numerator);
             *self.gen.denom.data.get_unchecked_mut(vec_row) = denom;
@@ -381,10 +395,7 @@ pub struct FractionWriter<'a> {
 }
 impl FractionWriter<'_> {
     pub fn write_frac(self, numerator: PackedSecureField, denom: PackedSecureField) {
-        debug_assert!(
-            denom.to_array().iter().all(|x| *x != SecureField::zero()),
-            "denom is zero {denom:?}"
-        );
+        assert_no_logup_poles(denom);
         let [c0, c1, c2, c3] = numerator.into_packed_m31s();
         *self.numerator[0] = c0;
         *self.numerator[1] = c1;
@@ -395,101 +406,4 @@ impl FractionWriter<'_> {
 }
 
 #[cfg(test)]
-mod tests {
-    use stwo::core::fields::FieldExpOps;
-    use stwo::prover::backend::simd::m31::LOG_N_LANES;
-    use stwo::prover::backend::simd::qm31::PackedSecureField;
-
-    use crate::prover::logup::LogupTraceGenerator;
-    use crate::{m31, qm31};
-
-    #[test]
-    fn test_frac_writer() {
-        let expected_sum = (qm31!(1, 2, 3, 4) * qm31!(5, 6, 7, 8).inverse()) * m31!(1 << 6);
-
-        let mut log_gen = LogupTraceGenerator::new(6);
-        let mut col_gen = log_gen.new_col();
-        for writer in col_gen.iter_mut() {
-            let num = PackedSecureField::broadcast(qm31!(1, 2, 3, 4));
-            let den = PackedSecureField::broadcast(qm31!(5, 6, 7, 8));
-            writer.write_frac(num, den);
-        }
-
-        col_gen.finalize_col();
-        let (_, sum) = log_gen.finalize_last();
-        assert_eq!(sum, expected_sum);
-    }
-
-    #[test]
-    fn test_col_from_iter() {
-        let log_size = 8;
-        let expected_sum = (qm31!(1, 2, 3, 4) * qm31!(5, 6, 7, 8).inverse()) * m31!(1 << log_size);
-
-        let mut log_gen = LogupTraceGenerator::new(log_size);
-        let col_iter = (0..1 << (log_size - LOG_N_LANES)).map(|_| {
-            let num = PackedSecureField::broadcast(qm31!(1, 2, 3, 4));
-            let den = PackedSecureField::broadcast(qm31!(5, 6, 7, 8));
-            (num, den)
-        });
-        log_gen.col_from_iter(col_iter);
-
-        let (_, sum) = log_gen.finalize_last();
-        assert_eq!(sum, expected_sum);
-    }
-
-    #[cfg(feature = "parallel")]
-    #[test]
-    fn test_col_from_par_iter() {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-
-        let log_size = 8;
-        let expected_sum = (qm31!(1, 2, 3, 4) * qm31!(5, 6, 7, 8).inverse()) * m31!(1 << log_size);
-
-        let mut log_gen = LogupTraceGenerator::new(log_size);
-        let col_iter = (0..1 << (log_size - LOG_N_LANES)).into_par_iter().map(|_| {
-            let num = PackedSecureField::broadcast(qm31!(1, 2, 3, 4));
-            let den = PackedSecureField::broadcast(qm31!(5, 6, 7, 8));
-            (num, den)
-        });
-        log_gen.col_from_par_iter(col_iter);
-
-        let (_, sum) = log_gen.finalize_last();
-        assert_eq!(sum, expected_sum);
-    }
-
-    #[cfg(feature = "parallel")]
-    #[test]
-    fn test_parallel_frac_writer() {
-        use std::array;
-
-        use rayon::prelude::*;
-        // Sequential version.
-        let mut log_gen_seq = LogupTraceGenerator::new(6);
-        let mut col_gen_seq = log_gen_seq.new_col();
-        col_gen_seq.iter_mut().enumerate().for_each(|(i, writer)| {
-            let num = array::from_fn(|j| qm31!(i as u32, j as u32, 0, 1));
-            let den = array::from_fn(|j| qm31!(i as u32, j as u32, 2, 3));
-            let [num, den] = [num, den].map(PackedSecureField::from_array);
-            writer.write_frac(num, den);
-        });
-        col_gen_seq.finalize_col();
-        let (_, sum_seq) = log_gen_seq.finalize_last();
-
-        // Parallel version.
-        let mut log_gen_par = LogupTraceGenerator::new(6);
-        let mut col_gen_par = log_gen_par.new_col();
-        col_gen_par
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, writer)| {
-                let num = array::from_fn(|j| qm31!(i as u32, j as u32, 0, 1));
-                let den = array::from_fn(|j| qm31!(i as u32, j as u32, 2, 3));
-                let [num, den] = [num, den].map(PackedSecureField::from_array);
-                writer.write_frac(num, den);
-            });
-        col_gen_par.finalize_col();
-        let (_, sum_par) = log_gen_par.finalize_last();
-
-        assert_eq!(sum_seq, sum_par);
-    }
-}
+mod tests;

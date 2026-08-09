@@ -9,6 +9,7 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::fields::FieldExpOps;
 
 use super::{BaseExpr, ColumnExpr, ExtExpr};
+use crate::preprocessed_columns::PreProcessedColumnId;
 use crate::{AssertEvaluator, EvalAtRow};
 
 /// An assignment to the variables that may appear in an expression.
@@ -16,21 +17,25 @@ use crate::{AssertEvaluator, EvalAtRow};
 ///     columns: (interaction, index, offset) -> value
 ///     base field expressions: name -> value
 ///     extension field expressions: name -> extension field value
+///     preprocessed columns: typed column ID -> value
 pub type ExprVarAssignment = (
     HashMap<(usize, usize, isize), BaseField>,
     HashMap<String, BaseField>,
     HashMap<String, SecureField>,
+    HashMap<PreProcessedColumnId, BaseField>,
 );
 
-/// Three sets representing all the variables that can appear in an expression:
+/// Four sets representing all the variables that can appear in an expression:
 ///    * `cols`: The columns of the AIR.
 ///    * `params`: The formal parameters to the AIR.
 ///    * `ext_params`: The extension field parameters to the AIR.
+///    * `preprocessed_cols`: The committed preprocessed columns of the AIR.
 #[derive(Default)]
 pub struct ExprVariables {
     pub cols: HashSet<ColumnExpr>,
     pub params: HashSet<String>,
     pub ext_params: HashSet<String>,
+    pub preprocessed_cols: HashSet<PreProcessedColumnId>,
 }
 
 impl ExprVariables {
@@ -39,6 +44,7 @@ impl ExprVariables {
             cols: vec![col].into_iter().collect(),
             params: HashSet::new(),
             ext_params: HashSet::new(),
+            preprocessed_cols: HashSet::new(),
         }
     }
 
@@ -47,6 +53,7 @@ impl ExprVariables {
             cols: HashSet::new(),
             params: vec![param].into_iter().collect(),
             ext_params: HashSet::new(),
+            preprocessed_cols: HashSet::new(),
         }
     }
 
@@ -55,6 +62,16 @@ impl ExprVariables {
             cols: HashSet::new(),
             params: HashSet::new(),
             ext_params: vec![param].into_iter().collect(),
+            preprocessed_cols: HashSet::new(),
+        }
+    }
+
+    pub fn preprocessed_col(column: PreProcessedColumnId) -> Self {
+        Self {
+            cols: HashSet::new(),
+            params: HashSet::new(),
+            ext_params: HashSet::new(),
+            preprocessed_cols: vec![column].into_iter().collect(),
         }
     }
 
@@ -92,7 +109,20 @@ impl ExprVariables {
             })
             .collect();
 
-        (cols, params, ext_params)
+        let mut preprocessed_columns = self.preprocessed_cols.iter().collect::<Vec<_>>();
+        preprocessed_columns.sort_by(|a, b| a.id.cmp(&b.id));
+        let preprocessed_columns = preprocessed_columns
+            .into_iter()
+            .map(|column| {
+                (column.clone(), {
+                    let mut hasher = DefaultHasher::new();
+                    (salt, "preprocessed_column", column).hash(&mut hasher);
+                    (hasher.finish() as u32).into()
+                })
+            })
+            .collect();
+
+        (cols, params, ext_params, preprocessed_columns)
     }
 }
 
@@ -103,6 +133,11 @@ impl Add for ExprVariables {
             cols: self.cols.union(&rhs.cols).cloned().collect(),
             params: self.params.union(&rhs.params).cloned().collect(),
             ext_params: self.ext_params.union(&rhs.ext_params).cloned().collect(),
+            preprocessed_cols: self
+                .preprocessed_cols
+                .union(&rhs.preprocessed_cols)
+                .cloned()
+                .collect(),
         }
     }
 }
@@ -111,7 +146,12 @@ impl AddAssign for ExprVariables {
     fn add_assign(&mut self, rhs: Self) {
         self.cols = self.cols.union(&rhs.cols).cloned().collect();
         self.params = self.params.union(&rhs.params).cloned().collect();
-        self.cols = self.cols.union(&rhs.cols).cloned().collect();
+        self.ext_params = self.ext_params.union(&rhs.ext_params).cloned().collect();
+        self.preprocessed_cols = self
+            .preprocessed_cols
+            .union(&rhs.preprocessed_cols)
+            .cloned()
+            .collect();
     }
 }
 
@@ -128,6 +168,7 @@ impl Sub for ExprVariables {
             cols: &self.cols - &rhs.cols,
             params: &self.params - &rhs.params,
             ext_params: &self.ext_params - &rhs.ext_params,
+            preprocessed_cols: &self.preprocessed_cols - &rhs.preprocessed_cols,
         }
     }
 }
@@ -143,27 +184,68 @@ impl BaseExpr {
         V: for<'a> Index<&'a String, Output = E::F>,
         E: EvalAtRow,
     {
+        let preprocessed_columns: HashMap<PreProcessedColumnId, E::F> = HashMap::new();
+        self.eval_expr_with_preprocessed::<E, C, _, V>(columns, &preprocessed_columns, vars)
+    }
+
+    /// Evaluates a base field expression with a distinct binding for committed preprocessed
+    /// columns.
+    pub fn eval_expr_with_preprocessed<E, C, P, V>(
+        &self,
+        columns: &C,
+        preprocessed_columns: &P,
+        vars: &V,
+    ) -> E::F
+    where
+        C: for<'a> Index<&'a (usize, usize, isize), Output = E::F>,
+        P: for<'a> Index<&'a PreProcessedColumnId, Output = E::F>,
+        V: for<'a> Index<&'a String, Output = E::F>,
+        E: EvalAtRow,
+    {
         match self {
             Self::Col(col) => columns[&(col.interaction, col.idx, col.offset)].clone(),
+            Self::PreprocessedColumn(column) => preprocessed_columns[column.column()].clone(),
             Self::Const(c) => E::F::from(*c),
             Self::Param(var) => vars[&var.to_string()].clone(),
             Self::Add(a, b) => {
-                a.eval_expr::<E, C, V>(columns, vars) + b.eval_expr::<E, C, V>(columns, vars)
+                a.eval_expr_with_preprocessed::<E, C, P, V>(columns, preprocessed_columns, vars)
+                    + b.eval_expr_with_preprocessed::<E, C, P, V>(
+                        columns,
+                        preprocessed_columns,
+                        vars,
+                    )
             }
             Self::Sub(a, b) => {
-                a.eval_expr::<E, C, V>(columns, vars) - b.eval_expr::<E, C, V>(columns, vars)
+                a.eval_expr_with_preprocessed::<E, C, P, V>(columns, preprocessed_columns, vars)
+                    - b.eval_expr_with_preprocessed::<E, C, P, V>(
+                        columns,
+                        preprocessed_columns,
+                        vars,
+                    )
             }
             Self::Mul(a, b) => {
-                a.eval_expr::<E, C, V>(columns, vars) * b.eval_expr::<E, C, V>(columns, vars)
+                a.eval_expr_with_preprocessed::<E, C, P, V>(columns, preprocessed_columns, vars)
+                    * b.eval_expr_with_preprocessed::<E, C, P, V>(
+                        columns,
+                        preprocessed_columns,
+                        vars,
+                    )
             }
-            Self::Neg(a) => -a.eval_expr::<E, C, V>(columns, vars),
-            Self::Inv(a) => a.eval_expr::<E, C, V>(columns, vars).inverse(),
+            Self::Neg(a) => {
+                -a.eval_expr_with_preprocessed::<E, C, P, V>(columns, preprocessed_columns, vars)
+            }
+            Self::Inv(a) => a
+                .eval_expr_with_preprocessed::<E, C, P, V>(columns, preprocessed_columns, vars)
+                .inverse(),
         }
     }
 
     pub fn collect_variables(&self) -> ExprVariables {
         match self {
             BaseExpr::Col(col) => ExprVariables::col(col.clone()),
+            BaseExpr::PreprocessedColumn(column) => {
+                ExprVariables::preprocessed_col(column.column().clone())
+            }
             BaseExpr::Const(_) => ExprVariables::default(),
             BaseExpr::Param(param) => ExprVariables::param(param.to_string()),
             BaseExpr::Add(a, b) => a.collect_variables() + b.collect_variables(),
@@ -175,7 +257,11 @@ impl BaseExpr {
     }
 
     pub fn assign(&self, assignment: &ExprVarAssignment) -> BaseField {
-        self.eval_expr::<AssertEvaluator<'_>, _, _>(&assignment.0, &assignment.1)
+        self.eval_expr_with_preprocessed::<AssertEvaluator<'_>, _, _, _>(
+            &assignment.0,
+            &assignment.3,
+            &assignment.1,
+        )
     }
 
     pub fn random_eval(&self) -> BaseField {
@@ -198,29 +284,102 @@ impl ExtExpr {
         EV: for<'a> Index<&'a String, Output = E::EF>,
         E: EvalAtRow,
     {
+        let preprocessed_columns: HashMap<PreProcessedColumnId, E::F> = HashMap::new();
+        self.eval_expr_with_preprocessed::<E, C, _, V, EV>(
+            columns,
+            &preprocessed_columns,
+            vars,
+            ext_vars,
+        )
+    }
+
+    /// Evaluates an extension field expression with a distinct binding for committed
+    /// preprocessed columns.
+    pub fn eval_expr_with_preprocessed<E, C, P, V, EV>(
+        &self,
+        columns: &C,
+        preprocessed_columns: &P,
+        vars: &V,
+        ext_vars: &EV,
+    ) -> E::EF
+    where
+        C: for<'a> Index<&'a (usize, usize, isize), Output = E::F>,
+        P: for<'a> Index<&'a PreProcessedColumnId, Output = E::F>,
+        V: for<'a> Index<&'a String, Output = E::F>,
+        EV: for<'a> Index<&'a String, Output = E::EF>,
+        E: EvalAtRow,
+    {
         match self {
             Self::SecureCol([a, b, c, d]) => {
-                let a = a.eval_expr::<E, C, V>(columns, vars);
-                let b = b.eval_expr::<E, C, V>(columns, vars);
-                let c = c.eval_expr::<E, C, V>(columns, vars);
-                let d = d.eval_expr::<E, C, V>(columns, vars);
+                let a = a.eval_expr_with_preprocessed::<E, C, P, V>(
+                    columns,
+                    preprocessed_columns,
+                    vars,
+                );
+                let b = b.eval_expr_with_preprocessed::<E, C, P, V>(
+                    columns,
+                    preprocessed_columns,
+                    vars,
+                );
+                let c = c.eval_expr_with_preprocessed::<E, C, P, V>(
+                    columns,
+                    preprocessed_columns,
+                    vars,
+                );
+                let d = d.eval_expr_with_preprocessed::<E, C, P, V>(
+                    columns,
+                    preprocessed_columns,
+                    vars,
+                );
                 E::combine_ef([a, b, c, d])
             }
             Self::Const(c) => E::EF::from(*c),
             Self::Param(var) => ext_vars[&var.to_string()].clone(),
             Self::Add(a, b) => {
-                a.eval_expr::<E, C, V, EV>(columns, vars, ext_vars)
-                    + b.eval_expr::<E, C, V, EV>(columns, vars, ext_vars)
+                a.eval_expr_with_preprocessed::<E, C, P, V, EV>(
+                    columns,
+                    preprocessed_columns,
+                    vars,
+                    ext_vars,
+                ) + b.eval_expr_with_preprocessed::<E, C, P, V, EV>(
+                    columns,
+                    preprocessed_columns,
+                    vars,
+                    ext_vars,
+                )
             }
             Self::Sub(a, b) => {
-                a.eval_expr::<E, C, V, EV>(columns, vars, ext_vars)
-                    - b.eval_expr::<E, C, V, EV>(columns, vars, ext_vars)
+                a.eval_expr_with_preprocessed::<E, C, P, V, EV>(
+                    columns,
+                    preprocessed_columns,
+                    vars,
+                    ext_vars,
+                ) - b.eval_expr_with_preprocessed::<E, C, P, V, EV>(
+                    columns,
+                    preprocessed_columns,
+                    vars,
+                    ext_vars,
+                )
             }
             Self::Mul(a, b) => {
-                a.eval_expr::<E, C, V, EV>(columns, vars, ext_vars)
-                    * b.eval_expr::<E, C, V, EV>(columns, vars, ext_vars)
+                a.eval_expr_with_preprocessed::<E, C, P, V, EV>(
+                    columns,
+                    preprocessed_columns,
+                    vars,
+                    ext_vars,
+                ) * b.eval_expr_with_preprocessed::<E, C, P, V, EV>(
+                    columns,
+                    preprocessed_columns,
+                    vars,
+                    ext_vars,
+                )
             }
-            Self::Neg(a) => -a.eval_expr::<E, C, V, EV>(columns, vars, ext_vars),
+            Self::Neg(a) => -a.eval_expr_with_preprocessed::<E, C, P, V, EV>(
+                columns,
+                preprocessed_columns,
+                vars,
+                ext_vars,
+            ),
         }
     }
 
@@ -242,7 +401,12 @@ impl ExtExpr {
     }
 
     pub fn assign(&self, assignment: &ExprVarAssignment) -> SecureField {
-        self.eval_expr::<AssertEvaluator<'_>, _, _, _>(&assignment.0, &assignment.1, &assignment.2)
+        self.eval_expr_with_preprocessed::<AssertEvaluator<'_>, _, _, _, _>(
+            &assignment.0,
+            &assignment.3,
+            &assignment.1,
+            &assignment.2,
+        )
     }
 
     pub fn random_eval(&self) -> SecureField {
@@ -259,8 +423,29 @@ mod tests {
     use stwo::core::fields::qm31::SecureField;
     use stwo::core::fields::FieldExpOps;
 
+    use crate::expr::assignment::ExprVariables;
     use crate::expr::utils::*;
+    use crate::expr::ColumnExpr;
+    use crate::preprocessed_columns::PreProcessedColumnId;
     use crate::AssertEvaluator;
+
+    #[test]
+    fn expr_variables_add_assign_merges_every_variable_kind() {
+        let column_expr = ColumnExpr::from((2, 3, -1));
+        let preprocessed_column = PreProcessedColumnId {
+            id: "preprocessed".to_string(),
+        };
+        let mut variables = ExprVariables::param("base".to_string());
+
+        variables += ExprVariables::col(column_expr.clone());
+        variables += ExprVariables::ext_param("extension".to_string());
+        variables += ExprVariables::preprocessed_col(preprocessed_column.clone());
+
+        assert!(variables.cols.contains(&column_expr));
+        assert!(variables.params.contains("base"));
+        assert!(variables.ext_params.contains("extension"));
+        assert!(variables.preprocessed_cols.contains(&preprocessed_column));
+    }
 
     #[test]
     fn test_eval_expr() {

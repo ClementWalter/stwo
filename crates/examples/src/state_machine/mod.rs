@@ -344,8 +344,8 @@ mod tests {
             - (StateMachineElements_z);
 
 \
-        let constraint_0 = (QM31Impl::from_partial_evals([trace_2_column_2_offset_0, trace_2_column_3_offset_0, trace_2_column_4_offset_0, trace_2_column_5_offset_0]) \
-            - (QM31Impl::from_partial_evals([trace_2_column_2_offset_neg_1, trace_2_column_3_offset_neg_1, trace_2_column_4_offset_neg_1, trace_2_column_5_offset_neg_1])) \
+        let constraint_0 = (QM31Impl::from_partial_evals([trace_2_column_0_offset_0, trace_2_column_1_offset_0, trace_2_column_2_offset_0, trace_2_column_3_offset_0]) \
+            - (QM31Impl::from_partial_evals([trace_2_column_0_offset_neg_1, trace_2_column_1_offset_neg_1, trace_2_column_2_offset_neg_1, trace_2_column_3_offset_neg_1])) \
                 + (claimed_sum) * (1 / (column_size))\
             ) \
             * ((intermediate0) * (intermediate1)) \

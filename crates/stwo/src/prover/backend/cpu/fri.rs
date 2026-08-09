@@ -8,6 +8,7 @@ use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::core::fields::FieldExpOps;
 use crate::core::poly::line::LineDomain;
+#[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::core::poly::utils::domain_line_twiddles_from_tree;
 use crate::core::utils::bit_reverse_index;
 use crate::prover::fri::FriOps;

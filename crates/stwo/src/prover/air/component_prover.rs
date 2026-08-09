@@ -9,6 +9,10 @@ use crate::core::poly::circle::CircleDomain;
 use crate::core::ColumnVec;
 use crate::prover::air::accumulation::{DomainEvaluationAccumulator, EvaluationMode};
 use crate::prover::backend::{Backend, Col};
+use crate::prover::composition_stage::{
+    validate_stage_result, CompositionPolynomialStage, CompositionPolynomialStageError,
+    CompositionPolynomialStageInputs,
+};
 use crate::prover::poly::circle::{CircleCoefficients, CircleEvaluation, SecureCirclePoly};
 use crate::prover::poly::twiddles::TwiddleTree;
 use crate::prover::poly::BitReversedOrder;
@@ -127,5 +131,44 @@ impl<B: Backend> ComponentProvers<'_, B> {
             component.evaluate_constraint_quotients_on_domain(trace, &mut accumulator)
         }
         accumulator.finalize(twiddles)
+    }
+
+    /// Consults an optional whole-stage implementation once, then runs the
+    /// unchanged host path if it declines before submitting work.
+    pub fn compute_composition_polynomial_with_stage(
+        &self,
+        random_coeff: SecureField,
+        trace: &Trace<'_, B>,
+        twiddles: &TwiddleTree<B>,
+        log_blowup_factor: u32,
+        stage: Option<&dyn CompositionPolynomialStage<B>>,
+    ) -> Result<SecureCirclePoly<B>, CompositionPolynomialStageError> {
+        if let Some(stage) = stage {
+            let total_constraints = self.components.iter().map(|c| c.n_constraints()).sum();
+            let components: Vec<&dyn Component> = self
+                .components
+                .iter()
+                .map(|component| *component as &dyn Component)
+                .collect();
+            let evaluation_mode = EvaluationMode::infer(&components, log_blowup_factor);
+            let inputs = CompositionPolynomialStageInputs {
+                component_provers: self,
+                random_coeff,
+                trace,
+                twiddles,
+                log_blowup_factor,
+                composition_log_degree_bound: self.components().composition_log_degree_bound(),
+                total_constraints,
+                evaluation_mode,
+            };
+            if let Some(polynomial) = stage.try_compute(inputs)? {
+                return validate_stage_result(
+                    polynomial,
+                    self.components().composition_log_degree_bound(),
+                );
+            }
+        }
+
+        Ok(self.compute_composition_polynomial(random_coeff, trace, twiddles, log_blowup_factor))
     }
 }

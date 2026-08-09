@@ -225,9 +225,17 @@ impl PolyOps for CpuBackend {
             }
         };
 
-        // One cached packed twiddle tree per root coset, shared by all columns of every
-        // commitment over that coset.
-        let simd_twiddles = cached_simd_twiddles(twiddles.root_coset);
+        // Keep only the suffix of the twiddle tower needed by this batch. In the
+        // heterogeneous commit path this is especially important for the SIMD-only
+        // partition (source log sizes 10..13): retaining the proof's full root tower
+        // would turn a <=64 KiB fallback cache into a 128 MiB cache at fib-1M scale.
+        let max_eval_log_size = columns
+            .iter()
+            .map(|column| column_log_size(column) + log_blowup_factor)
+            .max()
+            .expect("non-empty columns checked above");
+        let simd_twiddles =
+            cached_simd_twiddles_for_circle_log_size(twiddles.root_coset, max_eval_log_size);
 
         // Packing fallback for allocations that miss SIMD alignment (rare: large
         // allocations come straight from the page allocator).
@@ -518,6 +526,49 @@ impl PolyOps for CpuBackend {
         })
     }
 
+    fn barycentric_eval_many_at_point(
+        evals: &[&CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>],
+        weights: &Col<CpuBackend, SecureField>,
+    ) -> Vec<SecureField> {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(values) =
+            crate::prover::backend::metal::ood::barycentric_eval_many_metal(evals, weights)
+        {
+            return values;
+        }
+
+        #[cfg(feature = "parallel")]
+        return evals
+            .par_iter()
+            .map(|eval| Self::barycentric_eval_at_point(eval, weights))
+            .collect();
+
+        #[cfg(not(feature = "parallel"))]
+        evals
+            .iter()
+            .map(|eval| Self::barycentric_eval_at_point(eval, weights))
+            .collect()
+    }
+
+    fn barycentric_eval_many_groups(
+        groups: &[crate::prover::poly::circle::BarycentricEvalGroup<'_, CpuBackend>],
+    ) -> Vec<Option<Vec<SecureField>>> {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        return crate::prover::backend::metal::ood::barycentric_eval_groups_metal(groups);
+
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        groups.iter().map(|_| None).collect()
+    }
+
+    fn resident_barycentric_min_log_size() -> Option<u32> {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        return crate::prover::backend::metal::ood::is_ready()
+            .then_some(crate::prover::backend::metal::ood::MIN_METAL_OOD_LOG_SIZE);
+
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        None
+    }
+
     fn eval_at_point_by_folding(
         evals: &CircleEvaluation<Self, BaseField, BitReversedOrder>,
         point: CirclePoint<SecureField>,
@@ -727,6 +778,36 @@ impl PolyOps for CpuBackend {
 /// proof's transforms reuse one or two distinct root cosets, so the cache stays tiny.
 #[allow(clippy::type_complexity)]
 pub(crate) fn cached_simd_twiddles(
+    root_coset: Coset,
+) -> std::sync::Arc<TwiddleTree<crate::prover::backend::simd::SimdBackend>> {
+    cached_simd_twiddles_for_root(root_coset)
+}
+
+/// Returns the smallest cached SIMD twiddle tower that covers a circle domain of
+/// `max_circle_log_size` descended from `root_coset`.
+///
+/// A circle domain of log size `L` has a half-coset of log size `L - 1`. Every FFT
+/// layer it consumes is therefore a suffix of the tower rooted at that half-coset.
+/// Repeatedly doubling the original root down to log `L - 1` preserves that suffix
+/// exactly while avoiding all unused parent layers.
+fn cached_simd_twiddles_for_circle_log_size(
+    root_coset: Coset,
+    max_circle_log_size: u32,
+) -> std::sync::Arc<TwiddleTree<crate::prover::backend::simd::SimdBackend>> {
+    let required_root_log_size = max_circle_log_size
+        .checked_sub(1)
+        .expect("circle domains have positive log size");
+    assert!(
+        required_root_log_size <= root_coset.log_size(),
+        "circle domain log size {max_circle_log_size} exceeds twiddle root capacity {}",
+        root_coset.log_size() + 1
+    );
+    let required_root = root_coset.repeated_double(root_coset.log_size() - required_root_log_size);
+    cached_simd_twiddles_for_root(required_root)
+}
+
+#[allow(clippy::type_complexity)]
+fn cached_simd_twiddles_for_root(
     root_coset: Coset,
 ) -> std::sync::Arc<TwiddleTree<crate::prover::backend::simd::SimdBackend>> {
     use std::collections::HashMap;
@@ -1456,6 +1537,9 @@ mod dispatch_tests {
     use super::*;
     use crate::core::poly::circle::CanonicCoset;
     use crate::core::utils::bit_reverse_index;
+    use crate::prover::backend::simd::circle::{ifft_in_place_raw, rfft_raw};
+    use crate::prover::backend::simd::column::BaseColumn;
+    use crate::prover::backend::simd::SimdBackend;
     use crate::prover::poly::circle::{CircleEvaluation, EvalsOrCoeffs, PolyOps};
     use crate::prover::poly::BitReversedOrder;
 
@@ -1486,7 +1570,6 @@ mod dispatch_tests {
     /// Same root-independence invariant for the SIMD twiddle tree's flat buffer.
     #[test]
     fn simd_twiddle_layers_independent_of_tree_root() {
-        use crate::prover::backend::simd::SimdBackend;
         let domain = CanonicCoset::new(17).circle_domain();
         let t17 =
             SimdBackend::precompute_twiddles(CanonicCoset::new(17).circle_domain().half_coset);
@@ -1503,6 +1586,147 @@ mod dispatch_tests {
                 a.len()
             );
         }
+    }
+
+    /// A right-sized tree must be exactly the suffix of its supplied root tower, not
+    /// merely a same-sized canonical tree. Exercise the entire SIMD fallback range and
+    /// two distinct noncanonical roots through both inverse and extended transforms.
+    #[test]
+    fn right_sized_simd_twiddles_preserve_exact_transform_results() {
+        const ROOT_LOG_SIZE: u32 = 18;
+
+        for initial_multiplier in [1usize, 3] {
+            let root = Coset::new(
+                CirclePointIndex::generator() * initial_multiplier,
+                ROOT_LOG_SIZE,
+            );
+            let full_twiddles = SimdBackend::precompute_twiddles(root);
+
+            for source_log_size in 10u32..=13 {
+                let eval_log_size = source_log_size + 1;
+                let sized_twiddles = cached_simd_twiddles_for_circle_log_size(root, eval_log_size);
+                let expected_root = root.repeated_double(ROOT_LOG_SIZE - (eval_log_size - 1));
+
+                assert_eq!(sized_twiddles.root_coset, expected_root);
+                assert_eq!(sized_twiddles.twiddles.len(), 1 << (eval_log_size - 1));
+                assert_eq!(sized_twiddles.itwiddles.len(), 1 << (eval_log_size - 1));
+                assert!(std::sync::Arc::ptr_eq(
+                    &sized_twiddles,
+                    &cached_simd_twiddles_for_circle_log_size(root, eval_log_size)
+                ));
+
+                let source_domain =
+                    CircleDomain::new(root.repeated_double(ROOT_LOG_SIZE - (source_log_size - 1)));
+                let eval_domain = CircleDomain::new(expected_root);
+                let values = test_values(source_log_size);
+                let mut full_coeffs = BaseColumn::from_cpu(&values);
+                let mut sized_coeffs = BaseColumn::from_cpu(&values);
+
+                // SAFETY: BaseColumn storage is 64-byte aligned and both columns contain
+                // exactly source_domain.size() writable M31 values.
+                unsafe {
+                    ifft_in_place_raw(
+                        full_coeffs.data.as_mut_ptr().cast(),
+                        source_domain,
+                        &full_twiddles,
+                    );
+                    ifft_in_place_raw(
+                        sized_coeffs.data.as_mut_ptr().cast(),
+                        source_domain,
+                        &sized_twiddles,
+                    );
+                }
+                assert_eq!(
+                    sized_coeffs.as_slice(),
+                    full_coeffs.as_slice(),
+                    "IFFT mismatch for source log {source_log_size}, root multiplier {initial_multiplier}"
+                );
+
+                let mut full_evals =
+                    BaseColumn::from_iter((0..eval_domain.size()).map(|_| BaseField::zero()));
+                let mut sized_evals =
+                    BaseColumn::from_iter((0..eval_domain.size()).map(|_| BaseField::zero()));
+                // SAFETY: all BaseColumn buffers are 64-byte aligned, disjoint, and
+                // sized for their respective source and destination domains.
+                unsafe {
+                    rfft_raw(
+                        full_coeffs.data.as_ptr().cast(),
+                        full_evals.data.as_mut_ptr().cast(),
+                        source_log_size,
+                        eval_domain,
+                        &full_twiddles,
+                    );
+                    rfft_raw(
+                        sized_coeffs.data.as_ptr().cast(),
+                        sized_evals.data.as_mut_ptr().cast(),
+                        source_log_size,
+                        eval_domain,
+                        &sized_twiddles,
+                    );
+                }
+                assert_eq!(
+                    sized_evals.as_slice(),
+                    full_evals.as_slice(),
+                    "extended RFFT mismatch for source log {source_log_size}, root multiplier {initial_multiplier}"
+                );
+            }
+        }
+
+        let first = cached_simd_twiddles_for_circle_log_size(
+            Coset::new(CirclePointIndex::generator(), ROOT_LOG_SIZE),
+            14,
+        );
+        let distinct = cached_simd_twiddles_for_circle_log_size(
+            Coset::new(CirclePointIndex::generator() * 3usize, ROOT_LOG_SIZE),
+            14,
+        );
+        assert_ne!(first.root_coset, distinct.root_coset);
+        assert!(!std::sync::Arc::ptr_eq(&first, &distinct));
+    }
+
+    fn simd_twiddle_payload_bytes(twiddles: &TwiddleTree<SimdBackend>) -> usize {
+        (twiddles.twiddles.len() + twiddles.itwiddles.len()) * std::mem::size_of::<BaseField>()
+    }
+
+    /// Manual cold-process reference measurement. Run this test by exact name so no
+    /// other test warms the process-local cache first.
+    #[test]
+    #[ignore = "manual cold twiddle-cache measurement"]
+    fn measure_full_simd_twiddle_cache_cold() {
+        const ROOT_LOG_SIZE: u32 = 24;
+        let root = Coset::new(CirclePointIndex::generator() * 5usize, ROOT_LOG_SIZE);
+        let start = std::time::Instant::now();
+        let twiddles = cached_simd_twiddles(root);
+        let elapsed = start.elapsed();
+        let bytes = simd_twiddle_payload_bytes(&twiddles);
+
+        eprintln!(
+            "twiddle_cache kind=full root_log={ROOT_LOG_SIZE} bytes={bytes} cold_ms={:.3}",
+            elapsed.as_secs_f64() * 1_000.0
+        );
+        assert_eq!(bytes, 128 * 1024 * 1024);
+    }
+
+    /// Manual cold-process measurement for the largest heterogeneous SIMD-only batch:
+    /// source log 13 with blowup one requires a circle domain of log 14.
+    #[test]
+    #[ignore = "manual cold twiddle-cache measurement"]
+    fn measure_right_sized_simd_twiddle_cache_cold() {
+        const ROOT_LOG_SIZE: u32 = 24;
+        const MAX_FALLBACK_CIRCLE_LOG_SIZE: u32 = 14;
+        let root = Coset::new(CirclePointIndex::generator() * 7usize, ROOT_LOG_SIZE);
+        let start = std::time::Instant::now();
+        let twiddles = cached_simd_twiddles_for_circle_log_size(root, MAX_FALLBACK_CIRCLE_LOG_SIZE);
+        let elapsed = start.elapsed();
+        let bytes = simd_twiddle_payload_bytes(&twiddles);
+
+        eprintln!(
+            "twiddle_cache kind=right_sized root_log={} bytes={bytes} cold_ms={:.3}",
+            twiddles.root_coset.log_size(),
+            elapsed.as_secs_f64() * 1_000.0
+        );
+        assert_eq!(twiddles.root_coset, root.repeated_double(11));
+        assert_eq!(bytes, 64 * 1024);
     }
 
     /// Dispatched interpolate vs the scalar reference, spanning the SIMD cached-fft
