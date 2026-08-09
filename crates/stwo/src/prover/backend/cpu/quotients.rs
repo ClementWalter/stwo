@@ -21,6 +21,18 @@ use crate::prover::poly::BitReversedOrder;
 use crate::prover::secure_column::SecureColumnByCoords;
 use crate::prover::QuotientOps;
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn terminal_metal_quotient_result<T>(
+    result: Result<Option<T>, crate::prover::backend::metal::quotients::QuotientMetalError>,
+) -> Option<T> {
+    result.unwrap_or_else(|error| {
+        panic!(
+            "terminal Metal quotient failure after command submission; CPU fallback is unsafe: \
+             {error}"
+        )
+    })
+}
+
 impl QuotientOps for CpuBackend {
     fn accumulate_numerators(
         columns: &[&CircleEvaluation<Self, BaseField, BitReversedOrder>],
@@ -157,16 +169,19 @@ impl QuotientOps for CpuBackend {
         let (eval_subdomain, _) = eval_domain.split(log_blowup_factor);
         let subdomain_log_size = eval_subdomain.log_size();
 
-        // Apple-GPU path: the whole per-row combine in one submission (denominator
-        // inverses by Fermat exponentiation equal batch_inverse exactly).
+        // Apple-GPU path: the whole per-row combine in one submission. It batch-inverts
+        // denominator norms across 256-row groups with one M31 Fermat inverse per group,
+        // then reconstructs the CM31 inverses exactly.
         #[cfg(all(feature = "metal", target_os = "macos"))]
         let gpu_quotients = if subdomain_log_size
             >= crate::prover::backend::metal::quotients::MIN_METAL_QUOTIENT_LOG_SIZE
         {
-            crate::prover::backend::metal::quotients::combine_quotients_metal(
-                &accumulations,
-                eval_subdomain,
-                1 << subdomain_log_size,
+            terminal_metal_quotient_result(
+                crate::prover::backend::metal::quotients::combine_quotients_metal(
+                    &accumulations,
+                    eval_subdomain,
+                    1 << subdomain_log_size,
+                ),
             )
         } else {
             None
@@ -240,6 +255,35 @@ impl QuotientOps for CpuBackend {
         #[cfg(not(feature = "parallel"))]
         chunk_views.iter_mut().for_each(process_chunk);
         extend_quotients(quotients, eval_subdomain, eval_domain, twiddles)
+    }
+}
+
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+mod metal_error_tests {
+    use metal::MTLCommandBufferStatus;
+
+    use super::terminal_metal_quotient_result;
+    use crate::prover::backend::metal::quotients::QuotientMetalError;
+
+    #[test]
+    fn only_pre_submit_decline_can_fall_back_to_cpu() {
+        assert_eq!(terminal_metal_quotient_result::<()>(Ok(None)), None);
+
+        let command_failure = std::panic::catch_unwind(|| {
+            terminal_metal_quotient_result::<()>(Err(QuotientMetalError::CommandFailed {
+                status: MTLCommandBufferStatus::Error,
+            }))
+        });
+        assert!(command_failure.is_err());
+
+        let pole = std::panic::catch_unwind(|| {
+            terminal_metal_quotient_result::<()>(Err(QuotientMetalError::Pole {
+                sample_mask: 0b10,
+                first_row: 17,
+                sample_first_rows: [None, Some(17), None, None, None, None],
+            }))
+        });
+        assert!(pole.is_err());
     }
 }
 
