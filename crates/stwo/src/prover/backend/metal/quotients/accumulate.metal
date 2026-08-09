@@ -3,6 +3,10 @@ using namespace metal;
 
 constant uint P = 0x7FFFFFFFu;
 
+inline uint m31_canonical(uint a) {
+    return (a == P) ? 0u : a;
+}
+
 inline uint m31_add(uint a, uint b) {
     uint s = a + b;
     return (s >= P) ? s - P : s;
@@ -53,21 +57,22 @@ kernel void accumulate_numerators(
 
     uint acc[4];
     if (p.mode & 1u) {
-        for (uint k = 0; k < 4; k++) { acc[k] = p.init_acc[k]; }
+        for (uint k = 0; k < 4; k++) { acc[k] = m31_canonical(p.init_acc[k]); }
     } else {
-        for (uint k = 0; k < 4; k++) { acc[k] = state[i * 4 + k]; }
+        for (uint k = 0; k < 4; k++) { acc[k] = m31_canonical(state[i * 4 + k]); }
     }
     for (uint j = 0; j < p.n_cols; j++) {
-        uint v = cols[j][i];
+        uint v = m31_canonical(cols[j][i]);
         for (uint k = 0; k < 4; k++) {
-            acc[k] = m31_add(acc[k], m31_mul(v, p.coeffs[j * 4 + k]));
+            uint coeff = m31_canonical(p.coeffs[j * 4 + k]);
+            acc[k] = m31_add(acc[k], m31_mul(v, coeff));
         }
     }
     if (p.mode & 2u) {
-        out0[i] = acc[0];
-        out1[i] = acc[1];
-        out2[i] = acc[2];
-        out3[i] = acc[3];
+        out0[i] = m31_canonical(acc[0]);
+        out1[i] = m31_canonical(acc[1]);
+        out2[i] = m31_canonical(acc[2]);
+        out3[i] = m31_canonical(acc[3]);
     } else {
         for (uint k = 0; k < 4; k++) { state[i * 4 + k] = acc[k]; }
     }

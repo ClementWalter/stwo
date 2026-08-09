@@ -33,6 +33,27 @@ pub trait QuotientOps: PolyOps {
         log_blowup_factor: u32,
     );
 
+    /// Accumulates all post-periodicity numerator groups in ascending column-log order.
+    ///
+    /// The default deliberately replays the former one-group-at-a-time call sequence so
+    /// backends that do not override this hook retain byte-for-byte algebraic ordering.
+    /// Backends may override it to batch execution, but must append results in group order
+    /// and in each group's stable [`ColumnSampleBatch`] order.
+    fn accumulate_numerator_groups(
+        groups: &[NumeratorBatchGroup<'_, Self>],
+        accumulated_numerators_vec: &mut Vec<AccumulatedNumerators<Self>>,
+        log_blowup_factor: u32,
+    ) {
+        for group in groups {
+            Self::accumulate_numerators(
+                &group.columns,
+                &group.sample_batches,
+                accumulated_numerators_vec,
+                log_blowup_factor,
+            );
+        }
+    }
+
     /// Given a vector of `AccumulatedNumerators` (computed on evaluation subdomains), computes
     /// the full quotient on the subdomain of size `2^(lifting_log_size - log_blowup_factor)`,
     /// then interpolates and evaluates on the full domain of size `2^lifting_log_size`.
@@ -50,6 +71,15 @@ pub trait QuotientOps: PolyOps {
         log_blowup_factor: u32,
         twiddles: &TwiddleTree<Self>,
     ) -> SecureEvaluation<Self, BitReversedOrder>;
+}
+
+/// Columns and stable point batches for one post-periodicity column log size.
+///
+/// Instances are constructed only after sorting by `CircleEvaluation::domain.log_size`,
+/// exposing the cross-log execution plan without changing the mathematical batching.
+pub struct NumeratorBatchGroup<'a, B: ColumnOps<BaseField>> {
+    pub columns: Vec<&'a CircleEvaluation<B, BaseField, BitReversedOrder>>,
+    pub sample_batches: Vec<ColumnSampleBatch>,
 }
 
 /// Helper struct that keeps track of the accumulation of the numerators involved in the FRI
@@ -109,24 +139,45 @@ pub fn compute_fri_quotients<B: QuotientOps + AccumulationOps>(
     //
     //   ∑_k (# of distinct sample points per log size k).
     //
-    zip(
+    let numerator_groups = zip(
         columns.iter().flatten(),
         samples_with_randomness.iter().flatten(),
     )
     .sorted_by_key(|(c, _)| c.domain.log_size())
     .chunk_by(|(c, _)| c.domain.log_size())
     .into_iter()
-    .for_each(|(_, tuples)| {
+    .map(|(log_size, tuples)| {
         let (columns, samples_with_randomness): (Vec<_>, Vec<_>) = tuples.unzip();
         // TODO: slice.
         let sample_batches = ColumnSampleBatch::new_vec(&samples_with_randomness);
-        B::accumulate_numerators(
-            &columns,
-            &sample_batches,
-            &mut accumulated_numerators_vec,
-            log_blowup_factor,
-        )
-    });
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let batch_column_counts = sample_batches
+                .iter()
+                .take(16)
+                .map(|batch| batch.cols_vals_randpows.len())
+                .collect_vec();
+            let quotient_subdomain_log_size = log_size.checked_sub(log_blowup_factor);
+            tracing::debug!(
+                evaluation_domain_log_size = log_size,
+                ?quotient_subdomain_log_size,
+                column_count = columns.len(),
+                batch_count = sample_batches.len(),
+                ?batch_column_counts,
+                batches_truncated = sample_batches.len() > batch_column_counts.len(),
+                "FRI quotient post-periodicity batch shape"
+            );
+        }
+        NumeratorBatchGroup {
+            columns,
+            sample_batches,
+        }
+    })
+    .collect_vec();
+    B::accumulate_numerator_groups(
+        &numerator_groups,
+        &mut accumulated_numerators_vec,
+        log_blowup_factor,
+    );
 
     // Group and accumulate the numerators per sample point: the accumulations (of different
     // lengths) get lifted and accumulated to a single vector. After this step, there is a single

@@ -24,8 +24,17 @@ use crate::prover::secure_column::SecureColumnByCoords;
 /// only; declining leaves the original CPU implementation unchanged.
 pub(crate) const MIN_METAL_QUOTIENT_LOG_SIZE: u32 = 21;
 
+/// Bulk-numerator crossover, benchmarked independently from quotient combine.
+/// A single ordered command amortizes submission across the exact SHA/Keccak 2KiB
+/// inventories beginning at log 14; smaller groups remain on packed CPU.
+pub(crate) const MIN_METAL_NUMERATOR_LOG_SIZE: u32 = 14;
+
 pub(crate) const fn should_use_metal_quotients(subdomain_log_size: u32) -> bool {
     subdomain_log_size >= MIN_METAL_QUOTIENT_LOG_SIZE
+}
+
+pub(crate) const fn should_use_metal_numerators(subdomain_log_size: u32) -> bool {
+    subdomain_log_size >= MIN_METAL_NUMERATOR_LOG_SIZE
 }
 
 const CHUNK_COLS: usize = 16;
@@ -42,7 +51,7 @@ pub(crate) use error::QuotientMetalError;
 mod accumulate;
 #[path = "quotients/domain.rs"]
 mod domain;
-pub(crate) use accumulate::accumulate_numerators_metal;
+pub(crate) use accumulate::{accumulate_numerators_metal, NumeratorBatch};
 
 struct QuotientContext {
     device: Device,
@@ -460,3 +469,11 @@ fn combine_quotients_metal_impl(
 #[cfg(test)]
 #[path = "quotients_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "quotients/accumulate_tests.rs"]
+mod accumulate_tests;
+
+#[cfg(all(test, feature = "parallel"))]
+#[path = "quotients/accumulate_bench_tests.rs"]
+mod accumulate_bench_tests;

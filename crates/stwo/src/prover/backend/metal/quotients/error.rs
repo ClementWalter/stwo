@@ -5,6 +5,11 @@ use std::fmt;
 /// are never eligible for CPU fallback.
 #[derive(Debug)]
 pub(crate) enum QuotientMetalError {
+    NumeratorCommandFailed {
+        status: metal::MTLCommandBufferStatus,
+        batch_count: usize,
+        dispatch_count: usize,
+    },
     CommandFailed {
         status: metal::MTLCommandBufferStatus,
     },
@@ -18,6 +23,15 @@ pub(crate) enum QuotientMetalError {
 impl fmt::Display for QuotientMetalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NumeratorCommandFailed {
+                status,
+                batch_count,
+                dispatch_count,
+            } => write!(
+                formatter,
+                "Metal quotient-numerator command failed with status {status:?} after submitting \
+                 {batch_count} stable batches in {dispatch_count} ordered dispatches"
+            ),
             Self::CommandFailed { status } => write!(
                 formatter,
                 "Metal quotient command failed with status {status:?}"
