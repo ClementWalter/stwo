@@ -1,4 +1,4 @@
-use std::{array, mem};
+use std::array;
 
 use bytemuck::allocation::cast_vec;
 use bytemuck::{cast_slice, cast_slice_mut, Zeroable};
@@ -39,13 +39,15 @@ impl BaseColumn {
         &mut cast_slice_mut(&mut self.data)[..self.length]
     }
 
-    pub fn into_cpu_vec(mut self) -> Vec<BaseField> {
-        let capacity = self.data.capacity() * N_LANES;
-        let length = self.length;
-        let ptr = self.data.as_mut_ptr() as *mut BaseField;
-        let res = unsafe { Vec::from_raw_parts(ptr, length, capacity) };
-        mem::forget(self);
-        res
+    /// Copies this column into CPU-owned storage without changing raw field words.
+    ///
+    /// The copy is intentional: a `Vec<PackedBaseField>` allocation must be
+    /// deallocated with its original element layout and alignment. Rebuilding a
+    /// `Vec<BaseField>` from that allocation would violate `Vec`'s allocation
+    /// contract even though the packed contents can be viewed as base fields.
+    /// Copying the cast slice preserves non-canonical zero (`P`) exactly.
+    pub fn into_cpu_vec(self) -> Vec<BaseField> {
+        self.as_slice().to_vec()
     }
 
     pub fn from_cpu(values: &[BaseField]) -> Self {
@@ -837,13 +839,14 @@ impl VeryPackedSecureColumnByCoords {
 #[cfg(test)]
 mod tests {
     use std::array;
+    use std::time::Instant;
 
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 
     use super::BaseColumn;
     use crate::core::fields::cm31::CM31;
-    use crate::core::fields::m31::BaseField;
+    use crate::core::fields::m31::{BaseField, P};
     use crate::core::fields::qm31::SecureField;
     use crate::prover::backend::simd::column::{CM31Column, SecureColumn, VeryPackedBaseColumn};
     use crate::prover::backend::simd::m31::N_LANES;
@@ -859,6 +862,62 @@ mod tests {
         let res = values.into_iter().collect::<BaseColumn>();
 
         assert_eq!(res.to_cpu(), values);
+    }
+
+    #[test]
+    fn into_cpu_vec_copies_exact_words_for_empty_and_partial_columns() {
+        let empty = BaseColumn::zeros(0).into_cpu_vec();
+        assert!(empty.is_empty());
+
+        let raw_values = [0, P, P - 1, 1, 17];
+        let column: BaseColumn = raw_values
+            .into_iter()
+            .map(BaseField::from_u32_unchecked)
+            .collect();
+        let input_ptr = column.as_slice().as_ptr();
+        let cpu_values = column.into_cpu_vec();
+
+        assert_ne!(cpu_values.as_ptr(), input_ptr);
+        assert_eq!(
+            cpu_values.iter().map(|value| value.0).collect::<Vec<_>>(),
+            raw_values
+        );
+    }
+
+    #[test]
+    fn into_cpu_vec_copies_lane_multiple_in_order() {
+        let raw_values = (0..N_LANES * 3)
+            .map(|value| BaseField::from_u32_unchecked(value as u32))
+            .collect::<Vec<_>>();
+        let column: BaseColumn = raw_values.iter().copied().collect();
+
+        assert_eq!(column.into_cpu_vec(), raw_values);
+    }
+
+    #[test]
+    #[ignore = "bounded copy-throughput diagnostic; run explicitly"]
+    fn benchmark_into_cpu_vec_copy() {
+        const LENGTH: usize = 1 << 20;
+        const RUNS: usize = 9;
+        let source: BaseColumn = (0..LENGTH)
+            .map(|value| BaseField::from_u32_unchecked((value as u32) & P))
+            .collect();
+        let mut elapsed = Vec::with_capacity(RUNS);
+
+        for _ in 0..RUNS {
+            let input = source.clone();
+            let start = Instant::now();
+            let copied = input.into_cpu_vec();
+            elapsed.push(start.elapsed());
+            std::hint::black_box(copied);
+        }
+        elapsed.sort_unstable();
+        let median = elapsed[RUNS / 2];
+        let gib_per_second =
+            (LENGTH * size_of::<BaseField>()) as f64 / median.as_secs_f64() / (1_u64 << 30) as f64;
+        eprintln!(
+            "BaseColumn::into_cpu_vec: {LENGTH} words in {median:?} ({gib_per_second:.2} GiB/s)"
+        );
     }
 
     #[test]
