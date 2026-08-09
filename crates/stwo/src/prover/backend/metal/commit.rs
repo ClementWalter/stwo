@@ -23,21 +23,36 @@ pub(crate) fn commit_polynomials_metal(
     is_m31_output: bool,
 ) -> Result<(Vec<Poly<CpuBackend>>, Option<Vec<Vec<Blake2sHash>>>), Vec<EvalsOrCoeffs<CpuBackend>>>
 {
-    // The chained tree requires uniform column sizes whose extension equals the
-    // lifting size (the common commit shape); otherwise fall back entirely.
-    let mut logs = columns.iter().map(|column| match column {
-        EvalsOrCoeffs::Evals(evals) => evals.domain.log_size(),
-        EvalsOrCoeffs::Coeffs(coeffs) => coeffs.log_size(),
-    });
-    let Some(first_log) = logs.next() else {
-        return Err(columns);
-    };
-    let uniform = logs.all(|log| log == first_log);
-    let ext_log = first_log + log_blowup_factor;
-    let lifting = lifting_log_size.unwrap_or(ext_log);
-    if !uniform || lifting != ext_log {
+    if columns.is_empty() {
         return Err(columns);
     }
+    let base_logs: Vec<u32> = columns
+        .iter()
+        .map(|column| match column {
+            EvalsOrCoeffs::Evals(evals) => evals.domain.log_size(),
+            EvalsOrCoeffs::Coeffs(coeffs) => coeffs.log_size(),
+        })
+        .collect();
+    // Avoid paying GPU setup for an all-small commitment. Mixed commitments are
+    // admitted when at least one transform is large enough to amortize the epoch.
+    if base_logs.iter().copied().max().unwrap_or_default() < super::fft::MIN_METAL_FFT_LOG_SIZE {
+        return Err(columns);
+    }
+    let Some(ext_logs): Option<Vec<u32>> = base_logs
+        .iter()
+        .map(|&log| log.checked_add(log_blowup_factor))
+        .collect()
+    else {
+        return Err(columns);
+    };
+    let max_ext_log = ext_logs.iter().copied().max().unwrap_or_default();
+    let lifting = lifting_log_size.unwrap_or(max_ext_log);
+    if lifting < max_ext_log {
+        return Err(columns);
+    }
+    let uniform_at_lifting = ext_logs.iter().all(|&log| log == lifting);
+    let mut canonical_order: Vec<usize> = (0..columns.len()).collect();
+    canonical_order.sort_by_key(|&index| (ext_logs[index], index));
 
     let (polys, pending) = super::fft::fused_transform_metal_chained(
         columns,
@@ -46,19 +61,37 @@ pub(crate) fn commit_polynomials_metal(
         None,
         store_polynomials_coefficients,
         |command_buffer, out_buffers| {
-            super::blake2s::encode_tree(
-                command_buffer,
-                out_buffers,
-                1usize << ext_log,
-                is_m31_output,
-            )
+            if uniform_at_lifting {
+                super::blake2s::encode_tree(
+                    command_buffer,
+                    out_buffers,
+                    1usize.checked_shl(lifting)?,
+                    is_m31_output,
+                )
+            } else {
+                let ordered_buffers = canonical_order
+                    .iter()
+                    .map(|&index| out_buffers[index].clone())
+                    .collect::<Vec<_>>();
+                let ordered_logs = canonical_order
+                    .iter()
+                    .map(|&index| ext_logs[index])
+                    .collect::<Vec<_>>();
+                super::blake2s::encode_tree_compact(
+                    command_buffer,
+                    &ordered_buffers,
+                    &ordered_logs,
+                    lifting,
+                    is_m31_output,
+                )
+            }
         },
     )?;
 
     let layers = pending.map(|pending| {
         let mut layers = pending.finish();
         // Finish the sub-threshold tail on the SIMD path.
-        while (layers.len() as u32) < ext_log + 1 {
+        while (layers.len() as u32) < lifting + 1 {
             let next = if is_m31_output {
                 build_next_layer_simd::<true>(layers.last().unwrap())
             } else {

@@ -17,6 +17,7 @@ pub use pcs::quotient_ops::QuotientOps;
 pub use pcs::{CommitmentSchemeProver, CommitmentTreeProver, TreeBuilder};
 pub mod backend;
 pub mod channel;
+pub mod composition_stage;
 pub mod fri;
 pub mod line;
 pub mod lookups;
@@ -26,6 +27,10 @@ pub mod secure_column;
 pub mod vcs;
 pub mod vcs_lifted;
 
+pub use composition_stage::{
+    CompositionPolynomialStage, CompositionPolynomialStageError, CompositionPolynomialStageInputs,
+};
+
 pub fn prove<B: BackendForChannel<MC>, MC: MerkleChannel>(
     components: &[&dyn ComponentProver<B>],
     channel: &mut MC::C,
@@ -34,12 +39,50 @@ pub fn prove<B: BackendForChannel<MC>, MC: MerkleChannel>(
     Ok(prove_ex(components, channel, commitment_scheme, false)?.proof)
 }
 
+/// Proves with an optional whole composition-polynomial stage scoped to this call.
+pub fn prove_with_composition_stage<B: BackendForChannel<MC>, MC: MerkleChannel>(
+    components: &[&dyn ComponentProver<B>],
+    channel: &mut MC::C,
+    commitment_scheme: CommitmentSchemeProver<'_, B, MC>,
+    composition_stage: Option<&dyn CompositionPolynomialStage<B>>,
+) -> Result<StarkProof<MC::H>, ProvingError> {
+    Ok(prove_ex_with_composition_stage(
+        components,
+        channel,
+        commitment_scheme,
+        false,
+        composition_stage,
+    )?
+    .proof)
+}
+
 #[instrument(skip_all)]
 pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
     components: &[&dyn ComponentProver<B>],
     channel: &mut MC::C,
+    commitment_scheme: CommitmentSchemeProver<'_, B, MC>,
+    include_all_preprocessed_columns: bool,
+) -> Result<ExtendedStarkProof<MC::H>, ProvingError> {
+    prove_ex_with_composition_stage(
+        components,
+        channel,
+        commitment_scheme,
+        include_all_preprocessed_columns,
+        None,
+    )
+}
+
+/// Extended proving entrypoint with a per-proof optional composition stage.
+///
+/// A stage may decline before submission with `Ok(None)`. Submitted-stage errors
+/// propagate and never enter the host fallback.
+#[instrument(skip_all)]
+pub fn prove_ex_with_composition_stage<B: BackendForChannel<MC>, MC: MerkleChannel>(
+    components: &[&dyn ComponentProver<B>],
+    channel: &mut MC::C,
     mut commitment_scheme: CommitmentSchemeProver<'_, B, MC>,
     include_all_preprocessed_columns: bool,
+    composition_stage: Option<&dyn CompositionPolynomialStage<B>>,
 ) -> Result<ExtendedStarkProof<MC::H>, ProvingError> {
     let n_preprocessed_columns = commitment_scheme.trees[PREPROCESSED_TRACE_IDX]
         .polynomials
@@ -52,6 +95,7 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
 
     // Evaluate and commit on composition polynomial.
     let random_coeff = channel.draw_secure_felt();
+    let composition_start = std::time::Instant::now();
 
     let span = span!(Level::INFO, "Composition", class = "Composition").entered();
     let span1 = span!(
@@ -61,22 +105,28 @@ pub fn prove_ex<B: BackendForChannel<MC>, MC: MerkleChannel>(
     )
     .entered();
 
-    let composition_poly = component_provers.compute_composition_polynomial(
+    let generation_start = std::time::Instant::now();
+    let composition_poly = component_provers.compute_composition_polynomial_with_stage(
         random_coeff,
         &trace,
         commitment_scheme.twiddles,
         commitment_scheme.config.fri_config.log_blowup_factor,
-    );
+        composition_stage,
+    )?;
+    info!("Composition generation in {:?}", generation_start.elapsed());
     span1.exit();
 
     // Commit on the Composition Polynomial by splitting its coeffs to two polynomialsof degree
     // half the size of the original polynomial, and commit on each half separately.
+    let commit_start = std::time::Instant::now();
     let mut tree_builder = commitment_scheme.tree_builder();
     let (left_comp_poly_half, right_comp_poly_half) = composition_poly.split_at_mid();
 
     tree_builder.extend_polys(left_comp_poly_half.into_coordinate_polys());
     tree_builder.extend_polys(right_comp_poly_half.into_coordinate_polys());
     tree_builder.commit(channel);
+    info!("Composition commitment in {:?}", commit_start.elapsed());
+    info!("Composition total in {:?}", composition_start.elapsed());
     span.exit();
 
     // Draw OODS point.
@@ -159,4 +209,6 @@ pub enum ProvingError {
     InvalidLiftingLogSize(#[from] crate::core::pcs::utils::InvalidLiftingLogSizeError),
     #[error(transparent)]
     InvalidCanonicCosetLogSize(#[from] crate::core::poly::circle::InvalidCanonicCosetLogSize),
+    #[error(transparent)]
+    CompositionPolynomialStage(#[from] CompositionPolynomialStageError),
 }

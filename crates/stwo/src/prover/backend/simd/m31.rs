@@ -80,6 +80,17 @@ impl PackedM31 {
         self.reduce().0.to_array().map(M31)
     }
 
+    /// Fails closed unless every SIMD lane has a field inverse.
+    ///
+    /// `to_array` canonicalizes each lane, so both raw zero representatives
+    /// (`0` and `P`) are rejected in debug and release builds.
+    #[inline]
+    fn assert_invertible_lanes(&self) {
+        if let Some(lane) = self.to_array().iter().position(Zero::is_zero) {
+            panic!("packed inverse has a zero canonical lane at index {lane}");
+        }
+    }
+
     /// Reduces each element of the vector to the range `[0, P)`.
     fn reduce(self) -> PackedM31 {
         Self(min_u32x16(self.0, self.0 - MODULUS))
@@ -290,7 +301,7 @@ impl One for PackedM31 {
 
 impl FieldExpOps for PackedM31 {
     fn inverse(&self) -> Self {
-        assert!(!self.is_zero(), "0 has no inverse");
+        self.assert_invertible_lanes();
         pow2147483645(*self)
     }
 
@@ -636,16 +647,47 @@ pub fn reduce_to_m31_simd(val: u32x16) -> u32x16 {
 #[cfg(test)]
 mod tests {
     use std::array;
+    use std::hint::black_box;
+    use std::panic::{catch_unwind, UnwindSafe};
     use std::simd::u32x16;
+    use std::time::Instant;
 
     use aligned::{Aligned, A64};
+    use num_traits::{One, Zero};
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 
-    use super::PackedM31;
-    use crate::core::fields::m31::{BaseField, M31};
+    use super::{PackedM31, N_LANES};
+    use crate::core::fields::m31::{BaseField, M31, P};
     use crate::core::fields::FieldExpOps;
     use crate::prover::backend::simd::m31::reduce_to_m31_simd;
+
+    const BAD_LANE: usize = 7;
+
+    fn assert_bad_lane_panics(f: impl FnOnce() + UnwindSafe) {
+        let error = catch_unwind(f).expect_err("isolated zero lane must reject inversion");
+        let message = error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| error.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(message.contains("index 7"), "unexpected panic: {message}");
+    }
+
+    fn packed_with_bad_lane(value: M31) -> PackedM31 {
+        let mut values = [M31::one(); N_LANES];
+        values[BAD_LANE] = value;
+        PackedM31::from_array(values)
+    }
+
+    fn random_nonzero(rng: &mut SmallRng) -> M31 {
+        loop {
+            let value: M31 = rng.gen();
+            if !value.is_zero() {
+                return value;
+            }
+        }
+    }
 
     #[test]
     fn addition_works() {
@@ -719,12 +761,76 @@ mod tests {
     #[test]
     fn inverse_works() {
         let mut rng = SmallRng::seed_from_u64(0);
-        let values = rng.gen();
+        let values = array::from_fn(|_| random_nonzero(&mut rng));
         let packed_values = PackedM31::from_array(values);
 
         let res = packed_values.inverse();
 
         assert_eq!(res.to_array(), array::from_fn(|i| values[i].inverse()));
+    }
+
+    #[test]
+    fn inverse_rejects_isolated_zero_and_raw_modulus_lanes() {
+        for value in [M31::zero(), M31::from_u32_unchecked(P)] {
+            let packed = packed_with_bad_lane(value);
+            assert_bad_lane_panics(|| {
+                black_box(packed.inverse());
+            });
+        }
+    }
+
+    #[test]
+    fn batch_inverse_rejects_isolated_zero_and_raw_modulus_lanes() {
+        for value in [M31::zero(), M31::from_u32_unchecked(P)] {
+            let mut column = [PackedM31::one(); 8];
+            column[3] = packed_with_bad_lane(value);
+            assert_bad_lane_panics(|| {
+                black_box(PackedM31::batch_inverse(&column));
+            });
+        }
+    }
+
+    #[test]
+    fn batch_inverse_matches_nonzero_scalar_lanes() {
+        let mut rng = SmallRng::seed_from_u64(0x5eed_cafe);
+        let values: [[M31; N_LANES]; 8] =
+            array::from_fn(|_| array::from_fn(|_| random_nonzero(&mut rng)));
+        let column = values.map(PackedM31::from_array);
+
+        let inverses = PackedM31::batch_inverse(&column);
+
+        for (inverse, values) in inverses.iter().zip(values) {
+            assert_eq!(
+                inverse.to_array(),
+                array::from_fn(|lane| values[lane].inverse())
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual bounded inverse-precondition microbenchmark"]
+    fn inverse_precondition_microbenchmark() {
+        const ITERATIONS: u32 = 100_000;
+        let value = PackedM31::from_array(array::from_fn(|lane| M31::from(lane + 1)));
+
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            black_box(black_box(value).assert_invertible_lanes());
+        }
+        let check = start.elapsed();
+
+        let start = Instant::now();
+        for _ in 0..ITERATIONS {
+            black_box(black_box(value).inverse());
+        }
+        let inverse = start.elapsed();
+
+        println!(
+            "PackedM31 precondition {:.1}ns/inverse {:.1}ns ({:.2}% upper bound)",
+            check.as_nanos() as f64 / ITERATIONS as f64,
+            inverse.as_nanos() as f64 / ITERATIONS as f64,
+            100.0 * check.as_secs_f64() / inverse.as_secs_f64(),
+        );
     }
 
     #[test]

@@ -256,7 +256,7 @@ impl PolyOps for SimdBackend {
                                  offset: usize| {
             let mut sum = PackedSecureField::zeroed();
             let mut twiddle_high = Self::twiddle_at(&mappings, offset * N_LANES);
-            for (i, coeff_chunk) in coeff_chunk.array_chunks::<N_LANES>().enumerate() {
+            for (i, coeff_chunk) in coeff_chunk.as_chunks::<N_LANES>().0.iter().enumerate() {
                 // For every chunk of 2 ^ 4 * 2 ^ 4 = 2 ^ 8 elements, the twiddle high is the same.
                 // Multiply it by every mid twiddle factor to get the factors for the current chunk.
                 let high_twiddle_factors =
@@ -380,13 +380,9 @@ impl PolyOps for SimdBackend {
         let log_size = domain.log_size();
         let weights_vec_len = domain.size().div_ceil(N_LANES);
         if weights_vec_len == 1 {
-            return Col::<SimdBackend, SecureField>::from_iter(CircleEvaluation::<
-                CpuBackend,
-                BaseField,
-                BitReversedOrder,
-            >::barycentric_weights(
-                coset, p
-            ));
+            return crate::prover::backend::cpu::circle::barycentric_weights_scalar(coset, p)
+                .into_iter()
+                .collect();
         }
 
         let p = p.into_ef::<SecureField>();
@@ -483,6 +479,23 @@ impl PolyOps for SimdBackend {
             .to_array()
             .into_par_iter()
             .sum::<SecureField>();
+    }
+
+    fn barycentric_eval_many_at_point(
+        evals: &[&CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>],
+        weights: &Col<SimdBackend, SecureField>,
+    ) -> Vec<SecureField> {
+        #[cfg(feature = "parallel")]
+        return evals
+            .par_iter()
+            .map(|eval| Self::barycentric_eval_at_point(eval, weights))
+            .collect();
+
+        #[cfg(not(feature = "parallel"))]
+        evals
+            .iter()
+            .map(|eval| Self::barycentric_eval_at_point(eval, weights))
+            .collect()
     }
 
     fn eval_at_point_by_folding(

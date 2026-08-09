@@ -20,6 +20,9 @@ impl BaseExpr {
                 };
                 format!("trace_{interaction}_column_{idx}_offset_{offset_str}")
             }
+            BaseExpr::PreprocessedColumn(column) => {
+                format!("preprocessed_column({:?})", column.column().id)
+            }
             BaseExpr::Const(c) => format!("m31({c}).into()"),
             BaseExpr::Param(v) => v.to_string(),
             BaseExpr::Add(a, b) => format!("{} + {}", a.format_expr(), b.format_expr()),

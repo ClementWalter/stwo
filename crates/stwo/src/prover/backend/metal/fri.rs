@@ -4,9 +4,10 @@
 //! domain coordinate, and combines `f0 + alpha * f1`. For both the line fold and the
 //! circle-into-line fold, output row `i` uses the point `coset.at(bit_rev(i))` (the
 //! even global index always lands in the half coset), with the line fold reading `x`
-//! and the circle fold reading `y`. Threads compute their point by double-and-add and
-//! the coordinate inverse by Fermat exponentiation, so values are bit-identical to the
-//! CPU fold (group ops are exact; inverses are unique).
+//! and the circle fold reading `y`. The inverse-coordinate columns are views into the
+//! already-precomputed inverse-twiddle tree. Circle `y^-1` values are reconstructed
+//! from the following line layer's `x^-1` values with the same exact four-point identity
+//! used by the SIMD FFT, avoiding per-thread point generation and Fermat inversion.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -17,7 +18,6 @@ use metal::{
 use crate::core::circle::Coset;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
-use crate::core::utils::uninit_vec;
 use crate::prover::backend::CpuBackend;
 use crate::prover::secure_column::SecureColumnByCoords;
 
@@ -44,25 +44,6 @@ inline uint m31_mul(uint a, uint b) {
     uint s = (uint)(p & P) + (uint)(p >> 31);
     s = (s & P) + (s >> 31);
     return (s >= P) ? s - P : s;
-}
-
-// x^(P-2) = x^-1. P - 2 = 0b1111111111111111111111111111101.
-inline uint m31_inv(uint x) {
-    uint r = x;
-    for (int i = 29; i >= 0; i--) {
-        r = m31_mul(r, r);
-        if (i != 1) { r = m31_mul(r, x); }
-    }
-    return r;
-}
-
-struct Point { uint x; uint y; };
-
-inline Point pt_add(Point a, Point b) {
-    return Point{
-        m31_sub(m31_mul(a.x, b.x), m31_mul(a.y, b.y)),
-        m31_add(m31_mul(a.x, b.y), m31_mul(a.y, b.x)),
-    };
 }
 
 struct CM31v { uint a; uint b; };
@@ -108,10 +89,6 @@ inline QM31v qm31_scale_m31(QM31v x, uint m) {
 }
 
 struct FoldParams {
-    uint initial_x;
-    uint initial_y;
-    uint step_x;
-    uint step_y;
     uint half_log;   // log2 of the output length
     uint coord_is_y; // 1: circle fold (y coordinate), 0: line fold (x coordinate)
     uint alpha[8];   // QM31 coordinates of alpha
@@ -126,21 +103,23 @@ kernel void fold(
     device uint* out1 [[buffer(5)]],
     device uint* out2 [[buffer(6)]],
     device uint* out3 [[buffer(7)]],
-    constant FoldParams& p [[buffer(8)]],
+    device const uint* coordinate_inverses [[buffer(8)]],
+    constant FoldParams& p [[buffer(9)]],
     uint i [[thread_position_in_grid]])
 {
     if (i >= (1u << p.half_log)) { return; }
-    uint j = (p.half_log == 0u) ? 0u : (reverse_bits(i) >> (32u - p.half_log));
-
-    Point acc = Point{p.initial_x, p.initial_y};
-    Point base = Point{p.step_x, p.step_y};
-    uint k = j;
-    while (k != 0u) {
-        if (k & 1u) { acc = pt_add(acc, base); }
-        base = pt_add(base, base);
-        k >>= 1u;
+    uint coord_inv;
+    if (p.coord_is_y != 0u) {
+        // In bit-reversed order each four-point circle block has coordinates
+        // [(x,y),(-x,-y),(y,-x),(-y,x)]. The following line layer stores
+        // [x^-1,y^-1], so recover [y^-1,-y^-1,-x^-1,x^-1] exactly.
+        uint lane = i & 3u;
+        uint source = (i >> 2u) * 2u + ((lane < 2u) ? 1u : 0u);
+        coord_inv = coordinate_inverses[source];
+        if (lane == 1u || lane == 2u) { coord_inv = m31_sub(0u, coord_inv); }
+    } else {
+        coord_inv = coordinate_inverses[i];
     }
-    uint coord_inv = m31_inv(p.coord_is_y ? acc.y : acc.x);
 
     uint e = i << 1;
     uint o = e + 1;
@@ -199,12 +178,16 @@ pub(crate) fn warmup() {
     let _ = context();
 }
 
+/// Returns whether the static FRI-fold pipeline compiled successfully.
+pub(crate) fn is_ready() -> bool {
+    let Some(context) = context() else {
+        return false;
+    };
+    context.lock().is_ok()
+}
+
 #[repr(C)]
 struct FoldParams {
-    initial_x: u32,
-    initial_y: u32,
-    step_x: u32,
-    step_y: u32,
     half_log: u32,
     coord_is_y: u32,
     alpha: [u32; 8],
@@ -230,12 +213,40 @@ fn bind_input(device: &Device, data: &[BaseField]) -> Buffer {
     }
 }
 
-/// GPU FRI fold over secure-column coordinates. `coset` is the half coset whose points
-/// supply the fold coordinate (`x` for line folds, `y` for circle folds). Returns
-/// `None` without a usable device.
+fn bind_output(device: &Device, data: &mut [BaseField]) -> Buffer {
+    let bytes = std::mem::size_of_val(data);
+    let page = 16384;
+    if (data.as_mut_ptr() as usize).is_multiple_of(page) && bytes.is_multiple_of(page) {
+        // The exclusive borrow is not used again until the awaited command completes.
+        device.new_buffer_with_bytes_no_copy(
+            data.as_mut_ptr() as *const std::ffi::c_void,
+            bytes as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        )
+    } else {
+        device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+    }
+}
+
+/// GPU FRI fold over secure-column coordinates. `coordinate_inverses` is the matching
+/// inverse-`x` layer for a line fold and the following inverse-`x` layer from which a
+/// circle fold reconstructs inverse `y`. Returns `None` without a usable device,
+/// matching inverse layer, or successful command.
 pub(crate) fn fold_metal(
     values: &SecureColumnByCoords<CpuBackend>,
-    coset: Coset,
+    coordinate_inverses: &[BaseField],
+    coord_is_y: bool,
+    alpha: SecureField,
+) -> Option<SecureColumnByCoords<CpuBackend>> {
+    metal::objc::rc::autoreleasepool(|| {
+        fold_metal_inner(values, coordinate_inverses, coord_is_y, alpha)
+    })
+}
+
+fn fold_metal_inner(
+    values: &SecureColumnByCoords<CpuBackend>,
+    coordinate_inverses: &[BaseField],
     coord_is_y: bool,
     alpha: SecureField,
 ) -> Option<SecureColumnByCoords<CpuBackend>> {
@@ -243,25 +254,27 @@ pub(crate) fn fold_metal(
     if half_n < (1 << MIN_METAL_FOLD_LOG_SIZE) {
         return None;
     }
+    let expected_inverses = if coord_is_y { half_n / 2 } else { half_n };
+    if coordinate_inverses.len() != expected_inverses {
+        return None;
+    }
     let ctx = context()?;
     let ctx = ctx.lock().unwrap();
 
-    // Safety: the kernel writes every entry before anything reads them.
-    let mut out: [Vec<BaseField>; 4] = std::array::from_fn(|_| unsafe { uninit_vec(half_n) });
+    let mut out: [Vec<BaseField>; 4] = std::array::from_fn(|_| vec![BaseField::default(); half_n]);
     let in_buffers: Vec<Buffer> = values
         .columns
         .iter()
         .map(|c| bind_input(&ctx.device, c))
         .collect();
-    let out_buffers: Vec<Buffer> = out.iter().map(|c| bind_input(&ctx.device, c)).collect();
+    let out_buffers: Vec<Buffer> = out
+        .iter_mut()
+        .map(|c| bind_output(&ctx.device, c))
+        .collect();
 
-    let initial = coset.at(0);
+    let inverse_buffer = bind_input(&ctx.device, coordinate_inverses);
     let alpha_coords = alpha.to_m31_array();
     let params = FoldParams {
-        initial_x: initial.x.0,
-        initial_y: initial.y.0,
-        step_x: coset.step.x.0,
-        step_y: coset.step.y.0,
         half_log: half_n.ilog2(),
         coord_is_y: u32::from(coord_is_y),
         alpha: [
@@ -284,15 +297,16 @@ pub(crate) fn fold_metal(
     for (k, buffer) in out_buffers.iter().enumerate() {
         encoder.set_buffer(4 + k as u64, Some(buffer), 0);
     }
+    encoder.set_buffer(8, Some(&inverse_buffer), 0);
     encoder.set_bytes(
-        8,
+        9,
         std::mem::size_of::<FoldParams>() as u64,
         &params as *const _ as *const std::ffi::c_void,
     );
     encoder.dispatch_threads(MTLSize::new(half_n as u64, 1, 1), MTLSize::new(256, 1, 1));
     encoder.end_encoding();
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::context::wait_for_completion(command_buffer).ok()?;
 
     for (vec, buffer) in out.iter_mut().zip(&out_buffers) {
         let zero_copy = std::ptr::eq(buffer.contents() as *const BaseField, vec.as_ptr());
@@ -316,18 +330,40 @@ pub(crate) fn fold_metal(
 /// Chains all fold steps of one FRI layer and the packed Merkle tree of the final
 /// folded evaluation into one submission. Returns the folded coordinates and, when the
 /// folded size clears the tree threshold, the tree layers (leaves first, above-threshold
-/// only). `None` without a usable device or for sub-threshold sizes.
+/// only). `None` without a usable device, for sub-threshold sizes, or on command failure.
 #[allow(clippy::type_complexity)]
 pub(crate) fn fold_line_chain_and_packed_tree_metal(
     values: &SecureColumnByCoords<CpuBackend>,
-    mut coset: Coset,
+    coset: Coset,
     alphas: &[SecureField],
+    inverse_twiddle_tree: &[BaseField],
     is_m31_output: bool,
 ) -> Option<(
     SecureColumnByCoords<CpuBackend>,
     Option<Vec<Vec<crate::core::vcs::blake2_hash::Blake2sHash>>>,
 )> {
-    use crate::core::utils::uninit_vec;
+    metal::objc::rc::autoreleasepool(|| {
+        fold_line_chain_and_packed_tree_metal_inner(
+            values,
+            coset,
+            alphas,
+            inverse_twiddle_tree,
+            is_m31_output,
+        )
+    })
+}
+
+#[allow(clippy::type_complexity)]
+fn fold_line_chain_and_packed_tree_metal_inner(
+    values: &SecureColumnByCoords<CpuBackend>,
+    mut coset: Coset,
+    alphas: &[SecureField],
+    inverse_twiddle_tree: &[BaseField],
+    is_m31_output: bool,
+) -> Option<(
+    SecureColumnByCoords<CpuBackend>,
+    Option<Vec<Vec<crate::core::vcs::blake2_hash::Blake2sHash>>>,
+)> {
     let n0 = values.len();
     if alphas.is_empty() || (n0 >> alphas.len()) < (1 << MIN_METAL_FOLD_LOG_SIZE) {
         return None;
@@ -344,19 +380,27 @@ pub(crate) fn fold_line_chain_and_packed_tree_metal(
     // Keep every step's output storage alive until the wait.
     let mut step_outputs: Vec<[Vec<BaseField>; 4]> = Vec::with_capacity(alphas.len());
     let mut step_buffers: Vec<Vec<Buffer>> = Vec::with_capacity(alphas.len());
+    let mut inverse_buffers: Vec<Buffer> = Vec::with_capacity(alphas.len());
     for (step, &alpha) in alphas.iter().enumerate() {
         let half_n = n0 >> (step + 1);
-        // Safety: the fold kernel writes every entry before anything reads them.
-        let out: [Vec<BaseField>; 4] = std::array::from_fn(|_| unsafe { uninit_vec(half_n) });
-        let out_buffers: Vec<Buffer> = out.iter().map(|c| bind_input(&ctx.device, c)).collect();
+        let mut out: [Vec<BaseField>; 4] =
+            std::array::from_fn(|_| vec![BaseField::default(); half_n]);
+        let out_buffers: Vec<Buffer> = out
+            .iter_mut()
+            .map(|c| bind_output(&ctx.device, c))
+            .collect();
 
-        let initial = coset.at(0);
+        let line_domain = crate::core::poly::line::LineDomain::new(coset);
+        let coordinate_inverses = crate::core::poly::utils::domain_line_twiddles_from_tree(
+            line_domain,
+            inverse_twiddle_tree,
+        )[0];
+        if coordinate_inverses.len() != half_n {
+            return None;
+        }
+        inverse_buffers.push(bind_input(&ctx.device, coordinate_inverses));
         let alpha_coords = alpha.to_m31_array();
         let params = FoldParams {
-            initial_x: initial.x.0,
-            initial_y: initial.y.0,
-            step_x: coset.step.x.0,
-            step_y: coset.step.y.0,
             half_log: half_n.ilog2(),
             coord_is_y: 0,
             alpha: [
@@ -378,8 +422,9 @@ pub(crate) fn fold_line_chain_and_packed_tree_metal(
         for (k, buffer) in out_buffers.iter().enumerate() {
             encoder.set_buffer(4 + k as u64, Some(buffer), 0);
         }
+        encoder.set_buffer(8, Some(inverse_buffers.last().unwrap()), 0);
         encoder.set_bytes(
-            8,
+            9,
             std::mem::size_of::<FoldParams>() as u64,
             &params as *const _ as *const std::ffi::c_void,
         );
@@ -407,7 +452,7 @@ pub(crate) fn fold_line_chain_and_packed_tree_metal(
     };
 
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    super::context::wait_for_completion(command_buffer).ok()?;
 
     // Copy out any fold output that couldn't bind zero-copy.
     let final_buffers = step_buffers.last().unwrap();
@@ -432,4 +477,65 @@ pub(crate) fn fold_line_chain_and_packed_tree_metal(
         },
         pending.map(super::blake2s::PendingTree::finish),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fold_metal;
+    use crate::core::fields::qm31::SecureField;
+    use crate::core::poly::circle::{CanonicCoset, CircleDomain};
+    use crate::core::poly::line::LineDomain;
+    use crate::core::poly::utils::domain_line_twiddles_from_tree;
+    use crate::prover::backend::cpu::{fold_circle_into_line_cpu, fold_line_cpu};
+    use crate::prover::backend::CpuBackend;
+    use crate::prover::line::LineEvaluation;
+    use crate::prover::poly::circle::{PolyOps, SecureEvaluation};
+    use crate::prover::poly::BitReversedOrder;
+    use crate::prover::secure_column::SecureColumnByCoords;
+
+    const LOG_SIZE: u32 = super::MIN_METAL_FOLD_LOG_SIZE + 1;
+
+    fn values() -> SecureColumnByCoords<CpuBackend> {
+        SecureColumnByCoords {
+            columns: std::array::from_fn(|coordinate| {
+                (0..1usize << LOG_SIZE)
+                    .map(|row| {
+                        let raw = (row as u32)
+                            .wrapping_mul(2_654_435_761)
+                            .wrapping_add((coordinate as u32 + 1) * 97)
+                            & 0x3fff_ffff;
+                        crate::core::fields::m31::BaseField::from_u32_unchecked(raw)
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    fn alpha() -> SecureField {
+        SecureField::from_u32_unchecked(2213980, 2213981, 2213982, 2213983)
+    }
+
+    #[test]
+    fn inverse_twiddle_folds_match_scalar_for_line_and_circle() {
+        let line_domain = LineDomain::new(CanonicCoset::new(LOG_SIZE + 1).half_coset());
+        let line_twiddles = CpuBackend::precompute_twiddles(line_domain.coset());
+        let line_eval = LineEvaluation::new(line_domain, values());
+        let line_inverses =
+            domain_line_twiddles_from_tree(line_domain, &line_twiddles.itwiddles)[0];
+        let actual_line = fold_metal(&line_eval.values, line_inverses, false, alpha())
+            .expect("Metal line fold should dispatch");
+        let expected_line = fold_line_cpu(&line_eval, alpha());
+        assert_eq!(actual_line.columns, expected_line.values.columns);
+
+        let circle_domain: CircleDomain = CanonicCoset::new(LOG_SIZE).circle_domain();
+        let circle_twiddles = CpuBackend::precompute_twiddles(circle_domain.half_coset);
+        let circle_eval =
+            SecureEvaluation::<CpuBackend, BitReversedOrder>::new(circle_domain, values());
+        let circle_inverses =
+            domain_line_twiddles_from_tree(circle_domain, &circle_twiddles.itwiddles)[0];
+        let actual_circle = fold_metal(&circle_eval.values, circle_inverses, true, alpha())
+            .expect("Metal circle fold should dispatch");
+        let expected_circle = fold_circle_into_line_cpu(&circle_eval, alpha());
+        assert_eq!(actual_circle.columns, expected_circle.values.columns);
+    }
 }

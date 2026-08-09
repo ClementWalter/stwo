@@ -14,6 +14,8 @@ use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::{SecureField, QM31};
 use stwo::core::fields::FieldExpOps;
 
+use crate::preprocessed_columns::PreProcessedColumnId;
+
 /// A single base field column at index `idx` of interaction `interaction`, at mask offset `offset`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ColumnExpr {
@@ -32,8 +34,64 @@ impl From<(usize, usize, isize)> for ColumnExpr {
     }
 }
 
+impl ColumnExpr {
+    pub const fn interaction(&self) -> usize {
+        self.interaction
+    }
+
+    pub const fn column_index(&self) -> usize {
+        self.idx
+    }
+
+    pub const fn offset(&self) -> isize {
+        self.offset
+    }
+}
+
+/// A component-local access to a committed preprocessed column.
+///
+/// `access_index` is the position of this access in the component's
+/// [`FrameworkComponent::preprocessed_column_indices`] array. Keeping the column ID in the node
+/// preserves its typed identity for capture validation; lowering must bind through
+/// `preprocessed_column_indices`, never by resolving the ID as a scalar parameter name.
+///
+/// [`FrameworkComponent::preprocessed_column_indices`]: crate::FrameworkComponent::preprocessed_column_indices
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PreprocessedColumnExpr {
+    column: PreProcessedColumnId,
+    access_index: usize,
+}
+
+impl PreprocessedColumnExpr {
+    pub const fn new(column: PreProcessedColumnId, access_index: usize) -> Self {
+        Self {
+            column,
+            access_index,
+        }
+    }
+
+    pub const fn column(&self) -> &PreProcessedColumnId {
+        &self.column
+    }
+
+    pub const fn access_index(&self) -> usize {
+        self.access_index
+    }
+
+    /// Resolves this component-local access using the binding produced by
+    /// [`FrameworkComponent::preprocessed_column_indices`].
+    ///
+    /// [`FrameworkComponent::preprocessed_column_indices`]: crate::FrameworkComponent::preprocessed_column_indices
+    pub fn bind(&self, preprocessed_column_indices: &[usize]) -> usize {
+        *preprocessed_column_indices
+            .get(self.access_index)
+            .expect("missing preprocessed column binding for expression access")
+    }
+}
+
 /// An expression representing a base field value. Can be either:
 ///     * A column indexed by a `ColumnExpr`.
+///     * A typed access to a committed preprocessed column.
 ///     * A base field constant.
 ///     * A formal parameter to the AIR.
 ///     * A sum, difference, or product of two base field expressions.
@@ -44,6 +102,8 @@ impl From<(usize, usize, isize)> for ColumnExpr {
 #[derive(Clone, Debug, PartialEq)]
 pub enum BaseExpr {
     Col(ColumnExpr),
+    /// A committed preprocessed column, distinct from a scalar [`Self::Param`].
+    PreprocessedColumn(PreprocessedColumnExpr),
     Const(BaseField),
     /// Formal parameter to the AIR, for example the interaction elements of a relation.
     Param(String),

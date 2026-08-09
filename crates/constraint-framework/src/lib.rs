@@ -12,6 +12,8 @@ mod point;
 pub mod preprocessed_columns;
 #[cfg(all(feature = "prover", feature = "std"))]
 mod prover;
+#[cfg(all(feature = "prover", feature = "std"))]
+mod relation_parameters;
 
 use core::array;
 use core::fmt::Debug;
@@ -28,6 +30,8 @@ pub use prover::{
     CpuDomainEvaluator, FractionWriter, LogupColGenerator, LogupTraceGenerator,
     SimdDomainEvaluator,
 };
+#[cfg(all(feature = "prover", feature = "std"))]
+pub use relation_parameters::{RelationParameterEvaluator, RelationParameterSet};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::{SecureField, SECURE_EXTENSION_DEGREE};
 use stwo::core::fields::FieldExpOps;

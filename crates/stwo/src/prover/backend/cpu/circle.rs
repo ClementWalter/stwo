@@ -131,22 +131,83 @@ impl PolyOps for CpuBackend {
         use crate::prover::poly::circle::CircleEvaluation as GenericCircleEvaluation;
 
         const MIN_SIMD_DISPATCH_LOG_SIZE: u32 = 10;
-        let all_large = columns.iter().all(|column| {
-            let log_size = match column {
-                EvalsOrCoeffs::Evals(evals) => evals.domain.log_size(),
-                EvalsOrCoeffs::Coeffs(coeffs) => coeffs.log_size(),
-            };
-            log_size >= MIN_SIMD_DISPATCH_LOG_SIZE
-        });
-        if columns.is_empty() || !all_large {
-            // Fall back to the scalar single-pass default.
-            return fallback_interpolate_and_evaluate_polynomials(
-                columns,
+        if columns.is_empty() {
+            return Vec::new();
+        }
+
+        // A heterogeneous commitment must not let one tiny column drag every large
+        // column through the scalar transform. Partition first, process each class in
+        // a batch, then restore the protocol-visible column order exactly.
+        if columns
+            .iter()
+            .any(|column| column_log_size(column) < MIN_SIMD_DISPATCH_LOG_SIZE)
+        {
+            let total_columns = columns.len();
+            let (simd, scalar): (Vec<_>, Vec<_>) = columns
+                .into_iter()
+                .enumerate()
+                .partition(|(_, column)| column_log_size(column) >= MIN_SIMD_DISPATCH_LOG_SIZE);
+            let (simd_indices, simd_columns): (Vec<_>, Vec<_>) = simd.into_iter().unzip();
+            let (scalar_indices, scalar_columns): (Vec<_>, Vec<_>) = scalar.into_iter().unzip();
+            let simd_polys = Self::interpolate_and_evaluate_polynomials(
+                simd_columns,
                 log_blowup_factor,
                 twiddles,
                 store_polynomials_coefficients,
                 pool,
             );
+            let scalar_polys = fallback_interpolate_and_evaluate_polynomials(
+                scalar_columns,
+                log_blowup_factor,
+                twiddles,
+                store_polynomials_coefficients,
+                pool,
+            );
+            return restore_polynomial_order(
+                total_columns,
+                [(simd_indices, simd_polys), (scalar_indices, scalar_polys)],
+            );
+        }
+
+        // The Metal batch has a higher crossover than SIMD. Split only when both
+        // classes are present; an all-SIMD batch falls through to the existing cheap
+        // Metal rejection and then the packed CPU implementation.
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let min_metal_log = crate::prover::backend::metal::fft::MIN_METAL_FFT_LOG_SIZE;
+            let has_metal = columns
+                .iter()
+                .any(|column| column_log_size(column) >= min_metal_log);
+            let has_simd_only = columns
+                .iter()
+                .any(|column| column_log_size(column) < min_metal_log);
+            if has_metal && has_simd_only {
+                let total_columns = columns.len();
+                let (metal, simd): (Vec<_>, Vec<_>) = columns
+                    .into_iter()
+                    .enumerate()
+                    .partition(|(_, column)| column_log_size(column) >= min_metal_log);
+                let (metal_indices, metal_columns): (Vec<_>, Vec<_>) = metal.into_iter().unzip();
+                let (simd_indices, simd_columns): (Vec<_>, Vec<_>) = simd.into_iter().unzip();
+                let metal_polys = Self::interpolate_and_evaluate_polynomials(
+                    metal_columns,
+                    log_blowup_factor,
+                    twiddles,
+                    store_polynomials_coefficients,
+                    pool,
+                );
+                let simd_polys = Self::interpolate_and_evaluate_polynomials(
+                    simd_columns,
+                    log_blowup_factor,
+                    twiddles,
+                    store_polynomials_coefficients,
+                    pool,
+                );
+                return restore_polynomial_order(
+                    total_columns,
+                    [(metal_indices, metal_polys), (simd_indices, simd_polys)],
+                );
+            }
         }
 
         // Apple-GPU path: all columns' transforms encoded into one command buffer
@@ -164,9 +225,17 @@ impl PolyOps for CpuBackend {
             }
         };
 
-        // One cached packed twiddle tree per root coset, shared by all columns of every
-        // commitment over that coset.
-        let simd_twiddles = cached_simd_twiddles(twiddles.root_coset);
+        // Keep only the suffix of the twiddle tower needed by this batch. In the
+        // heterogeneous commit path this is especially important for the SIMD-only
+        // partition (source log sizes 10..13): retaining the proof's full root tower
+        // would turn a <=64 KiB fallback cache into a 128 MiB cache at fib-1M scale.
+        let max_eval_log_size = columns
+            .iter()
+            .map(|column| column_log_size(column) + log_blowup_factor)
+            .max()
+            .expect("non-empty columns checked above");
+        let simd_twiddles =
+            cached_simd_twiddles_for_circle_log_size(twiddles.root_coset, max_eval_log_size);
 
         // Packing fallback for allocations that miss SIMD alignment (rare: large
         // allocations come straight from the page allocator).
@@ -438,33 +507,14 @@ impl PolyOps for CpuBackend {
         coset: CanonicCoset,
         p: CirclePoint<SecureField>,
     ) -> Col<CpuBackend, SecureField> {
-        let domain = coset.circle_domain();
+        if barycentric_weights_use_simd(coset.log_size()) {
+            use crate::prover::backend::simd::SimdBackend;
 
-        let (si_i, vi_p): (Vec<_>, Vec<_>) = (0..domain.size())
-            .map(|i| {
-                let coset_point = domain
-                    .at(bit_reverse_index(i, domain.log_size()))
-                    .into_ef::<SecureField>();
-                let minus_two_coset_point_y = coset_point.y * SecureField::from(-2);
-                (
-                    minus_two_coset_point_y
-                        * coset_vanishing_derivative(
-                            Coset::new(CirclePointIndex::generator(), domain.log_size()),
-                            coset_point,
-                        ),
-                    point_vanishing(coset_point, p.into_ef::<SecureField>()),
-                )
-            })
-            .unzip();
+            let weights = <SimdBackend as PolyOps>::barycentric_weights(coset, p);
+            return weights.to_cpu();
+        }
 
-        let vn_p: SecureField = coset_vanishing(
-            CanonicCoset::new(domain.log_size()).coset,
-            p.into_ef::<SecureField>(),
-        );
-
-        (0..domain.size())
-            .map(|i| vn_p / (si_i[i] * vi_p[i]))
-            .collect_vec()
+        barycentric_weights_scalar(coset, p)
     }
 
     fn barycentric_eval_at_point(
@@ -474,6 +524,49 @@ impl PolyOps for CpuBackend {
         (0..evals.domain.size()).fold(SecureField::zero(), |acc, i| {
             acc + (evals.values[i] * weights[i])
         })
+    }
+
+    fn barycentric_eval_many_at_point(
+        evals: &[&CircleEvaluation<CpuBackend, BaseField, BitReversedOrder>],
+        weights: &Col<CpuBackend, SecureField>,
+    ) -> Vec<SecureField> {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(values) =
+            crate::prover::backend::metal::ood::barycentric_eval_many_metal(evals, weights)
+        {
+            return values;
+        }
+
+        #[cfg(feature = "parallel")]
+        return evals
+            .par_iter()
+            .map(|eval| Self::barycentric_eval_at_point(eval, weights))
+            .collect();
+
+        #[cfg(not(feature = "parallel"))]
+        evals
+            .iter()
+            .map(|eval| Self::barycentric_eval_at_point(eval, weights))
+            .collect()
+    }
+
+    fn barycentric_eval_many_groups(
+        groups: &[crate::prover::poly::circle::BarycentricEvalGroup<'_, CpuBackend>],
+    ) -> Vec<Option<Vec<SecureField>>> {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        return crate::prover::backend::metal::ood::barycentric_eval_groups_metal(groups);
+
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        groups.iter().map(|_| None).collect()
+    }
+
+    fn resident_barycentric_min_log_size() -> Option<u32> {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        return crate::prover::backend::metal::ood::is_ready()
+            .then_some(crate::prover::backend::metal::ood::MIN_METAL_OOD_LOG_SIZE);
+
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        None
     }
 
     fn eval_at_point_by_folding(
@@ -655,8 +748,10 @@ impl PolyOps for CpuBackend {
             });
         #[cfg(not(feature = "parallel"))]
         twiddles
-            .array_chunks::<CHUNK_SIZE>()
-            .zip(itwiddles.array_chunks_mut::<CHUNK_SIZE>())
+            .as_chunks::<CHUNK_SIZE>()
+            .0
+            .iter()
+            .zip(itwiddles.as_chunks_mut::<CHUNK_SIZE>().0.iter_mut())
             .for_each(|(src, dst)| {
                 batch_inverse_in_place(src, dst);
             });
@@ -685,24 +780,115 @@ impl PolyOps for CpuBackend {
 pub(crate) fn cached_simd_twiddles(
     root_coset: Coset,
 ) -> std::sync::Arc<TwiddleTree<crate::prover::backend::simd::SimdBackend>> {
+    cached_simd_twiddles_for_root(root_coset)
+}
+
+/// Returns the smallest cached SIMD twiddle tower that covers a circle domain of
+/// `max_circle_log_size` descended from `root_coset`.
+///
+/// A circle domain of log size `L` has a half-coset of log size `L - 1`. Every FFT
+/// layer it consumes is therefore a suffix of the tower rooted at that half-coset.
+/// Repeatedly doubling the original root down to log `L - 1` preserves that suffix
+/// exactly while avoiding all unused parent layers.
+fn cached_simd_twiddles_for_circle_log_size(
+    root_coset: Coset,
+    max_circle_log_size: u32,
+) -> std::sync::Arc<TwiddleTree<crate::prover::backend::simd::SimdBackend>> {
+    let required_root_log_size = max_circle_log_size
+        .checked_sub(1)
+        .expect("circle domains have positive log size");
+    assert!(
+        required_root_log_size <= root_coset.log_size(),
+        "circle domain log size {max_circle_log_size} exceeds twiddle root capacity {}",
+        root_coset.log_size() + 1
+    );
+    let required_root = root_coset.repeated_double(root_coset.log_size() - required_root_log_size);
+    cached_simd_twiddles_for_root(required_root)
+}
+
+#[allow(clippy::type_complexity)]
+fn cached_simd_twiddles_for_root(
+    root_coset: Coset,
+) -> std::sync::Arc<TwiddleTree<crate::prover::backend::simd::SimdBackend>> {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
 
     use crate::prover::backend::simd::SimdBackend;
 
-    static CACHE: OnceLock<Mutex<HashMap<(u32, u32), Arc<TwiddleTree<SimdBackend>>>>> =
-        OnceLock::new();
+    type Tree = TwiddleTree<SimdBackend>;
+    type Cache = Mutex<HashMap<(u32, u32), Arc<OnceLock<Arc<Tree>>>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
     let key = (root_coset.initial_index.0 as u32, root_coset.log_size);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(tree) = cache.lock().unwrap().get(&key) {
-        return tree.clone();
-    }
-    let tree = Arc::new(SimdBackend::precompute_twiddles(root_coset));
-    cache.lock().unwrap().entry(key).or_insert(tree).clone()
+    cached_arc(cache, key, || SimdBackend::precompute_twiddles(root_coset))
 }
 
-/// Size from which single-column transforms dispatch to the shared SIMD FFT kernels.
+/// Returns one shared value per key and permits at most one concurrent builder. The
+/// map lock only protects slot publication; expensive initialization is serialized by
+/// the per-key `OnceLock`, so unrelated keys can still initialize independently.
+fn cached_arc<K, V>(
+    cache: &std::sync::Mutex<
+        std::collections::HashMap<K, std::sync::Arc<std::sync::OnceLock<std::sync::Arc<V>>>>,
+    >,
+    key: K,
+    build: impl FnOnce() -> V,
+) -> std::sync::Arc<V>
+where
+    K: Eq + std::hash::Hash,
+{
+    use std::sync::{Arc, OnceLock};
+
+    let slot = {
+        let mut cache = cache.lock().unwrap();
+        Arc::clone(
+            cache
+                .entry(key)
+                .or_insert_with(|| Arc::new(OnceLock::new())),
+        )
+    };
+    Arc::clone(slot.get_or_init(|| Arc::new(build())))
+}
+
+/// Size from which eligible CPU polynomial operations dispatch to shared SIMD kernels.
 const SIMD_DISPATCH_LOG_SIZE: u32 = 10;
+
+const fn barycentric_weights_use_simd(log_size: u32) -> bool {
+    log_size >= SIMD_DISPATCH_LOG_SIZE
+}
+
+/// Scalar barycentric-weight implementation and recursion-safe SIMD base case.
+pub(crate) fn barycentric_weights_scalar(
+    coset: CanonicCoset,
+    p: CirclePoint<SecureField>,
+) -> Vec<SecureField> {
+    let domain = coset.circle_domain();
+
+    let (si_i, vi_p): (Vec<_>, Vec<_>) = (0..domain.size())
+        .map(|i| {
+            let coset_point = domain
+                .at(bit_reverse_index(i, domain.log_size()))
+                .into_ef::<SecureField>();
+            let minus_two_coset_point_y = coset_point.y * SecureField::from(-2);
+            (
+                minus_two_coset_point_y
+                    * coset_vanishing_derivative(
+                        Coset::new(CirclePointIndex::generator(), domain.log_size()),
+                        coset_point,
+                    ),
+                point_vanishing(coset_point, p.into_ef::<SecureField>()),
+            )
+        })
+        .unzip();
+
+    let vn_p: SecureField = coset_vanishing(
+        CanonicCoset::new(domain.log_size()).coset,
+        p.into_ef::<SecureField>(),
+    );
+
+    (0..domain.size())
+        .map(|i| vn_p / (si_i[i] * vi_p[i]))
+        .collect_vec()
+}
 
 /// Converts a coefficient column between the SIMD kernels' large-transform layout and
 /// natural coefficient order. Above [`CACHED_FFT_LOG_SIZE`] the SIMD ifft leaves
@@ -977,14 +1163,111 @@ mod tests {
     use itertools::Itertools;
     use num_traits::One;
 
-    use crate::core::circle::CirclePoint;
+    use crate::core::circle::{CirclePoint, SECURE_FIELD_CIRCLE_GEN};
     use crate::core::fields::m31::BaseField;
     use crate::core::fields::qm31::SecureField;
     use crate::core::poly::circle::CanonicCoset;
     use crate::prover::backend::cpu::CpuCirclePoly;
-    use crate::prover::backend::CpuBackend;
+    use crate::prover::backend::simd::SimdBackend;
+    use crate::prover::backend::{Column, CpuBackend};
     use crate::prover::poly::circle::{CircleEvaluation, PolyOps};
     use crate::prover::poly::BitReversedOrder;
+
+    fn extension_barycentric_points() -> [CirclePoint<SecureField>; 2] {
+        let points = [
+            SECURE_FIELD_CIRCLE_GEN,
+            SECURE_FIELD_CIRCLE_GEN.mul(1_234_567),
+        ];
+        for point in points {
+            let x = point.x.to_m31_array();
+            let y = point.y.to_m31_array();
+            assert!(
+                x[1..]
+                    .iter()
+                    .chain(&y[1..])
+                    .any(|coordinate| coordinate.0 != 0),
+                "test point must not be base-field-valued"
+            );
+        }
+        points
+    }
+
+    #[test]
+    fn barycentric_dispatch_threshold_is_pinned() {
+        assert!(!super::barycentric_weights_use_simd(9));
+        assert!(super::barycentric_weights_use_simd(10));
+    }
+
+    #[test]
+    fn concurrent_cache_miss_builds_value_once() {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier, Mutex, OnceLock};
+
+        let cache: Mutex<HashMap<u32, Arc<OnceLock<Arc<u32>>>>> = Mutex::new(HashMap::new());
+        let barrier = Barrier::new(16);
+        let builds = AtomicUsize::new(0);
+        let values = std::thread::scope(|scope| {
+            let handles = (0..16)
+                .map(|_| {
+                    let cache = &cache;
+                    let barrier = &barrier;
+                    let builds = &builds;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        super::cached_arc(cache, 7, || {
+                            builds.fetch_add(1, Ordering::Relaxed);
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            42
+                        })
+                    })
+                })
+                .collect_vec();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect_vec()
+        });
+
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        assert!(values.iter().all(|value| Arc::ptr_eq(value, &values[0])));
+    }
+
+    #[test]
+    fn scalar_and_direct_simd_barycentric_weights_are_exact() {
+        for log_size in [5, 9, 10, 11] {
+            let coset = CanonicCoset::new(log_size);
+            for point in extension_barycentric_points() {
+                let scalar = super::barycentric_weights_scalar(coset, point);
+                let simd = <SimdBackend as PolyOps>::barycentric_weights(coset, point).to_cpu();
+                assert_eq!(simd, scalar, "log_size={log_size}, point={point:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn public_cpu_barycentric_weights_match_scalar_across_dispatch() {
+        for log_size in [9, 10, 11] {
+            let coset = CanonicCoset::new(log_size);
+            for point in extension_barycentric_points() {
+                let scalar = super::barycentric_weights_scalar(coset, point);
+                let public = <CpuBackend as PolyOps>::barycentric_weights(coset, point);
+                assert_eq!(public, scalar, "log_size={log_size}, point={point:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn small_simd_barycentric_fallback_matches_scalar() {
+        for log_size in 1..=4 {
+            let coset = CanonicCoset::new(log_size);
+            for point in extension_barycentric_points() {
+                let scalar = super::barycentric_weights_scalar(coset, point);
+                let simd = <SimdBackend as PolyOps>::barycentric_weights(coset, point).to_cpu();
+                assert_eq!(simd, scalar, "log_size={log_size}, point={point:?}");
+            }
+        }
+    }
 
     #[test]
     fn test_eval_at_point_with_4_coeffs() {
@@ -1223,6 +1506,30 @@ fn fallback_interpolate_and_evaluate_polynomials(
     .collect()
 }
 
+const fn column_log_size(column: &EvalsOrCoeffs<CpuBackend>) -> u32 {
+    match column {
+        EvalsOrCoeffs::Evals(evals) => evals.domain.log_size(),
+        EvalsOrCoeffs::Coeffs(coeffs) => coeffs.log_size(),
+    }
+}
+
+fn restore_polynomial_order<const N: usize>(
+    total_columns: usize,
+    groups: [(Vec<usize>, Vec<Poly<CpuBackend>>); N],
+) -> Vec<Poly<CpuBackend>> {
+    let mut ordered: Vec<Option<Poly<CpuBackend>>> = (0..total_columns).map(|_| None).collect();
+    for (indices, polynomials) in groups {
+        assert_eq!(indices.len(), polynomials.len());
+        for (index, polynomial) in zip(indices, polynomials) {
+            assert!(ordered[index].replace(polynomial).is_none());
+        }
+    }
+    ordered
+        .into_iter()
+        .map(|polynomial| polynomial.expect("partition omitted a polynomial"))
+        .collect()
+}
+
 #[cfg(test)]
 mod dispatch_tests {
     use itertools::Itertools;
@@ -1230,6 +1537,9 @@ mod dispatch_tests {
     use super::*;
     use crate::core::poly::circle::CanonicCoset;
     use crate::core::utils::bit_reverse_index;
+    use crate::prover::backend::simd::circle::{ifft_in_place_raw, rfft_raw};
+    use crate::prover::backend::simd::column::BaseColumn;
+    use crate::prover::backend::simd::SimdBackend;
     use crate::prover::poly::circle::{CircleEvaluation, EvalsOrCoeffs, PolyOps};
     use crate::prover::poly::BitReversedOrder;
 
@@ -1260,7 +1570,6 @@ mod dispatch_tests {
     /// Same root-independence invariant for the SIMD twiddle tree's flat buffer.
     #[test]
     fn simd_twiddle_layers_independent_of_tree_root() {
-        use crate::prover::backend::simd::SimdBackend;
         let domain = CanonicCoset::new(17).circle_domain();
         let t17 =
             SimdBackend::precompute_twiddles(CanonicCoset::new(17).circle_domain().half_coset);
@@ -1277,6 +1586,147 @@ mod dispatch_tests {
                 a.len()
             );
         }
+    }
+
+    /// A right-sized tree must be exactly the suffix of its supplied root tower, not
+    /// merely a same-sized canonical tree. Exercise the entire SIMD fallback range and
+    /// two distinct noncanonical roots through both inverse and extended transforms.
+    #[test]
+    fn right_sized_simd_twiddles_preserve_exact_transform_results() {
+        const ROOT_LOG_SIZE: u32 = 18;
+
+        for initial_multiplier in [1usize, 3] {
+            let root = Coset::new(
+                CirclePointIndex::generator() * initial_multiplier,
+                ROOT_LOG_SIZE,
+            );
+            let full_twiddles = SimdBackend::precompute_twiddles(root);
+
+            for source_log_size in 10u32..=13 {
+                let eval_log_size = source_log_size + 1;
+                let sized_twiddles = cached_simd_twiddles_for_circle_log_size(root, eval_log_size);
+                let expected_root = root.repeated_double(ROOT_LOG_SIZE - (eval_log_size - 1));
+
+                assert_eq!(sized_twiddles.root_coset, expected_root);
+                assert_eq!(sized_twiddles.twiddles.len(), 1 << (eval_log_size - 1));
+                assert_eq!(sized_twiddles.itwiddles.len(), 1 << (eval_log_size - 1));
+                assert!(std::sync::Arc::ptr_eq(
+                    &sized_twiddles,
+                    &cached_simd_twiddles_for_circle_log_size(root, eval_log_size)
+                ));
+
+                let source_domain =
+                    CircleDomain::new(root.repeated_double(ROOT_LOG_SIZE - (source_log_size - 1)));
+                let eval_domain = CircleDomain::new(expected_root);
+                let values = test_values(source_log_size);
+                let mut full_coeffs = BaseColumn::from_cpu(&values);
+                let mut sized_coeffs = BaseColumn::from_cpu(&values);
+
+                // SAFETY: BaseColumn storage is 64-byte aligned and both columns contain
+                // exactly source_domain.size() writable M31 values.
+                unsafe {
+                    ifft_in_place_raw(
+                        full_coeffs.data.as_mut_ptr().cast(),
+                        source_domain,
+                        &full_twiddles,
+                    );
+                    ifft_in_place_raw(
+                        sized_coeffs.data.as_mut_ptr().cast(),
+                        source_domain,
+                        &sized_twiddles,
+                    );
+                }
+                assert_eq!(
+                    sized_coeffs.as_slice(),
+                    full_coeffs.as_slice(),
+                    "IFFT mismatch for source log {source_log_size}, root multiplier {initial_multiplier}"
+                );
+
+                let mut full_evals =
+                    BaseColumn::from_iter((0..eval_domain.size()).map(|_| BaseField::zero()));
+                let mut sized_evals =
+                    BaseColumn::from_iter((0..eval_domain.size()).map(|_| BaseField::zero()));
+                // SAFETY: all BaseColumn buffers are 64-byte aligned, disjoint, and
+                // sized for their respective source and destination domains.
+                unsafe {
+                    rfft_raw(
+                        full_coeffs.data.as_ptr().cast(),
+                        full_evals.data.as_mut_ptr().cast(),
+                        source_log_size,
+                        eval_domain,
+                        &full_twiddles,
+                    );
+                    rfft_raw(
+                        sized_coeffs.data.as_ptr().cast(),
+                        sized_evals.data.as_mut_ptr().cast(),
+                        source_log_size,
+                        eval_domain,
+                        &sized_twiddles,
+                    );
+                }
+                assert_eq!(
+                    sized_evals.as_slice(),
+                    full_evals.as_slice(),
+                    "extended RFFT mismatch for source log {source_log_size}, root multiplier {initial_multiplier}"
+                );
+            }
+        }
+
+        let first = cached_simd_twiddles_for_circle_log_size(
+            Coset::new(CirclePointIndex::generator(), ROOT_LOG_SIZE),
+            14,
+        );
+        let distinct = cached_simd_twiddles_for_circle_log_size(
+            Coset::new(CirclePointIndex::generator() * 3usize, ROOT_LOG_SIZE),
+            14,
+        );
+        assert_ne!(first.root_coset, distinct.root_coset);
+        assert!(!std::sync::Arc::ptr_eq(&first, &distinct));
+    }
+
+    fn simd_twiddle_payload_bytes(twiddles: &TwiddleTree<SimdBackend>) -> usize {
+        (twiddles.twiddles.len() + twiddles.itwiddles.len()) * std::mem::size_of::<BaseField>()
+    }
+
+    /// Manual cold-process reference measurement. Run this test by exact name so no
+    /// other test warms the process-local cache first.
+    #[test]
+    #[ignore = "manual cold twiddle-cache measurement"]
+    fn measure_full_simd_twiddle_cache_cold() {
+        const ROOT_LOG_SIZE: u32 = 24;
+        let root = Coset::new(CirclePointIndex::generator() * 5usize, ROOT_LOG_SIZE);
+        let start = std::time::Instant::now();
+        let twiddles = cached_simd_twiddles(root);
+        let elapsed = start.elapsed();
+        let bytes = simd_twiddle_payload_bytes(&twiddles);
+
+        eprintln!(
+            "twiddle_cache kind=full root_log={ROOT_LOG_SIZE} bytes={bytes} cold_ms={:.3}",
+            elapsed.as_secs_f64() * 1_000.0
+        );
+        assert_eq!(bytes, 128 * 1024 * 1024);
+    }
+
+    /// Manual cold-process measurement for the largest heterogeneous SIMD-only batch:
+    /// source log 13 with blowup one requires a circle domain of log 14.
+    #[test]
+    #[ignore = "manual cold twiddle-cache measurement"]
+    fn measure_right_sized_simd_twiddle_cache_cold() {
+        const ROOT_LOG_SIZE: u32 = 24;
+        const MAX_FALLBACK_CIRCLE_LOG_SIZE: u32 = 14;
+        let root = Coset::new(CirclePointIndex::generator() * 7usize, ROOT_LOG_SIZE);
+        let start = std::time::Instant::now();
+        let twiddles = cached_simd_twiddles_for_circle_log_size(root, MAX_FALLBACK_CIRCLE_LOG_SIZE);
+        let elapsed = start.elapsed();
+        let bytes = simd_twiddle_payload_bytes(&twiddles);
+
+        eprintln!(
+            "twiddle_cache kind=right_sized root_log={} bytes={bytes} cold_ms={:.3}",
+            twiddles.root_coset.log_size(),
+            elapsed.as_secs_f64() * 1_000.0
+        );
+        assert_eq!(twiddles.root_coset, root.repeated_double(11));
+        assert_eq!(bytes, 64 * 1024);
     }
 
     /// Dispatched interpolate vs the scalar reference, spanning the SIMD cached-fft
@@ -1420,6 +1870,122 @@ mod dispatch_tests {
                     "coeffs log_size {log_size} col {c}"
                 );
             }
+        }
+    }
+
+    /// Mixed-size commitments retain their original order while independently taking
+    /// the scalar, SIMD, and (when enabled) Metal transform paths. Both evaluations and
+    /// already-interpolated coefficients are covered so partitioning cannot change the
+    /// representation contract at either input boundary.
+    #[test]
+    fn mixed_size_commit_partition_matches_scalar_in_order() {
+        const LOG_BLOWUP: u32 = 1;
+        // Adjacent pairs put both input representations through every dispatch tier.
+        let logs = [5u32, 5, 9, 9, 10, 10, 13, 13, 14, 14, 20, 20];
+        let twiddles =
+            CpuBackend::precompute_twiddles(CanonicCoset::new(21).circle_domain().half_coset);
+        let mut columns = Vec::with_capacity(logs.len());
+        let mut expected = Vec::with_capacity(logs.len());
+
+        for (column_index, &log_size) in logs.iter().enumerate() {
+            let values = (0..1usize << log_size)
+                .map(|row| {
+                    BaseField::from(
+                        (row as u32)
+                            .wrapping_mul(2654435761)
+                            .wrapping_add((column_index as u32 + 1) * 97)
+                            >> 1,
+                    )
+                })
+                .collect_vec();
+            let domain = CanonicCoset::new(log_size).circle_domain();
+            let scalar_coeffs = if column_index.is_multiple_of(2) {
+                let eval = CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+                    domain,
+                    values.clone(),
+                );
+                columns.push(EvalsOrCoeffs::Evals(eval));
+                interpolate_scalar(
+                    CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+                        domain, values,
+                    ),
+                    &twiddles,
+                )
+            } else {
+                let coeffs = CircleCoefficients::<CpuBackend>::new(values);
+                columns.push(EvalsOrCoeffs::Coeffs(CircleCoefficients::new(
+                    coeffs.coeffs.clone(),
+                )));
+                coeffs
+            };
+            let ext_domain = CanonicCoset::new(log_size + LOG_BLOWUP).circle_domain();
+            let scalar_evals = evaluate_into_scalar(
+                &scalar_coeffs,
+                ext_domain,
+                &twiddles,
+                vec![BaseField::zero(); ext_domain.size()],
+            );
+            expected.push((scalar_coeffs, scalar_evals));
+        }
+
+        let pool = BaseColumnPool::new();
+        let dispatched = <CpuBackend as PolyOps>::interpolate_and_evaluate_polynomials(
+            columns, LOG_BLOWUP, &twiddles, true, &pool,
+        );
+
+        assert_eq!(dispatched.len(), logs.len());
+        for (index, (actual, (expected_coeffs, expected_evals))) in
+            dispatched.iter().zip(expected).enumerate()
+        {
+            assert_eq!(
+                actual.coeffs.as_ref().unwrap().coeffs,
+                expected_coeffs.coeffs,
+                "coefficient order or value mismatch at input index {index}"
+            );
+            assert_eq!(
+                actual.evals.values, expected_evals.values,
+                "evaluation order or value mismatch at input index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_size_commit_without_stored_coefficients_matches_scalar() {
+        const LOG_BLOWUP: u32 = 1;
+        let logs = [9u32, 10, 14];
+        let twiddles =
+            CpuBackend::precompute_twiddles(CanonicCoset::new(15).circle_domain().half_coset);
+        let mut columns = Vec::new();
+        let mut expected = Vec::new();
+        for (index, &log_size) in logs.iter().enumerate() {
+            let domain = CanonicCoset::new(log_size).circle_domain();
+            let values = (0..1usize << log_size)
+                .map(|row| BaseField::from((row as u32 + 1) * (index as u32 + 3)))
+                .collect_vec();
+            let scalar_coeffs = interpolate_scalar(
+                CircleEvaluation::<CpuBackend, BaseField, BitReversedOrder>::new(
+                    domain,
+                    values.clone(),
+                ),
+                &twiddles,
+            );
+            let ext_domain = CanonicCoset::new(log_size + LOG_BLOWUP).circle_domain();
+            expected.push(evaluate_into_scalar(
+                &scalar_coeffs,
+                ext_domain,
+                &twiddles,
+                vec![BaseField::zero(); ext_domain.size()],
+            ));
+            columns.push(EvalsOrCoeffs::Evals(CircleEvaluation::new(domain, values)));
+        }
+
+        let pool = BaseColumnPool::new();
+        let dispatched = <CpuBackend as PolyOps>::interpolate_and_evaluate_polynomials(
+            columns, LOG_BLOWUP, &twiddles, false, &pool,
+        );
+        for (actual, expected) in dispatched.iter().zip(expected) {
+            assert!(actual.coeffs.is_none());
+            assert_eq!(actual.evals.values, expected.values);
         }
     }
 }

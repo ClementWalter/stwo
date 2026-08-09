@@ -1,5 +1,3 @@
-use std::iter::zip;
-
 use itertools::Itertools;
 use num_traits::Zero;
 #[cfg(feature = "parallel")]
@@ -11,15 +9,30 @@ use crate::core::fields::cm31::CM31;
 use crate::core::fields::m31::BaseField;
 use crate::core::fields::qm31::SecureField;
 use crate::core::fields::FieldExpOps;
-use crate::core::pcs::quotients::{denominators, quotient_constants, ColumnSampleBatch};
+use crate::core::pcs::quotients::{denominators, ColumnSampleBatch};
 use crate::core::poly::circle::CanonicCoset;
 use crate::core::utils::bit_reverse_index;
-use crate::prover::pcs::quotient_ops::AccumulatedNumerators;
+use crate::prover::pcs::quotient_ops::{AccumulatedNumerators, NumeratorBatchGroup};
 use crate::prover::poly::circle::{CircleEvaluation, SecureEvaluation};
 use crate::prover::poly::twiddles::{TwiddleBuffer, TwiddleTree};
 use crate::prover::poly::BitReversedOrder;
 use crate::prover::secure_column::SecureColumnByCoords;
 use crate::prover::QuotientOps;
+
+#[path = "quotients/numerators.rs"]
+mod numerators;
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn terminal_metal_quotient_result<T>(
+    result: Result<Option<T>, crate::prover::backend::metal::quotients::QuotientMetalError>,
+) -> Option<T> {
+    result.unwrap_or_else(|error| {
+        panic!(
+            "terminal Metal quotient failure after command submission; CPU fallback is unsafe: \
+             {error}"
+        )
+    })
+}
 
 impl QuotientOps for CpuBackend {
     fn accumulate_numerators(
@@ -28,123 +41,20 @@ impl QuotientOps for CpuBackend {
         accumulated_numerators_vec: &mut Vec<AccumulatedNumerators<Self>>,
         log_blowup_factor: u32,
     ) {
-        let size = columns[0].len();
-        let subdomain_size = size >> log_blowup_factor;
-        let quotient_constants = quotient_constants(sample_batches);
+        numerators::accumulate_group(
+            columns,
+            sample_batches,
+            accumulated_numerators_vec,
+            log_blowup_factor,
+        );
+    }
 
-        for (batch, coeffs) in zip(sample_batches, quotient_constants.line_coeffs) {
-            // Apple-GPU path: the whole batch accumulated in one GPU submission.
-            #[cfg(all(feature = "metal", target_os = "macos"))]
-            if subdomain_size
-                >= 1 << crate::prover::backend::metal::quotients::MIN_METAL_QUOTIENT_LOG_SIZE
-            {
-                let col_slices: Vec<&[BaseField]> = batch
-                    .cols_vals_randpows
-                    .iter()
-                    .map(|data| columns[data.column_index].values.as_slice())
-                    .collect();
-                let coeff_cs: Vec<SecureField> = coeffs.iter().map(|(_, _, c)| *c).collect();
-                let b_sum: SecureField = coeffs.iter().map(|(_, b, _)| *b).sum();
-                if let Some(partial_numerators_acc) =
-                    crate::prover::backend::metal::quotients::accumulate_numerators_metal(
-                        &col_slices,
-                        &coeff_cs,
-                        -b_sum,
-                        subdomain_size,
-                    )
-                {
-                    let first_linear_term_acc: SecureField = coeffs.iter().map(|(a, ..)| a).sum();
-                    accumulated_numerators_vec.push(AccumulatedNumerators {
-                        sample_point: batch.point,
-                        partial_numerators_acc,
-                        first_linear_term_acc,
-                    });
-                    continue;
-                }
-            }
-            let mut partial_numerators_acc =
-                unsafe { SecureColumnByCoords::uninitialized(subdomain_size) };
-
-            // Rows are independent; process disjoint row chunks concurrently. Each chunk
-            // writes a disjoint row range of every coordinate column.
-            let chunk_size = 1 << 12;
-            let mut chunk_views = {
-                let [c0, c1, c2, c3]: &mut [Vec<BaseField>; 4] =
-                    &mut partial_numerators_acc.columns;
-                (c0.chunks_mut(chunk_size))
-                    .zip(c1.chunks_mut(chunk_size))
-                    .zip(c2.chunks_mut(chunk_size))
-                    .zip(c3.chunks_mut(chunk_size))
-                    .enumerate()
-                    .map(|(i, (((d0, d1), d2), d3))| (i * chunk_size, [d0, d1, d2, d3]))
-                    .collect_vec()
-            };
-
-            // Column-outer accumulation: the row numerator is
-            // sum_i (f_i(row) * c_i - b_i) = sum_i f_i(row) * c_i - sum_i b_i, so each
-            // batch column is streamed sequentially into per-row accumulators instead of
-            // gathering across every column per row. The summands are identical to
-            // [`accumulate_row_partial_numerators`].
-            let b_sum: SecureField = coeffs.iter().map(|(_, b, _)| *b).sum();
-            let process_chunk = |(start, chunk): &mut (usize, [&mut [BaseField]; 4])| {
-                use crate::prover::backend::simd::m31::{PackedM31, N_LANES};
-                let rows = chunk[0].len();
-                if rows.is_multiple_of(N_LANES) {
-                    // Packed path: per-coordinate accumulators over the chunk; each
-                    // column streams once with one packed load and four broadcast
-                    // multiply-accumulates per 16 rows.
-                    let n_groups = rows / N_LANES;
-                    let neg_coords = (-b_sum).to_m31_array();
-                    let mut acc: [Vec<PackedM31>; 4] =
-                        neg_coords.map(|coord| vec![PackedM31::broadcast(coord); n_groups]);
-                    for (data, (_, _, c)) in zip(&batch.cols_vals_randpows, &coeffs) {
-                        let column = columns[data.column_index];
-                        let column_chunk = &column[*start..*start + rows];
-                        let c_coords = c.to_m31_array().map(PackedM31::broadcast);
-                        for (g, group) in column_chunk.chunks_exact(N_LANES).enumerate() {
-                            let v = PackedM31::from_array(group.try_into().unwrap());
-                            for k in 0..4 {
-                                acc[k][g] += v * c_coords[k];
-                            }
-                        }
-                    }
-                    for k in 0..4 {
-                        for (g, packed) in acc[k].iter().enumerate() {
-                            chunk[k][g * N_LANES..(g + 1) * N_LANES]
-                                .copy_from_slice(&packed.to_array());
-                        }
-                    }
-                    return;
-                }
-                let mut acc = vec![-b_sum; rows];
-                for (data, (_, _, c)) in zip(&batch.cols_vals_randpows, &coeffs) {
-                    let column = columns[data.column_index];
-                    let column_chunk = &column[*start..*start + rows];
-                    for (a, &v) in acc.iter_mut().zip(column_chunk) {
-                        *a += v * *c;
-                    }
-                }
-                for (idx, row_value) in acc.into_iter().enumerate() {
-                    let [v0, v1, v2, v3] = row_value.to_m31_array();
-                    chunk[0][idx] = v0;
-                    chunk[1][idx] = v1;
-                    chunk[2][idx] = v2;
-                    chunk[3][idx] = v3;
-                }
-            };
-
-            #[cfg(feature = "parallel")]
-            chunk_views.par_iter_mut().for_each(process_chunk);
-            #[cfg(not(feature = "parallel"))]
-            chunk_views.iter_mut().for_each(process_chunk);
-
-            let first_linear_term_acc: SecureField = coeffs.iter().map(|(a, ..)| a).sum();
-            accumulated_numerators_vec.push(AccumulatedNumerators {
-                sample_point: batch.point,
-                partial_numerators_acc,
-                first_linear_term_acc,
-            })
-        }
+    fn accumulate_numerator_groups(
+        groups: &[NumeratorBatchGroup<'_, Self>],
+        accumulated_numerators_vec: &mut Vec<AccumulatedNumerators<Self>>,
+        log_blowup_factor: u32,
+    ) {
+        numerators::accumulate_groups(groups, accumulated_numerators_vec, log_blowup_factor);
     }
 
     fn compute_quotients_and_combine(
@@ -157,16 +67,19 @@ impl QuotientOps for CpuBackend {
         let (eval_subdomain, _) = eval_domain.split(log_blowup_factor);
         let subdomain_log_size = eval_subdomain.log_size();
 
-        // Apple-GPU path: the whole per-row combine in one submission (denominator
-        // inverses by Fermat exponentiation equal batch_inverse exactly).
+        // Apple-GPU path: the whole per-row combine in one submission. It batch-inverts
+        // denominator norms across 256-row groups with one M31 Fermat inverse per group,
+        // then reconstructs the CM31 inverses exactly.
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        let gpu_quotients = if subdomain_log_size
-            >= crate::prover::backend::metal::quotients::MIN_METAL_QUOTIENT_LOG_SIZE
-        {
-            crate::prover::backend::metal::quotients::combine_quotients_metal(
-                &accumulations,
-                eval_subdomain,
-                1 << subdomain_log_size,
+        let gpu_quotients = if crate::prover::backend::metal::quotients::should_use_metal_quotients(
+            subdomain_log_size,
+        ) {
+            terminal_metal_quotient_result(
+                crate::prover::backend::metal::quotients::combine_quotients_metal(
+                    &accumulations,
+                    eval_subdomain,
+                    1 << subdomain_log_size,
+                ),
             )
         } else {
             None
@@ -240,6 +153,44 @@ impl QuotientOps for CpuBackend {
         #[cfg(not(feature = "parallel"))]
         chunk_views.iter_mut().for_each(process_chunk);
         extend_quotients(quotients, eval_subdomain, eval_domain, twiddles)
+    }
+}
+
+#[cfg(all(test, feature = "metal", target_os = "macos"))]
+mod metal_error_tests {
+    use metal::MTLCommandBufferStatus;
+
+    use super::terminal_metal_quotient_result;
+    use crate::prover::backend::metal::quotients::QuotientMetalError;
+
+    #[test]
+    fn only_pre_submit_decline_can_fall_back_to_cpu() {
+        assert_eq!(terminal_metal_quotient_result::<()>(Ok(None)), None);
+
+        let command_failure = std::panic::catch_unwind(|| {
+            terminal_metal_quotient_result::<()>(Err(QuotientMetalError::CommandFailed {
+                status: MTLCommandBufferStatus::Error,
+            }))
+        });
+        assert!(command_failure.is_err());
+
+        let numerator_failure = std::panic::catch_unwind(|| {
+            terminal_metal_quotient_result::<()>(Err(QuotientMetalError::NumeratorCommandFailed {
+                status: MTLCommandBufferStatus::Error,
+                batch_count: 14,
+                dispatch_count: 42,
+            }))
+        });
+        assert!(numerator_failure.is_err());
+
+        let pole = std::panic::catch_unwind(|| {
+            terminal_metal_quotient_result::<()>(Err(QuotientMetalError::Pole {
+                sample_mask: 0b10,
+                first_row: 17,
+                sample_first_rows: [None, Some(17), None, None, None, None],
+            }))
+        });
+        assert!(pole.is_err());
     }
 }
 
