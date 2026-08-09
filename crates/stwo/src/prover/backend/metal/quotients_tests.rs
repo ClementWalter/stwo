@@ -132,8 +132,10 @@ fn domain_xy(subdomain: CircleDomain) -> (Vec<BaseField>, Vec<BaseField>) {
 }
 
 #[test]
-fn batched_one_sample_log16_matches_direct_cpu() {
-    let log_size = super::MIN_METAL_QUOTIENT_LOG_SIZE;
+fn batched_one_sample_matches_direct_cpu() {
+    // Kernel equivalence is independent of the production admission crossover;
+    // keep this test small enough for routine local and CI execution.
+    let log_size = 16;
     let subdomain = CanonicCoset::new(log_size).circle_domain();
     let accumulations = vec![seeded_accumulation(log_size, 0, 0)];
     let expected = direct_reference(&accumulations, subdomain);
@@ -389,6 +391,14 @@ fn malformed_shapes_decline_before_submission() {
             .expect("uneven coordinate lengths must decline pre-submit")
             .is_none()
     );
+}
+
+#[test]
+fn quotient_admission_boundary_is_pinned() {
+    assert_eq!(super::MIN_METAL_QUOTIENT_LOG_SIZE, 21);
+    assert!(!super::should_use_metal_quotients(20));
+    assert!(super::should_use_metal_quotients(21));
+    assert!(super::should_use_metal_quotients(22));
 }
 
 #[path = "quotients/pole_tests.rs"]

@@ -17,8 +17,16 @@ use crate::core::fields::m31::BaseField;
 use crate::prover::backend::CpuBackend;
 use crate::prover::secure_column::SecureColumnByCoords;
 
-/// Minimum rows for GPU dispatch.
-pub(crate) const MIN_METAL_QUOTIENT_LOG_SIZE: u32 = 16;
+/// Minimum quotient subdomain log size for GPU dispatch.
+///
+/// Below log 21, repeated Metal numerator submissions and the combine submission
+/// cost more than the packed CPU reference path. This is an admission crossover
+/// only; declining leaves the original CPU implementation unchanged.
+pub(crate) const MIN_METAL_QUOTIENT_LOG_SIZE: u32 = 21;
+
+pub(crate) const fn should_use_metal_quotients(subdomain_log_size: u32) -> bool {
+    subdomain_log_size >= MIN_METAL_QUOTIENT_LOG_SIZE
+}
 
 const CHUNK_COLS: usize = 16;
 

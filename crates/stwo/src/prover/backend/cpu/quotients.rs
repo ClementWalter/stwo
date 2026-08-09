@@ -47,9 +47,9 @@ impl QuotientOps for CpuBackend {
         for (batch, coeffs) in zip(sample_batches, quotient_constants.line_coeffs) {
             // Apple-GPU path: the whole batch accumulated in one GPU submission.
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            if subdomain_size
-                >= 1 << crate::prover::backend::metal::quotients::MIN_METAL_QUOTIENT_LOG_SIZE
-            {
+            if crate::prover::backend::metal::quotients::should_use_metal_quotients(
+                subdomain_size.ilog2(),
+            ) {
                 let col_slices: Vec<&[BaseField]> = batch
                     .cols_vals_randpows
                     .iter()
@@ -173,9 +173,9 @@ impl QuotientOps for CpuBackend {
         // denominator norms across 256-row groups with one M31 Fermat inverse per group,
         // then reconstructs the CM31 inverses exactly.
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        let gpu_quotients = if subdomain_log_size
-            >= crate::prover::backend::metal::quotients::MIN_METAL_QUOTIENT_LOG_SIZE
-        {
+        let gpu_quotients = if crate::prover::backend::metal::quotients::should_use_metal_quotients(
+            subdomain_log_size,
+        ) {
             terminal_metal_quotient_result(
                 crate::prover::backend::metal::quotients::combine_quotients_metal(
                     &accumulations,
